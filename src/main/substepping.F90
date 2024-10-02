@@ -845,7 +845,7 @@ subroutine get_force(nptmass,npart,nsubsteps,ntypes,timei,dtextforce,xyzh,vxyzu,
  use io,              only:iverbose,master,id,iprint,warning,fatal
  use dim,             only:maxp,maxvxyzu,itau_alloc
  use ptmass,          only:get_accel_sink_gas,get_accel_sink_sink,merge_sinks, &
-                           ptmass_vdependent_correction,n_force_order
+                           ptmass_vdependent_correction,n_force_order,is_sinkgas_slow
  use options,         only:iexternalforce
  use part,            only:maxphase,abundance,nabundances,epot_sinksink,eos_vars,&
                            isdead_or_accreted,iamboundary,igas,iphase,iamtype,massoftype,divcurlv, &
@@ -990,7 +990,7 @@ subroutine get_force(nptmass,npart,nsubsteps,ntypes,timei,dtextforce,xyzh,vxyzu,
  call get_timings(t1,tcpu1)
 
  !$omp parallel default(none) &
- !$omp shared(maxp,maxphase,wsub) &
+ !$omp shared(maxp,maxphase,wsub,is_sinkgas_slow) &
  !$omp shared(npart,nptmass,xyzh,vxyzu,xyzmh_ptmass,fext) &
  !$omp shared(eos_vars,dust_temp,idamp,damp_fac,abundance,iphase,ntypes,massoftype) &
  !$omp shared(dkdt,dt,timei,iexternalforce,extf_vdep_flag,last) &
@@ -1022,7 +1022,7 @@ subroutine get_force(nptmass,npart,nsubsteps,ntypes,timei,dtextforce,xyzh,vxyzu,
           yi = xyzh(2,i)
           zi = xyzh(3,i)
        endif
-       if (nptmass > 0) then
+       if (nptmass > 0 .and. .not.is_sinkgas_slow) then
           if (wsub) then
              if (extrap) then
                 call get_accel_sink_gas(nptmass,xi,yi,zi,xyzh(4,i),xyzmh_ptmass,&

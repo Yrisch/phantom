@@ -98,10 +98,11 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
                           iamboundary,get_ntypes,npartoftypetot,&
                           dustfrac,dustevol,ddustevol,eos_vars,alphaind,nptmass,&
                           dustprop,ddustprop,dustproppred,pxyzu,dens,metrics,ics,&
-                          filfac,filfacpred,mprev,filfacprev,isionised
+                          filfac,filfacpred,mprev,filfacprev,isionised,&
+                          fsinkgas_slow,fgasink_slow
  use options,        only:avdecayconst,alpha,ieos,alphamax
  use deriv,          only:derivs
- use timestep,       only:dterr,bignumber,tolv
+ use timestep,       only:dterr,bignumber,tolv,C_force
  use mpiutils,       only:reduceall_mpi
  use part,           only:nptmass,xyzmh_ptmass,vxyz_ptmass,fxyz_ptmass, &
                           dsdt_ptmass,fsink_old,ibin_wake,dptmass,linklist_ptmass
@@ -126,12 +127,14 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
  use cons2primsolver, only:conservative2primitive,primitive2conservative
  use substepping,     only:substep,substep_gr, &
                            substep_sph_gr,substep_sph
+ use ptmass,         only: ptmass_kick,is_sinkgas_slow,get_accel_sink_gas
 
  integer, intent(inout) :: npart
  integer, intent(in)    :: nactive
  real,    intent(in)    :: t,dtsph
  real,    intent(inout) :: dtextforce
  real,    intent(out)   :: dtnew
+ real,    intent(inout) :: dtsinkgas_slow
  integer            :: i,its,np,ntypes,itype,nwake,nvfloorp,nvfloorps,nvfloorc,ialphaloc
  real               :: timei,erri,errmax,v2i,errmaxmean
  real               :: vxi,vyi,vzi,eni,hdtsph,pmassi
@@ -140,15 +143,19 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
  real(kind=4)       :: t1,t2,tcpu1,tcpu2
  real               :: pxi,pyi,pzi,p2i,p2mean
  real               :: dtsph_next,dti,time_now
+ real               :: fonrmaxi,dtphi2i,dtphi2,fonrmax,phisg,dtsinkgas
  logical, parameter :: allow_waking = .true.
  integer, parameter :: maxits = 30
  logical            :: converged,store_itype
+ logical            :: update_sgforce = .true.
 !
 ! set initial quantities
 !
  timei  = t
  hdtsph = 0.5*dtsph
  dterr  = bignumber
+ fonrmax = 0
+ dtphi2  = bignumber
 ! determine twas for each ibin
  if (ind_timesteps .and. sts_it_n) then
     time_now = timei + dtsph
@@ -231,6 +238,10 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
     call check_dustprop(npart,dustprop,filfac,mprev,filfacprev)
  endif
 
+ if (is_sinkgas_slow .and. nptmass>0) then
+    call ptmass_kick(nptmass,hdtsph,vxyz_ptmass,fsinkgas_slow,xyzmh_ptmass,dsdt_ptmass)
+ endif
+
 
 !----------------------------------------------------------------------
 ! substepping with external and sink particle forces, using dtextforce
@@ -269,8 +280,9 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
 ! force evaluations, using dtsph
 !----------------------------------------------------
 !$omp parallel do default(none) schedule(guided,1) &
-!$omp shared(maxp,maxphase,maxalpha) &
+!$omp shared(maxp,maxphase,maxalpha,is_sinkgas_slow) &
 !$omp shared(xyzh,vxyzu,vpred,fxyzu,divcurlv,npart,store_itype) &
+!$omp shared(xyzmh_ptmass,fgasink_slow,update_sgforce,nptmass) &
 !$omp shared(pxyzu,ppred) &
 !$omp shared(Bevol,dBevol,Bpred,dtsph,massoftype,iphase) &
 !$omp shared(dustevol,ddustprop,dustprop,dustproppred,dustfrac,ddustevol,dustpred,use_dustfrac) &
@@ -281,8 +293,12 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
 !$omp shared(rad,drad,radpred)&
 !$omp private(hi,rhoi,tdecay1,source,ddenom,hdti) &
 !$omp private(i,spsoundi,alphaloci) &
+!$omp private(fonrmaxi,dtphi2i,phisg)&
 !$omp firstprivate(pmassi,itype,avdecayconst,alpha) &
-!$omp reduction(+:nvfloorps)
+!$omp reduction(+:nvfloorps)&
+!$omp reduction(min:dtphi2)&
+!$omp reduction(max:fonrmax)&
+!$omp reduction(+:fsinkgas_slow,dsdt_ptmass,bin_info)
  predict_sph: do i=1,npart
     if (.not.isdead_or_accreted(xyzh(4,i))) then
        if (store_itype) then
@@ -368,9 +384,22 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
              alphaind(1,i) = real(min((alphaind(1,i) + dtsph*(source + alpha*tdecay1))*ddenom,alphamax),kind=kind(alphaind))
           endif
        endif
+       !
+       ! if sink gas interaction is a slow force we need to recompute this force each dtsinkgas
+       !
+       if (is_sinkgas_slow .and. nptmass>0 .and. update_sgforce) then
+          call get_accel_sink_gas(nptmass,xyzh(1,i),xyzh(2,i),xyzh(3,i),xyzh(4,i),xyzmh_ptmass,&
+                                  fgasink_slow(1,i),fgasink_slow(2,i),fgasink_slow(3,i),&
+                                  phisg,pmassi,fsinkgas_slow,dsdt_ptmass,fonrmaxi,dtphi2i,&
+                                  bin_info=bin_info)
+          fonrmax = max(fonrmax,fonrmaxi)
+          dtphi2  = min(dtphi2,dtphi2i)
+       endif
     endif
  enddo predict_sph
  !$omp end parallel do
+ ! sink-gas dt constraint (if slow force)
+ dtsinkgas = min(C_force*1./sqrt(fonrmax),C_force*sqrt(dtphi2))
  if (use_dustgrowth) then
     if (use_porosity) then
        call get_filfac(npart,xyzh,dustprop(1,:),filfacpred,dustproppred,hdti)

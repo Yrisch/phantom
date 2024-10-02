@@ -79,6 +79,7 @@ module ptmass
  real,    public :: r_merge_cond    = 0.0     ! sinks will merge if bound within this radius
  real,    public :: f_crit_override = 0.0     ! 1000.
 
+ logical, public :: is_sinkgas_slow = .false.
  logical, public :: use_regnbody    = .false. ! subsystems switch
  logical, public :: use_fourthorder = .true.
  integer, public :: n_force_order   = 3
@@ -89,6 +90,7 @@ module ptmass
 
  real, public :: dk(3)
  real, public :: ck(2)
+
 
 
  ! Note for above: if f_crit_override > 0, then will unconditionally make a sink when rho > f_crit_override*rho_crit_cgs
