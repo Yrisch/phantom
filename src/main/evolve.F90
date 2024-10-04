@@ -88,14 +88,16 @@ subroutine evol(infile,logfile,evfile,dumpfile,flag)
  use io,               only:ianalysis
 #endif
  use part,             only:npart,nptmass,xyzh,vxyzu,fxyzu,fext,divcurlv,massoftype, &
-                            xyzmh_ptmass,vxyz_ptmass,fxyz_ptmass,dptmass,gravity,iboundary, &
-                            fxyz_ptmass_sinksink,ntot,poten,ndustsmall,accrete_particles_outside_sphere,&
-                            linklist_ptmass,isionised,dsdt_ptmass,isdead_or_accreted
+                            xyzmh_ptmass,vxyz_ptmass,fxyz_ptmass,fsinkgas_slow,fgasink_slow,dptmass, &
+                            gravity,iboundary,fxyz_ptmass_sinksink,ntot,poten,ndustsmall,&
+                            accrete_particles_outside_sphere,linklist_ptmass,isionised,dsdt_ptmass,&
+                            isdead_or_accreted
  use part,             only:n_group,n_ingroup,n_sing,group_info,bin_info,nmatrix
  use quitdump,         only:quit
  use ptmass,           only:icreate_sinks,ptmass_create,ipart_rhomax,pt_write_sinkev,calculate_mdot, &
                             set_integration_precision,ptmass_create_stars,use_regnbody,ptmass_create_seeds,&
-                            ipart_createseeds,ipart_createstars
+                            ipart_createseeds,ipart_createstars,is_sinkgas_slow,dtsinkgasslow,nstep_sinkgas,&
+                            update_sgforce,get_accel_sink_slow
  use io_summary,       only:iosum_nreal,summary_counter,summary_printout,summary_printnow
  use externalforces,   only:iext_spiral
  use boundary_dyn,     only:dynamic_bdy,update_boundaries
@@ -144,6 +146,7 @@ subroutine evol(infile,logfile,evfile,dumpfile,flag)
  integer         :: j,nskip,nskipped,nevwrite_threshold,nskipped_sink,nsinkwrite_threshold
  character(len=120) :: dumpfile_orig
  integer         :: dummy,istepHII,nptmass_old
+ integer         :: nsg_count
 
  dummy = 0
 
@@ -158,6 +161,7 @@ subroutine evol(infile,logfile,evfile,dumpfile,flag)
  np_e_eq_0  = 0
  abortrun_bdy = .false.
  dumpfile_orig = trim(dumpfile)
+ nsg_count  = 0
 
  call init_conservation_checks(should_conserve_energy,should_conserve_momentum,&
                                should_conserve_angmom,should_conserve_dustmass)
@@ -205,6 +209,11 @@ subroutine evol(infile,logfile,evfile,dumpfile,flag)
 ! threshold for writing to .ev file, to avoid repeatedly computing energies
 ! for all the particles which would add significantly to the cpu time
 !
+
+!
+! set the number of step to skip...
+!
+ if (is_sinkgas_slow) nstep_sinkgas = max(int(dtsinkgasslow/dt),1)
 
  nskipped = 0
  if (iexternalforce==iext_spiral) then
@@ -305,6 +314,9 @@ subroutine evol(infile,logfile,evfile,dumpfile,flag)
        endif
     endif
 
+    !
+    ! Update Ionised particle for HII region expansion
+    !
     if (iH2R > 0 .and. id==master) then
        istepHII = 1
        if (ind_timesteps) then
@@ -315,17 +327,34 @@ subroutine evol(infile,logfile,evfile,dumpfile,flag)
           call HII_feedback(nptmass,npart,xyzh,xyzmh_ptmass,vxyzu,isionised)
        endif
     endif
-
+    !
     ! Need to recompute the force when sink or stars are created
+    !
     if (nptmass > nptmass_old .or. ipart_createseeds /= 0 .or. ipart_createstars /= 0) then
-       if (use_regnbody) then
-          call group_identify(nptmass,n_group,n_ingroup,n_sing,xyzmh_ptmass,vxyz_ptmass,group_info,bin_info,nmatrix,&
-                              new_ptmass=.true.,dtext=dtextforce)
-          call get_force(nptmass,npart,0,1,time,dtextforce,xyzh,vxyzu,fext,xyzmh_ptmass,vxyz_ptmass,&
-                 fxyz_ptmass,dsdt_ptmass,0.,0.,dummy,.false.,linklist_ptmass,bin_info,group_info=group_info)
+       if (is_sinkgas_slow) then
+          if (use_regnbody) then
+             call group_identify(nptmass,n_group,n_ingroup,n_sing,xyzmh_ptmass,vxyz_ptmass,group_info,bin_info,nmatrix)
+             call get_accel_sink_slow(nptmass,npart,time,dtextforce,xyzmh_ptmass,xyzh,fxyz_ptmass,fsinkgas_slow,&
+                                      fgasink_slow,dsdt_ptmass,group_info,bin_info)
+          else
+             call get_accel_sink_slow(nptmass,npart,time,dtextforce,xyzmh_ptmass,xyzh,fxyz_ptmass,fsinkgas_slow,&
+                                      fgasink_slow,dsdt_ptmass)
+          endif
+          !
+          ! set the number of step to skip...
+          !
+          nstep_sinkgas = max(int(dtsinkgasslow/dt),1)
+          nsg_count = 0
        else
-          call get_force(nptmass,npart,0,1,time,dtextforce,xyzh,vxyzu,fext,xyzmh_ptmass,vxyz_ptmass,&
+          if (use_regnbody) then
+             call group_identify(nptmass,n_group,n_ingroup,n_sing,xyzmh_ptmass,vxyz_ptmass,group_info,bin_info,nmatrix,&
+                                 new_ptmass=.true.,dtext=dtextforce)
+             call get_force(nptmass,npart,0,1,time,dtextforce,xyzh,vxyzu,fext,xyzmh_ptmass,vxyz_ptmass,&
+                 fxyz_ptmass,dsdt_ptmass,0.,0.,dummy,.false.,linklist_ptmass,bin_info,group_info=group_info)
+          else
+             call get_force(nptmass,npart,0,1,time,dtextforce,xyzh,vxyzu,fext,xyzmh_ptmass,vxyz_ptmass,&
                 fxyz_ptmass,dsdt_ptmass,0.,0.,dummy,.false.,linklist_ptmass,bin_info)
+          endif
        endif
        if (ipart_createseeds /= 0) ipart_createseeds = 0 ! reset pointer to zero
        if (ipart_createstars /= 0) ipart_createstars = 0 ! reset pointer to zero
@@ -336,6 +365,16 @@ subroutine evol(infile,logfile,evfile,dumpfile,flag)
     !
     if (do_radiation  .and. exchange_radiation_energy  .and. .not.implicit_radiation) then
        call update_radenergy(npart,xyzh,fxyzu,vxyzu,rad,radprop,0.5*dt)
+    endif
+
+    !
+    ! does the step need an sink-gas force update
+    !
+    if (is_sinkgas_slow .and. nstep_sinkgas/=0) then
+       nsg_count = nsg_count + 1
+       print*,nstep_sinkgas,nsg_count
+       update_sgforce = nsg_count >= nstep_sinkgas
+       if(update_sgforce) nsg_count = 0
     endif
 
     nsteps = nsteps + 1
@@ -386,6 +425,17 @@ subroutine evol(infile,logfile,evfile,dumpfile,flag)
     if (nbinmax /= nbinmaxprev .or. dtmax_ifactor /= 0) then
        call change_nbinmax(nbinmax,nbinmaxprev,istepfrac,dtmax,dt)
        dt_changed = .true.
+       if (is_sinkgas_slow) then
+          if (nbinmax > nbinmaxprev) then
+             nsg_count = nsg_count*2**(nbinmax-nbinmaxprev)
+             nstep_sinkgas = nstep_sinkgas*2**(nbinmax-nbinmaxprev)
+             !print*,' adjust factor = ',2**(nbinmax-nbinmaxprev)
+          else
+             nsg_count = nsg_count/2**(nbinmaxprev - nbinmax)
+             nstep_sinkgas = nstep_sinkgas/2**(nbinmaxprev - nbinmax)
+             ! print*,' adjust factor = ',2**(nbinmaxprev-nbinmax)
+          endif
+       endif
     endif
 
 #else

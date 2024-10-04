@@ -127,14 +127,14 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
  use cons2primsolver, only:conservative2primitive,primitive2conservative
  use substepping,     only:substep,substep_gr, &
                            substep_sph_gr,substep_sph
- use ptmass,         only: ptmass_kick,is_sinkgas_slow,get_accel_sink_gas
+ use ptmass,         only: ptmass_kick,is_sinkgas_slow,get_accel_sink_gas,dtsinkgasslow,&
+                           nstep_sinkgas,update_sgforce
 
  integer, intent(inout) :: npart
  integer, intent(in)    :: nactive
  real,    intent(in)    :: t,dtsph
  real,    intent(inout) :: dtextforce
  real,    intent(out)   :: dtnew
- real,    intent(inout) :: dtsinkgas_slow
  integer            :: i,its,np,ntypes,itype,nwake,nvfloorp,nvfloorps,nvfloorc,ialphaloc
  real               :: timei,erri,errmax,v2i,errmaxmean
  real               :: vxi,vyi,vzi,eni,hdtsph,pmassi
@@ -143,11 +143,10 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
  real(kind=4)       :: t1,t2,tcpu1,tcpu2
  real               :: pxi,pyi,pzi,p2i,p2mean
  real               :: dtsph_next,dti,time_now
- real               :: fonrmaxi,dtphi2i,dtphi2,fonrmax,phisg,dtsinkgas
+ real               :: fonrmaxi,dtphi2i,dtphi2,fonrmax,phisg
  logical, parameter :: allow_waking = .true.
  integer, parameter :: maxits = 30
  logical            :: converged,store_itype
- logical            :: update_sgforce = .true.
 !
 ! set initial quantities
 !
@@ -238,6 +237,9 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
     call check_dustprop(npart,dustprop,filfac,mprev,filfacprev)
  endif
 
+ !
+ ! 1st ptmass kick (sink-gas slow)
+ !
  if (is_sinkgas_slow .and. nptmass>0) then
     call ptmass_kick(nptmass,hdtsph,vxyz_ptmass,fsinkgas_slow,xyzmh_ptmass,dsdt_ptmass)
  endif
@@ -398,8 +400,22 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
     endif
  enddo predict_sph
  !$omp end parallel do
+ !
  ! sink-gas dt constraint (if slow force)
- dtsinkgas = min(C_force*1./sqrt(fonrmax),C_force*sqrt(dtphi2))
+ !
+ if (is_sinkgas_slow .and. nptmass>0 .and. update_sgforce) then
+    dtsinkgasslow = min(C_force*1./sqrt(fonrmax),C_force*sqrt(dtphi2))
+    nstep_sinkgas = max(int(dtsinkgasslow/dtsph),1)
+ endif
+
+ !
+ ! 2nd ptmass kick (sink-gas slow)
+ !
+ if (is_sinkgas_slow .and. nptmass>0) then
+    call ptmass_kick(nptmass,hdtsph,vxyz_ptmass,fsinkgas_slow,xyzmh_ptmass,dsdt_ptmass)
+ endif
+
+
  if (use_dustgrowth) then
     if (use_porosity) then
        call get_filfac(npart,xyzh,dustprop(1,:),filfacpred,dustproppred,hdti)
@@ -473,6 +489,7 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
 !$omp shared(dustprop,ddustprop,dustproppred) &
 !$omp shared(xyzmh_ptmass,vxyz_ptmass,fxyz_ptmass,nptmass,massoftype) &
 !$omp shared(dtsph,ieos,ufloor) &
+!$omp shared(is_sinkgas_slow,fgasink_slow)&
 !$omp shared(ibin,ibin_old,ibin_sts,twas,timei,use_sts,dtsph_next,ibin_wake,sts_it_n) &
 !$omp shared(ibin_dts,nbinmax) &
 !$omp private(dti,hdti) &
@@ -510,6 +527,9 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
                    pxyzu(:,i) = pxyzu(:,i) + dti*fxyzu(:,i)
                 else
                    vxyzu(:,i) = vxyzu(:,i) + dti*fxyzu(:,i)
+                   if(is_sinkgas_slow) then
+                      vxyzu(:,i) = vxyzu(:,i) + dti*fgasink_slow(:,i)
+                   endif
                 endif
 
                 if (use_dustgrowth .and. itype==idust) dustprop(:,i) = dustprop(:,i) + dti*ddustprop(:,i)
@@ -532,6 +552,9 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
                 pxyzu(:,i) = pxyzu(:,i) + hdti*fxyzu(:,i)
              else
                 vxyzu(:,i) = vxyzu(:,i) + hdti*fxyzu(:,i)
+                if(is_sinkgas_slow) then
+                   vxyzu(:,i) = vxyzu(:,i) + hdti*fgasink_slow(:,i)
+                endif
              endif
 
              !--floor the thermal energy if requested and required

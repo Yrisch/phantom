@@ -162,7 +162,7 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
  use ptmass,           only:init_ptmass,get_accel_sink_gas,get_accel_sink_sink, &
                             h_acc,r_crit,r_crit2,rho_crit,rho_crit_cgs,icreate_sinks, &
                             r_merge_uncond,r_merge_cond,r_merge_uncond2,r_merge_cond2,r_merge2, &
-                            use_regnbody,is_sinkgas_slow
+                            use_regnbody,is_sinkgas_slow,dtsinkgasslow
  use timestep,         only:time,dt,dtextforce,C_force,dtmax,dtmax_user,idtmax_n
  use timing,           only:get_timings
  use timestep_ind,     only:ibinnow,maxbins,init_ibin,istepfrac
@@ -536,11 +536,15 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
     ntypes = get_ntypes(npartoftype)
     dtphi2 = huge(dtphi2)
     fonrmax = 0.
+    if (is_sinkgas_slow) then
+       fgasink_slow = 0.
+       fsinkgas_slow = 0.
+    endif
     !$omp parallel default(none) &
     !$omp shared(maxp,maxphase,use_regnbody,is_sinkgas_slow) &
     !$omp shared(npart,nptmass,xyzh,xyzmh_ptmass,fext,fgasink_slow) &
     !$omp shared(iphase,ntypes,massoftype) &
-    !$omp private(i,fonrmaxi,dtphi2i,poti,dtf) &
+    !$omp private(i,fonrmaxi,dtphi2i,poti) &
     !$omp firstprivate(pmassi,itype) &
     !$omp reduction(min:dtphi2,dtsinkgas) &
     !$omp reduction(max:fonrmax) &
@@ -554,21 +558,22 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
           if (use_regnbody) then
              if (is_sinkgas_slow) then
                 call get_accel_sink_gas(nptmass,xyzh(1,i),xyzh(2,i),xyzh(3,i),xyzh(4,i),xyzmh_ptmass, &
-                                     fext(1,i),fext(2,i),fext(3,i),poti,pmassi,fxyz_ptmass,&
-                                     dsdt_ptmass,fonrmax,dtphi2,bin_info=bin_info)
+                                        fgasink_slow(1,i),fgasink_slow(2,i),fgasink_slow(3,i),poti,pmassi,fsinkgas_slow,&
+                                        dsdt_ptmass,fonrmaxi,dtphi2i,bin_info=bin_info)
              else
                 call get_accel_sink_gas(nptmass,xyzh(1,i),xyzh(2,i),xyzh(3,i),xyzh(4,i),xyzmh_ptmass, &
-                                     fgasink_slow(1,i),fgasink_slow(2,i),fgasink_slow(3,i),poti,pmassi,fsinkgas_slow,&
-                                     dsdt_ptmass,fonrmaxi,dtphi2i,bin_info=bin_info)
+                                        fext(1,i),fext(2,i),fext(3,i),poti,pmassi,fxyz_ptmass,&
+                                        dsdt_ptmass,fonrmax,dtphi2,bin_info=bin_info)
              endif
           else
              if (is_sinkgas_slow) then
                 call get_accel_sink_gas(nptmass,xyzh(1,i),xyzh(2,i),xyzh(3,i),xyzh(4,i),xyzmh_ptmass, &
-            fext(1,i),fext(2,i),fext(3,i),poti,pmassi,fxyz_ptmass,dsdt_ptmass,fonrmax,dtphi2)
+                                        fgasink_slow(1,i),fgasink_slow(2,i),fgasink_slow(3,i),poti,pmassi,fsinkgas_slow,&
+                                        dsdt_ptmass,fonrmaxi,dtphi2i)
              else
                 call get_accel_sink_gas(nptmass,xyzh(1,i),xyzh(2,i),xyzh(3,i),xyzh(4,i),xyzmh_ptmass, &
-                                 fgasink_slow(1,i),fgasink_slow(2,i),fgasink_slow(3,i),poti,pmassi,fsinkgas_slow,&
-                                 dsdt_ptmass,fonrmaxi,dtphi2i,bin_info=bin_info)
+                                       fext(1,i),fext(2,i),fext(3,i),poti,pmassi,fxyz_ptmass,&
+                                       dsdt_ptmass,fonrmax,dtphi2)
              endif
           endif
           fonrmax = max(fonrmax,fonrmaxi)
@@ -583,6 +588,10 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
     call reduce_in_place_mpi('+',fxyz_ptmass(:,1:nptmass))
 
     dtsinkgas = min(dtsinkgas,C_force*1./sqrt(fonrmax),C_force*sqrt(dtphi2))
+
+    if(is_sinkgas_slow) then
+       dtsinkgasslow = dtsinkgas
+    endif
 
     if (id==master) write(iprint,*) 'dt(sink-gas)  = ',dtsinkgas
 

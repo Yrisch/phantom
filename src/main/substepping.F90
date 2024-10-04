@@ -873,16 +873,16 @@ subroutine get_force(nptmass,npart,nsubsteps,ntypes,timei,dtextforce,xyzh,vxyzu,
  integer,        optional, intent(inout) :: group_info(:,:)
  integer(kind=1),optional, intent(inout) :: nmatrix(:,:)
  logical,        optional, intent(in)    :: isionised(:)
- real(kind=4)    :: t1,t2,tcpu1,tcpu2
- integer         :: merge_ij(nptmass)
- integer         :: merge_n
- integer         :: i,itype
- real, save      :: dmdt = 0.
- real            :: dtf,dtextforcenew,dtsinkgas,dtphi2,fonrmax
- real            :: fextx,fexty,fextz,xi,yi,zi,pmassi,damp_fac
- real            :: fonrmaxi,phii,dtphi2i
- real            :: dkdt,extrapfac
- logical         :: extrap,last,wsub
+ real(kind=4)         :: t1,t2,tcpu1,tcpu2
+ integer, allocatable :: merge_ij(:)
+ integer              :: merge_n
+ integer              :: i,itype
+ real, save           :: dmdt = 0.
+ real                 :: dtf,dtextforcenew,dtsinkgas,dtphi2,fonrmax
+ real                 :: fextx,fexty,fextz,xi,yi,zi,pmassi,damp_fac
+ real                 :: fonrmaxi,phii,dtphi2i
+ real                 :: dkdt,extrapfac
+ logical              :: extrap,last,wsub
 
  if (present(fsink_old)) then
     fsink_old = fxyz_ptmass
@@ -897,7 +897,7 @@ subroutine get_force(nptmass,npart,nsubsteps,ntypes,timei,dtextforce,xyzh,vxyzu,
     wsub = .false.
  endif
 
-
+ allocate(merge_ij(nptmass))
  force_count   = force_count + 1
  extrapfac     = (1./24.)*dt**2
  dkdt          = dki*dt
@@ -1125,13 +1125,15 @@ subroutine get_force(nptmass,npart,nsubsteps,ntypes,timei,dtextforce,xyzh,vxyzu,
     dtextforce = dtextforcenew
  endif
 
+ deallocate(merge_ij)
+
 end subroutine get_force
 
 !-----------------------------------------------------------------------------------
 !+
 ! Update of abundances and internal energy using cooling method (see cooling module)
 ! NOTE: The chemistry and cooling here is implicitly calculated.  That is,
-!       dt is *passed in* to the chemistry & cooling routines so that the
+!       dt is *passed in* to the cnptmasshemistry & cooling routines so that the
 !       output will be at the correct time of time + dt.  Since this is
 !       implicit, there is no cooling timestep.  Explicit cooling is
 !       calculated in force and requires a cooling timestep.
