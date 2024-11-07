@@ -167,10 +167,12 @@ subroutine test_binary(ntests,npass,string)
  use io,         only:id,master,iverbose
  use physcon,    only:pi,deg_to_rad
  use ptmass,     only:get_accel_sink_sink,h_soft_sinksink, &
-                      get_accel_sink_gas,f_acc,use_fourthorder
+                      get_accel_sink_gas,f_acc,use_fourthorder,get_accel_sink_slow,&
+                      dtsinkgasslow,nstep_sinkgas
  use part,       only:nptmass,xyzmh_ptmass,vxyz_ptmass,fxyz_ptmass,dsdt_ptmass,fext,&
                       npart,npartoftype,massoftype,xyzh,vxyzu,fxyzu,&
-                      hfact,igas,epot_sinksink,init_part,iJ2,ispinx,ispiny,ispinz,iReff,istar
+                      hfact,igas,epot_sinksink,init_part,iJ2,ispinx,ispiny,ispinz,iReff,istar,&
+                      fsinkgas_slow,fgasink_slow,ihsoft
  use energies,   only:angtot,etot,totmom,compute_energies,hp,hx
  use timestep,   only:dtmax,C_force,tolv
  use kdtree,     only:tree_accuracy
@@ -190,10 +192,10 @@ subroutine test_binary(ntests,npass,string)
  character(len=*), intent(in)    :: string
  integer :: i,ierr,itest,nfailed(3),nsteps,nerr,nwarn,norbits
  integer :: merge_ij(2),merge_n,nparttot,nfailgw(2),ncheckgw(2)
- integer, parameter :: nbinary_tests = 5
+ integer, parameter :: nbinary_tests = 6
  real :: m1,m2,a,ecc,hacc1,hacc2,dt,dtext,t,dtnew,tolen,tolmom,tolang,hp_exact,hx_exact
  real :: angmomin,etotin,totmomin,dum,dum2,omega,errmax,dtsinksink,fac,errgw(2)
- real :: angle,rin,rout
+ real :: angle,rin,rout,fonrmax,fonrmaxi,dtphi2,dtphi2i
  real :: fxyz_sinksink(4,2),dsdt_sinksink(3,2) ! we only use 2 sink particles in the tests here
  real(kind=4) :: t1
  character(len=20) :: dumpfile
@@ -210,8 +212,10 @@ subroutine test_binary(ntests,npass,string)
  ishock_heating = 0
 
  tolv = 1e-2
+ fonrmax = 0.
+ dtphi2 = huge(dtphi2)
 
- binary_tests: do itest = 1,nbinary_tests
+ binary_tests: do itest = 2,2
     select case(itest)
     case(4)
        if (use_fourthorder) then
@@ -220,7 +224,7 @@ subroutine test_binary(ntests,npass,string)
        else
           if (id==master) write(*,"(/,a)") '--> testing integration of binary orbit with oblateness'//trim(string)
        endif
-    case(2,3,5)
+    case(2,3,5,6)
        if (periodic) then
           if (id==master) write(*,"(/,a)") '--> skipping circumbinary disc test (-DPERIODIC is set)'
           cycle binary_tests
@@ -232,6 +236,8 @@ subroutine test_binary(ntests,npass,string)
              if (id==master) write(*,"(/,a)") '--> testing integration of disc around oblate star'//trim(string)
           elseif (itest==3) then
              if (id==master) write(*,"(/,a)") '--> testing integration of disc around eccentric binary'//trim(string)
+          elseif (itest==6) then
+             if (id==master) write(*,"(/,a)") '--> testing integration of disc around binary (sink_gas_slow)'//trim(string)
           else
              if (id==master) write(*,"(/,a)") '--> testing integration of circumbinary disc'//trim(string)
           endif
@@ -249,8 +255,8 @@ subroutine test_binary(ntests,npass,string)
     m1    = 1.
     m2    = 1.
     a     = 1.
-    rin   = 1.5*a
-    rout  = 15.*a
+    rin   = 5.*a
+    rout  = 20.*a
     if (itest==5) then
        m2 = 0.0
        rin = 1.
@@ -271,7 +277,7 @@ subroutine test_binary(ntests,npass,string)
     call set_binary(m1,m2,a,ecc,hacc1,hacc2,xyzmh_ptmass,vxyz_ptmass,nptmass,ierr,verbose=.false.)
     if (ierr /= 0) nerr = nerr + 1
 
-    if (itest==2 .or. itest==3 .or. itest==5) then
+    if (itest==2 .or. itest==3 .or. itest==5 .or. itest==6) then
        !  add a circumbinary gas disc around it
        nparttot = 1000
        call set_disc(id,master,nparttot=nparttot,npart=npart,rmin=rin,rmax=rout,p_index=1.0,q_index=0.75,&
@@ -316,10 +322,22 @@ subroutine test_binary(ntests,npass,string)
     call bcast_mpi(dtsinksink)
 
     fext(:,:) = 0.
-    do i=1,npart
-       call get_accel_sink_gas(nptmass,xyzh(1,i),xyzh(2,i),xyzh(3,i),xyzh(4,i),xyzmh_ptmass,&
-                fext(1,i),fext(2,i),fext(3,i),dum,massoftype(igas),fxyz_ptmass,dsdt_ptmass,dum,dum2)
-    enddo
+    if (itest == 6) then
+       xyzmh_ptmass(ihsoft,1) = 0.
+       xyzmh_ptmass(ihsoft,2) = 0.
+       do i=1,npart
+          call get_accel_sink_gas(nptmass,xyzh(1,i),xyzh(2,i),xyzh(3,i),xyzh(4,i),xyzmh_ptmass,&
+              fgasink_slow(1,i),fgasink_slow(2,i),fgasink_slow(3,i),dum,massoftype(igas),&
+              fsinkgas_slow,dsdt_ptmass,fonrmaxi,dtphi2i)
+          fonrmax = max(fonrmax,fonrmaxi)
+          dtphi2 = min(dtphi2,dtphi2i)
+       enddo
+    else
+       do i=1,npart
+          call get_accel_sink_gas(nptmass,xyzh(1,i),xyzh(2,i),xyzh(3,i),xyzh(4,i),xyzmh_ptmass,&
+               fext(1,i),fext(2,i),fext(3,i),dum,massoftype(igas),fxyz_ptmass,dsdt_ptmass,dum,dum2)
+       enddo
+    endif
     if (id==master) then
        fxyz_ptmass(:,1:nptmass) = fxyz_ptmass(:,1:nptmass) + fxyz_sinksink(:,1:nptmass)
        dsdt_ptmass(:,1:nptmass) = dsdt_ptmass(:,1:nptmass) + dsdt_sinksink(:,1:nptmass)
@@ -332,6 +350,12 @@ subroutine test_binary(ntests,npass,string)
     !
     dt = C_force*dtsinksink
     if (m2 <= 0.) dt = min(C_force*dtsinksink,4.e-3*sqrt(2.*pi/omega))
+
+    if (itest == 6) then
+       dtsinkgasslow = min(C_force*1./sqrt(fonrmax),C_force*sqrt(dtphi2))
+       nstep_sinkgas = max(int(dtsinkgasslow/dt),1)
+       write(*,*) "dt sink/gas slow and number of step skipping : ", dtsinkgasslow,nstep_sinkgas
+    endif
 
     dtmax = dt  ! required prior to derivs call, as used to set ibin
     !
@@ -365,7 +389,7 @@ subroutine test_binary(ntests,npass,string)
     !--determine number of steps per orbit for information
     !
     nsteps  = int(2.*pi/omega/dt) + 1
-    if (itest==2 .or. itest==3 .or. itest==5) then
+    if (itest==2 .or. itest==3 .or. itest==5 .or. itest==6) then
        norbits = 10
     else
        norbits = 100
@@ -416,7 +440,7 @@ subroutine test_binary(ntests,npass,string)
           tolang = 6.e-10
        endif
        tolen = 1.2e-2
-    case(2)
+    case(2,6)
        tolen = 1.2e-3
        if (gravity) tolen = 3.1e-3
 

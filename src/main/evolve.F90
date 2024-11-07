@@ -372,7 +372,6 @@ subroutine evol(infile,logfile,evfile,dumpfile,flag)
     !
     if (is_sinkgas_slow .and. nstep_sinkgas/=0) then
        nsg_count = nsg_count + 1
-       print*,nstep_sinkgas,nsg_count
        update_sgforce = nsg_count >= nstep_sinkgas
        if(update_sgforce) nsg_count = 0
     endif
@@ -429,11 +428,9 @@ subroutine evol(infile,logfile,evfile,dumpfile,flag)
           if (nbinmax > nbinmaxprev) then
              nsg_count = nsg_count*2**(nbinmax-nbinmaxprev)
              nstep_sinkgas = nstep_sinkgas*2**(nbinmax-nbinmaxprev)
-             !print*,' adjust factor = ',2**(nbinmax-nbinmaxprev)
           else
              nsg_count = nsg_count/2**(nbinmaxprev - nbinmax)
              nstep_sinkgas = nstep_sinkgas/2**(nbinmaxprev - nbinmax)
-             ! print*,' adjust factor = ',2**(nbinmaxprev-nbinmax)
           endif
        endif
     endif
