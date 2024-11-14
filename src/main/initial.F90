@@ -563,7 +563,7 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
              else
                 call get_accel_sink_gas(nptmass,xyzh(1,i),xyzh(2,i),xyzh(3,i),xyzh(4,i),xyzmh_ptmass, &
                                         fext(1,i),fext(2,i),fext(3,i),poti,pmassi,fxyz_ptmass,&
-                                        dsdt_ptmass,fonrmax,dtphi2,bin_info=bin_info)
+                                        dsdt_ptmass,fonrmax,dtphi2i,bin_info=bin_info)
              endif
           else
              if (is_sinkgas_slow) then
@@ -573,7 +573,7 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
              else
                 call get_accel_sink_gas(nptmass,xyzh(1,i),xyzh(2,i),xyzh(3,i),xyzh(4,i),xyzmh_ptmass, &
                                        fext(1,i),fext(2,i),fext(3,i),poti,pmassi,fxyz_ptmass,&
-                                       dsdt_ptmass,fonrmax,dtphi2)
+                                       dsdt_ptmass,fonrmax,dtphi2i)
              endif
           endif
           fonrmax = max(fonrmax,fonrmaxi)

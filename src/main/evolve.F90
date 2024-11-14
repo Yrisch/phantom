@@ -97,7 +97,7 @@ subroutine evol(infile,logfile,evfile,dumpfile,flag)
  use ptmass,           only:icreate_sinks,ptmass_create,ipart_rhomax,pt_write_sinkev,calculate_mdot, &
                             set_integration_precision,ptmass_create_stars,use_regnbody,ptmass_create_seeds,&
                             ipart_createseeds,ipart_createstars,is_sinkgas_slow,dtsinkgasslow,nstep_sinkgas,&
-                            update_sgforce,get_accel_sink_slow
+                            update_sgforce,get_accel_sink_slow,dtsinkgasslow
  use io_summary,       only:iosum_nreal,summary_counter,summary_printout,summary_printnow
  use externalforces,   only:iext_spiral
  use boundary_dyn,     only:dynamic_bdy,update_boundaries
@@ -374,6 +374,7 @@ subroutine evol(infile,logfile,evfile,dumpfile,flag)
        nsg_count = nsg_count + 1
        update_sgforce = nsg_count >= nstep_sinkgas
        if(update_sgforce) nsg_count = 0
+       !print*,nsg_count, nstep_sinkgas,dtsinkgasslow
     endif
 
     nsteps = nsteps + 1

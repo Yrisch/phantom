@@ -180,6 +180,7 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
  !$omp shared(dustprop,ddustprop,dustproppred,ufloor) &
  !$omp shared(mprev,filfacprev,filfac,use_porosity) &
  !$omp shared(ibin,ibin_old,twas,timei) &
+ !$omp shared(is_sinkgas_slow,fgasink_slow)&
  !$omp firstprivate(itype) &
  !$omp private(i,hdti) &
  !$omp reduction(+:nvfloorp)
@@ -202,6 +203,9 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
        if (gr) then
           pxyzu(:,i) = pxyzu(:,i) + hdti*fxyzu(:,i)
        else
+          if(is_sinkgas_slow) then
+             vxyzu(:,i) = vxyzu(:,i) + hdti*fgasink_slow(:,i)
+          endif
           vxyzu(:,i) = vxyzu(:,i) + hdti*fxyzu(:,i)
        endif
 
@@ -242,6 +246,7 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
  !
  if (is_sinkgas_slow .and. nptmass>0) then
     call ptmass_kick(nptmass,hdtsph,vxyz_ptmass,fsinkgas_slow,xyzmh_ptmass,dsdt_ptmass)
+    if (update_sgforce) fsinkgas_slow = 0.
  endif
 
 
@@ -335,11 +340,26 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
        else
           hdti = 0.5*dtsph
        endif
+       !
+       ! if sink gas interaction is a slow force we need to recompute this force each dtsinkgas
+       !
+       if (is_sinkgas_slow .and. nptmass>0 .and. update_sgforce) then
+          fgasink_slow(:,i) = 0.
+          call get_accel_sink_gas(nptmass,xyzh(1,i),xyzh(2,i),xyzh(3,i),xyzh(4,i),xyzmh_ptmass,&
+                                 fgasink_slow(1,i),fgasink_slow(2,i),fgasink_slow(3,i),&
+                                 phisg,pmassi,fsinkgas_slow,dsdt_ptmass,fonrmaxi,dtphi2i,&
+                                 bin_info=bin_info)
+          fonrmax = max(fonrmax,fonrmaxi)
+          dtphi2  = min(dtphi2,dtphi2i)
+       endif
 
        if (gr) then
           ppred(:,i) = pxyzu(:,i) + hdti*fxyzu(:,i)
        else
           vpred(:,i) = vxyzu(:,i) + hdti*fxyzu(:,i)
+          if(is_sinkgas_slow) then
+             vpred(:,i) = vpred(:,i) + hdti*fgasink_slow(:,i)
+          endif
        endif
 
        !--floor the thermal energy if requested and required
@@ -385,17 +405,6 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
              source = max(0.0_4,-divcurlv(1,i))
              alphaind(1,i) = real(min((alphaind(1,i) + dtsph*(source + alpha*tdecay1))*ddenom,alphamax),kind=kind(alphaind))
           endif
-       endif
-       !
-       ! if sink gas interaction is a slow force we need to recompute this force each dtsinkgas
-       !
-       if (is_sinkgas_slow .and. nptmass>0 .and. update_sgforce) then
-          call get_accel_sink_gas(nptmass,xyzh(1,i),xyzh(2,i),xyzh(3,i),xyzh(4,i),xyzmh_ptmass,&
-                                  fgasink_slow(1,i),fgasink_slow(2,i),fgasink_slow(3,i),&
-                                  phisg,pmassi,fsinkgas_slow,dsdt_ptmass,fonrmaxi,dtphi2i,&
-                                  bin_info=bin_info)
-          fonrmax = max(fonrmax,fonrmaxi)
-          dtphi2  = min(dtphi2,dtphi2i)
        endif
     endif
  enddo predict_sph
@@ -626,6 +635,9 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
                 vxyzu(3,i) = vzi
                 !--this is the energy equation if non-isothermal
                 if (maxvxyzu >= 4) vxyzu(4,i) = eni
+                if (is_sinkgas_slow) then
+                   vxyzu(:,i) = vxyzu(:,i) + hdtsph*fgasink_slow(:,i)
+                endif
              endif
 
              if (itype==idust .and. use_dustgrowth) dustprop(:,i) = dustprop(:,i) + hdtsph*ddustprop(:,i)
@@ -667,6 +679,7 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
 !$omp shared(dustprop,ddustprop,dustproppred,use_dustfrac,dustevol,dustpred,ddustevol) &
 !$omp shared(filfac,filfacpred,use_porosity) &
 !$omp shared(rad,drad,radpred) &
+!$omp shared(is_sinkgas_slow,fgasink_slow)&
 !$omp firstprivate(itype) &
 !$omp schedule(static)
        until_converged: do i=1,npart
@@ -705,6 +718,11 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
                 pxyzu(:,i) = pxyzu(:,i) - hdtsph*fxyzu(:,i)
              else
                 vxyzu(:,i) = vxyzu(:,i) - hdtsph*fxyzu(:,i)
+                if (is_sinkgas_slow) then
+                   vxyzu(:,i) = vxyzu(:,i) - hdtsph*fgasink_slow(:,i)
+                   !np = 0
+                endif
+
              endif
              if (itype==idust .and. use_dustgrowth) dustprop(:,i) = dustprop(:,i) - hdtsph*ddustprop(:,i)
              if (itype==igas) then

@@ -1023,7 +1023,7 @@ subroutine get_force(nptmass,npart,nsubsteps,ntypes,timei,dtextforce,xyzh,vxyzu,
           yi = xyzh(2,i)
           zi = xyzh(3,i)
        endif
-       if (nptmass > 0 .and. .not.is_sinkgas_slow) then
+       if (nptmass > 0 .and. (.not.is_sinkgas_slow)) then
           if (wsub) then
              if (extrap) then
                 call get_accel_sink_gas(nptmass,xi,yi,zi,xyzh(4,i),xyzmh_ptmass,&
