@@ -1847,6 +1847,9 @@ subroutine ptmass_create_stars(nptmass,itest,xyzmh_ptmass,vxyz_ptmass,fxyz_ptmas
  else
     allocate(masses(n))
     minmass  = 0.08/(mi*(umass/solarm))
+
+    if (iverbose > 1) write(iprint,*) "Mass sharing start ! "
+
     call divide_unit_seg(masses,minmass,n,iseed_sf)
 
     if (iverbose > 1) write(iprint,*) "Mass sharing  : ", masses*mi*(umass/solarm)
@@ -1993,12 +1996,17 @@ end subroutine ptmass_create_stars
 !-------------------------------------------------------------------------
 subroutine update_after_merge(itest,n,xyzmh_ptmass,vxyz_ptmass,fxyz_ptmass,linklist_ptmass)
  use random ,   only:ran2,rinsphere
+ use io,        only: iverbose,iprint
  integer, intent(in)    :: itest,n
  integer, intent(inout) :: linklist_ptmass(:)
  real,    intent(inout) :: xyzmh_ptmass(:,:),vxyz_ptmass(:,:),fxyz_ptmass(:,:)
  real    :: xi(3),vi(3),xk(3),vk(3),xcom(3),vcom(3),mi,mk,hacci,relfac
  real    :: r,vl,mrel
- integer :: nextra,nrel,k,ncur,kextra
+ integer :: nextra,nrel,k,ncur,kextra,k_old
+
+ if (iverbose >1) then
+    write(iprint,*) 'Update after merge !! '
+ endif
 
  nextra = n-n_max        ! n extra seeds to evacuate (release or kill)
  relfac = ran2(iseed_sf) ! fraction of extra seeds that will be released
@@ -2056,8 +2064,9 @@ subroutine update_after_merge(itest,n,xyzmh_ptmass,vxyz_ptmass,fxyz_ptmass,linkl
        ncur = ncur + 1
        k = linklist_ptmass(k)
     else
+       k_old = k
        k = linklist_ptmass(k)
-       linklist_ptmass(k) = -2
+       linklist_ptmass(k_old) = -2
     endif
  enddo
 
@@ -2066,12 +2075,14 @@ subroutine update_after_merge(itest,n,xyzmh_ptmass,vxyz_ptmass,fxyz_ptmass,linkl
  !
  k = kextra
  do while(k>0)
-    xcom(1) = xcom(1) + xyzmh_ptmass(4,k) * xyzmh_ptmass(1,k)
-    xcom(2) = xcom(2) + xyzmh_ptmass(4,k) * xyzmh_ptmass(2,k)
-    xcom(3) = xcom(3) + xyzmh_ptmass(4,k) * xyzmh_ptmass(3,k)
-    vcom(1) = vcom(1) + xyzmh_ptmass(4,k) * vxyz_ptmass(1,k)
-    vcom(2) = vcom(2) + xyzmh_ptmass(4,k) * vxyz_ptmass(2,k)
-    vcom(3) = vcom(3) + xyzmh_ptmass(4,k) * vxyz_ptmass(3,k)
+    if(xyzmh_ptmass(4,k) > 0.) then
+       xcom(1) = xcom(1) + xyzmh_ptmass(4,k) * xyzmh_ptmass(1,k)
+       xcom(2) = xcom(2) + xyzmh_ptmass(4,k) * xyzmh_ptmass(2,k)
+       xcom(3) = xcom(3) + xyzmh_ptmass(4,k) * xyzmh_ptmass(3,k)
+       vcom(1) = vcom(1) + xyzmh_ptmass(4,k) * vxyz_ptmass(1,k)
+       vcom(2) = vcom(2) + xyzmh_ptmass(4,k) * vxyz_ptmass(2,k)
+       vcom(3) = vcom(3) + xyzmh_ptmass(4,k) * vxyz_ptmass(3,k)
+    endif
     k = linklist_ptmass(k) ! acces to the next point mass in the linked list
  enddo
 
@@ -2080,23 +2091,26 @@ subroutine update_after_merge(itest,n,xyzmh_ptmass,vxyz_ptmass,fxyz_ptmass,linkl
 
  k = kextra
  do while(k>0)
-    xyzmh_ptmass(1,k) = xyzmh_ptmass(1,k) - xcom(1) + xi(1)
-    xyzmh_ptmass(2,k) = xyzmh_ptmass(2,k) - xcom(2) + xi(2)
-    xyzmh_ptmass(3,k) = xyzmh_ptmass(3,k) - xcom(3) + xi(3)
-    vxyz_ptmass(1,k)  = vxyz_ptmass(1,k)  - vcom(1) + vi(1)
-    vxyz_ptmass(2,k)  = vxyz_ptmass(2,k)  - vcom(2) + vi(2)
-    vxyz_ptmass(3,k)  = vxyz_ptmass(3,k)  - vcom(3) + vi(3)
+    if(xyzmh_ptmass(4,k) > 0.) then
+       xyzmh_ptmass(1,k) = xyzmh_ptmass(1,k) - xcom(1) + xi(1)
+       xyzmh_ptmass(2,k) = xyzmh_ptmass(2,k) - xcom(2) + xi(2)
+       xyzmh_ptmass(3,k) = xyzmh_ptmass(3,k) - xcom(3) + xi(3)
+       vxyz_ptmass(1,k)  = vxyz_ptmass(1,k)  - vcom(1) + vi(1)
+       vxyz_ptmass(2,k)  = vxyz_ptmass(2,k)  - vcom(2) + vi(2)
+       vxyz_ptmass(3,k)  = vxyz_ptmass(3,k)  - vcom(3) + vi(3)
+    endif
     k = linklist_ptmass(k) ! acces to the next point mass in the linked list
  enddo
 
-
- xyzmh_ptmass(1,itest) = xyzmh_ptmass(1,itest) - xcom(1)
- xyzmh_ptmass(2,itest) = xyzmh_ptmass(2,itest) - xcom(2)
- xyzmh_ptmass(3,itest) = xyzmh_ptmass(3,itest) - xcom(3)
- xyzmh_ptmass(4,itest) = xyzmh_ptmass(4,itest) - mrel
- vxyz_ptmass(1,itest)  = vxyz_ptmass(1,itest)  - vcom(1)
- vxyz_ptmass(2,itest)  = vxyz_ptmass(2,itest)  - vcom(2)
- vxyz_ptmass(3,itest)  = vxyz_ptmass(3,itest)  - vcom(3)
+ if (mrel > 0.) then
+    xyzmh_ptmass(1,itest) = xyzmh_ptmass(1,itest) - xcom(1)
+    xyzmh_ptmass(2,itest) = xyzmh_ptmass(2,itest) - xcom(2)
+    xyzmh_ptmass(3,itest) = xyzmh_ptmass(3,itest) - xcom(3)
+    xyzmh_ptmass(4,itest) = xyzmh_ptmass(4,itest) - mrel
+    vxyz_ptmass(1,itest)  = vxyz_ptmass(1,itest)  - vcom(1)
+    vxyz_ptmass(2,itest)  = vxyz_ptmass(2,itest)  - vcom(2)
+    vxyz_ptmass(3,itest)  = vxyz_ptmass(3,itest)  - vcom(3)
+ endif
 
 end subroutine update_after_merge
 
