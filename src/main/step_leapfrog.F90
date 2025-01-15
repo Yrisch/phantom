@@ -204,7 +204,7 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
           pxyzu(:,i) = pxyzu(:,i) + hdti*fxyzu(:,i)
        else
           if(is_sinkgas_slow) then
-             vxyzu(:,i) = vxyzu(:,i) + hdti*fgasink_slow(:,i)
+             vxyzu(1:3,i) = vxyzu(1:3,i) + hdti*fgasink_slow(1:3,i)
           endif
           vxyzu(:,i) = vxyzu(:,i) + hdti*fxyzu(:,i)
        endif
@@ -358,7 +358,7 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
        else
           vpred(:,i) = vxyzu(:,i) + hdti*fxyzu(:,i)
           if(is_sinkgas_slow) then
-             vpred(:,i) = vpred(:,i) + hdti*fgasink_slow(:,i)
+             vpred(1:3,i) = vpred(1:3,i) + hdti*fgasink_slow(1:3,i)
           endif
        endif
 
@@ -537,7 +537,7 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
                 else
                    vxyzu(:,i) = vxyzu(:,i) + dti*fxyzu(:,i)
                    if(is_sinkgas_slow) then
-                      vxyzu(:,i) = vxyzu(:,i) + dti*fgasink_slow(:,i)
+                      vxyzu(1:3,i) = vxyzu(1:3,i) + dti*fgasink_slow(1:3,i)
                    endif
                 endif
 
@@ -562,7 +562,7 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
              else
                 vxyzu(:,i) = vxyzu(:,i) + hdti*fxyzu(:,i)
                 if(is_sinkgas_slow) then
-                   vxyzu(:,i) = vxyzu(:,i) + hdti*fgasink_slow(:,i)
+                   vxyzu(1:3,i) = vxyzu(1:3,i) + hdti*fgasink_slow(1:3,i)
                 endif
              endif
 
@@ -636,7 +636,7 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
                 !--this is the energy equation if non-isothermal
                 if (maxvxyzu >= 4) vxyzu(4,i) = eni
                 if (is_sinkgas_slow) then
-                   vxyzu(:,i) = vxyzu(:,i) + hdtsph*fgasink_slow(:,i)
+                   vxyzu(1:3,i) = vxyzu(1:3,i) + hdtsph*fgasink_slow(1:3,i)
                 endif
              endif
 
@@ -719,7 +719,7 @@ subroutine step(npart,nactive,t,dtsph,dtextforce,dtnew)
              else
                 vxyzu(:,i) = vxyzu(:,i) - hdtsph*fxyzu(:,i)
                 if (is_sinkgas_slow) then
-                   vxyzu(:,i) = vxyzu(:,i) - hdtsph*fgasink_slow(:,i)
+                   vxyzu(1:3,i) = vxyzu(1:3,i) - hdtsph*fgasink_slow(1:3,i)
                    !np = 0
                 endif
 
