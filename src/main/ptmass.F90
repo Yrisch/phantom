@@ -81,7 +81,7 @@ module ptmass
  real,    public :: tseeds   = huge(f_acc)
  integer, public :: n_max    = 5
 
- logical, public :: merge_release_sort = .false.
+ logical, public :: merge_release_sort = .true.
  logical, public :: use_regnbody       = .false. ! subsystems switch
  logical, public :: use_fourthorder    = .true.
  integer, public :: n_force_order      = 3
@@ -1944,13 +1944,14 @@ subroutine ptmass_merge_release(itest,ni,nj,mi,mj,nptmass,xyzmh_ptmass,vxyz_ptma
                            vxyz_ptmass(3,maxptmass),fxyz_ptmass(4,maxptmass)
  real, allocatable :: masses(:)
  real              :: xi(3),vi(3),xk(3),vk(3),xcom(3),vcom(3)
- real              :: r,vl,mrel,mk,hacci,minmass,mtmp
+ real              :: r,vl,mrel,mk,hacci,minmass,mtmp,mij
  integer           :: ntot,nrel,nsav,i,itmp
 
  if (iverbose >1) then
     write(iprint,*) 'Update after merge !! '
  endif
  ntot = ni+nj
+ mij  = mi+mj
 
  allocate(masses(ntot))
 !
@@ -1958,8 +1959,10 @@ subroutine ptmass_merge_release(itest,ni,nj,mi,mj,nptmass,xyzmh_ptmass,vxyz_ptma
 !
  minmass  = 0.08/(mi*(umass/solarm))
  call divide_unit_seg(masses(1:ni),minmass,ni,iseed_sf)
+ masses(1:ni) = masses(1:ni)*mi
  minmass  = 0.08/(mj*(umass/solarm))
  call divide_unit_seg(masses(ni+1:ntot),minmass,nj,iseed_sf)
+ masses(1:ni) = masses(1:ni)*mj
 !
 !-- Choose how many protostars (1 to 3) remains inside the sink
 !
@@ -2005,9 +2008,10 @@ subroutine ptmass_merge_release(itest,ni,nj,mi,mj,nptmass,xyzmh_ptmass,vxyz_ptma
     call ronsphere(vk,iseed_sf)
     xk = xk * hacci
     r  = xk(1)**2 + xk(2)**2 + xk(3)**2
-    vl = sqrt(2*(mi+mj)/r) ! liberation velocity of the entire system...
-    vk = vk * vl
     mk = masses(nsav+i)
+
+    vl = sqrt(2*(mij-mk)/r) ! liberation velocity of the entire system...
+    vk = vk * vl
     !
     !-- Star creation
     !
