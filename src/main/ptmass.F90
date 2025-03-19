@@ -1962,7 +1962,7 @@ subroutine ptmass_merge_release(itest,ni,nj,mi,mj,nptmass,xyzmh_ptmass,vxyz_ptma
  masses(1:ni) = masses(1:ni)*mi
  minmass  = 0.08/(mj*(umass/solarm))
  call divide_unit_seg(masses(ni+1:ntot),minmass,nj,iseed_sf)
- masses(1:ni) = masses(1:ni)*mj
+ masses(ni+1:ntot) = masses(ni+1:ntot)*mj
 !
 !-- Choose how many protostars (1 to 3) remains inside the sink
 !
