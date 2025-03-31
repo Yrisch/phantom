@@ -2116,10 +2116,11 @@ end subroutine ptmass_check_stars
 !-----------------------------------------------------------------------
 subroutine merge_sinks(time,nptmass,xyzmh_ptmass,vxyz_ptmass,fxyz_ptmass,fxyz_ptmass_tree,&
                        sf_ptmass,merge_ij)
- use io,    only:iprint,warning,iverbose,id,master,fatal
- use dim,   only:maxptmass
- use part,  only:itbirth
- use dim,   only:use_sinktree
+ use io,           only:iprint,warning,iverbose,id,master,fatal
+ use dim,          only:maxptmass
+ use part,         only:itbirth
+ use dim,          only:use_sinktree
+ use utils_kepler, only: extract_a
  real,    intent(in)    :: time
  integer, intent(inout) :: nptmass
  integer, intent(in)    :: merge_ij(nptmass)
@@ -2128,8 +2129,8 @@ subroutine merge_sinks(time,nptmass,xyzmh_ptmass,vxyz_ptmass,fxyz_ptmass,fxyz_pt
  real,    intent(inout) :: vxyz_ptmass(3,maxptmass),fxyz_ptmass(4,maxptmass)
  real,    intent(inout) :: fxyz_ptmass_tree(3,maxptmass)
  integer :: i,j,k,ni,nj
- real    :: rr2,xi,yi,zi,mi,vxi,vyi,vzi,xj,yj,zj,mj,vxj,vyj,vzj,Epot,Ekin
- real    :: mij,mij1,tbirthi,tbirthj
+ real    :: rr2,r,xi,yi,zi,mi,vxi,vyi,vzi,xj,yj,zj,mj,vxj,vyj,vzj,Epot,Ekin
+ real    :: mij,mij1,tbirthi,tbirthj,aij
  logical :: lmerge
  character(len=15) :: typ
  character(len=11), parameter :: label ="merge_sinks"
@@ -2162,13 +2163,24 @@ subroutine merge_sinks(time,nptmass,xyzmh_ptmass,vxyz_ptmass,fxyz_ptmass,fxyz_pt
           vyj = vxyz_ptmass(2,j)
           vzj = vxyz_ptmass(3,j)
           rr2 = (xi-xj)**2 + (yi-yj)**2 + (zi-zj)**2
+          mij = mi + mj
           if (rr2 < r_merge_uncond2) then
              lmerge = .true.
              typ    = 'unconditionally'
           elseif (rr2 < r_merge_cond2) then
              Ekin = 0.5*( (vxi-vxj)**2 + (vyi-vyj)**2 + (vzi-vzj)**2 )
-             Epot = -(mi+mj)/rr2
-             if (Ekin + Epot < 0.) lmerge = .true.
+             Epot = -mij/sqrt(rr2)
+             select case (icreate_sinks)
+             case(1)
+                if (Ekin + Epot < 0.) lmerge = .true.
+             case(2)
+                if (sf_ptmass(2,i)==0 .or. sf_ptmass(2,i)==0) then
+                   lmerge = .true.
+                elseif (Ekin + Epot < 0.) then
+                   call extract_a(r,mij,2.*Ekin,aij)
+                   if (aij < h_acc .and. aij > 0.) lmerge = .true.
+                endif
+             end select
              typ    = 'conditionally'
           endif
           if (lmerge) then
@@ -2177,7 +2189,6 @@ subroutine merge_sinks(time,nptmass,xyzmh_ptmass,vxyz_ptmass,fxyz_ptmass,fxyz_pt
              xyzmh_ptmass(ispiny,i) = xyzmh_ptmass(ispiny,i) + mi*(zi*vxi - xi*vzi)
              xyzmh_ptmass(ispinz,i) = xyzmh_ptmass(ispinz,i) + mi*(xi*vyi - yi*vxi)
              ! Calculate new masses
-             mij  = mi + mj
              mij1 = 1.0/mij
              ! Update quantities
              xyzmh_ptmass(1:3,i)    = (xyzmh_ptmass(1:3,i)*mi + xyzmh_ptmass(1:3,j)*mj)*mij1
@@ -2201,8 +2212,8 @@ subroutine merge_sinks(time,nptmass,xyzmh_ptmass,vxyz_ptmass,fxyz_ptmass,fxyz_pt
              ! Kill sink j by setting negative mass
              xyzmh_ptmass(4,j)      = -abs(mj)
              xyzmh_ptmass(ihacc,j)  = -1.
+             ! Merge stars seeds and release escapers
              if (icreate_sinks == 2) then
-                ! Merge stars seeds and release escapers
                 if (sf_ptmass(2,j)>=0) then
                    ni = sf_ptmass(2,i)
                    nj = sf_ptmass(2,j)
