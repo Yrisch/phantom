@@ -2040,12 +2040,12 @@ subroutine ptmass_merge_release(itest,ni,nj,mi,mj,nptmass,xyzmh_ptmass,vxyz_ptma
  !-- Center the system on itest position and velocity
  !
  do i=1,nrel
-    xyzmh_ptmass(1,nptmass+i) = xyzmh_ptmass(1,nptmass+i) - xi(1)
-    xyzmh_ptmass(2,nptmass+i) = xyzmh_ptmass(2,nptmass+i) - xi(2)
-    xyzmh_ptmass(3,nptmass+i) = xyzmh_ptmass(3,nptmass+i) - xi(3)
-    vxyz_ptmass(1,nptmass+i)  = vxyz_ptmass(1,nptmass+i)  - vi(1)
-    vxyz_ptmass(2,nptmass+i)  = vxyz_ptmass(2,nptmass+i)  - vi(2)
-    vxyz_ptmass(3,nptmass+i)  = vxyz_ptmass(3,nptmass+i)  - vi(3)
+    xyzmh_ptmass(1,nptmass+i) = xyzmh_ptmass(1,nptmass+i) + xi(1)
+    xyzmh_ptmass(2,nptmass+i) = xyzmh_ptmass(2,nptmass+i) + xi(2)
+    xyzmh_ptmass(3,nptmass+i) = xyzmh_ptmass(3,nptmass+i) + xi(3)
+    vxyz_ptmass(1,nptmass+i)  = vxyz_ptmass(1,nptmass+i)  + vi(1)
+    vxyz_ptmass(2,nptmass+i)  = vxyz_ptmass(2,nptmass+i)  + vi(2)
+    vxyz_ptmass(3,nptmass+i)  = vxyz_ptmass(3,nptmass+i)  + vi(3)
  enddo
 
  if (mrel > 0.) then
