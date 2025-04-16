@@ -1043,10 +1043,10 @@ subroutine update_ptmass(dptmass,xyzmh_ptmass,vxyz_ptmass,fxyz_ptmass,nptmass)
                                 - xyzmh_ptmass(2,1:nptmass)*vxyz_ptmass(1,1:nptmass))
  ! Calculate new masses
  newptmass(1:nptmass)           =xyzmh_ptmass(4,1:nptmass)+dptmass(idmsi,1:nptmass)
- where (newptmass(1:nptmass) > 0)
-    newptmass1(1:nptmass)       = 1./newptmass(1:nptmass)
- elsewhere
+ where (newptmass(1:nptmass) == 0)
     newptmass1(1:nptmass)       = 1.
+ elsewhere
+    newptmass1(1:nptmass)       = 1./newptmass(1:nptmass)
  endwhere
  ! Update position and accreted mass
  xyzmh_ptmass(1,1:nptmass)      =(dptmass(idxmsi,1:nptmass)+xyzmh_ptmass(1,1:nptmass)*xyzmh_ptmass(4,1:nptmass))*newptmass1
