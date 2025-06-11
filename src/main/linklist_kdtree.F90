@@ -201,7 +201,8 @@ subroutine get_neighbour_list(inode,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesi
                               cell_xpos,cell_xsizei,cell_rcuti)
  use io,     only:nprocs
  use dim,    only:mpi
- use kdtree, only:getneigh,lenfgrav
+ use kdtree, only:getneigh
+ use dtypekdtree, only: lenfgrav
  use kernel, only:radkern
  use part,   only:gravity
 #ifdef PERIODIC
@@ -258,7 +259,7 @@ subroutine get_neighbour_list(inode,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesi
  if (mpi .and. global_search) then
     ! Find MPI tasks that have neighbours of this cell, output to remote_export
     call getneigh(nodeglobal,xpos,xsizei,rcuti,3,mylistneigh,nneigh,xyzcache,ixyzcachesize,&
-            cellatid,get_j,get_f,fgrav_global,remote_export)
+            cellatid,get_j,.false.,fgrav_global,remote_export)
  elseif (get_f) then
     ! Set fgrav to zero, which matters if gravity is enabled but global search is not
     fgrav_global = 0.0
@@ -266,9 +267,9 @@ subroutine get_neighbour_list(inode,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesi
 
  ! Find neighbours of this cell on this node
  call getneigh(node,xpos,xsizei,rcuti,3,mylistneigh,nneigh,xyzcache,ixyzcachesize,&
-              ifirstincell,get_j,get_f,fgrav)
+              ifirstincell,get_j,.false.,fgrav)
 
- if (get_f) f = fgrav + fgrav_global
+ if (get_f) f = node(inode)%fnode !fgrav + fgrav_global
 
 end subroutine get_neighbour_list
 

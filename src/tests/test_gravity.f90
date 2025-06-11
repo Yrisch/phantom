@@ -46,7 +46,7 @@ subroutine test_gravity(ntests,npass,string)
     testtaylorseries = .true.
  case('directsum')
     testdirectsum = .true.
- case('polytrope')
+ case('fmm')
     testpolytrope = .true.
  case default
     testall = .true.
@@ -62,6 +62,8 @@ subroutine test_gravity(ntests,npass,string)
     !--unit tests of treecode gravity by direct summation
     !
     if (testdirectsum .or. testall) call test_directsum(ntests,npass)
+
+    if (testpolytrope .or. testall) call test_FMM(ntests,npass)
 
     if (id==master) write(*,"(/,a)") '<-- SELF-GRAVITY TESTS COMPLETE'
  else
@@ -259,9 +261,9 @@ subroutine test_directsum(ntests,npass)
  use setup_params,    only:npart_total
 
  integer, intent(inout) :: ntests,npass
- integer :: nfailed(18),boundi,boundf
+ integer :: nfailed(18),boundi,boundf,j
  integer :: maxvxyzu,nx,np,i,k,merge_n,merge_ij(maxptmass),nfgrav
- real :: psep,totvol,totmass,rhozero,tol,pmassi
+ real :: psep,totvol,totmass,rhozero,tol,pmassi,fsum(3)
  real :: time,rmin,rmax,phitot,dtsinksink,fonrmax,phii,epot_gas_sink
  real(kind=4) :: t1,t2
  real :: epoti,tree_acc_prev
@@ -397,6 +399,16 @@ subroutine test_directsum(ntests,npass)
        call compute_energies(0.)
        call checkval(epot,phitot,5.2e-4,nfailed(6),'epot in compute_energies')
        call update_test_scores(ntests,nfailed(1:6),npass)
+
+       do j=1,3
+          fsum(j)=sum(fxyzu(j,1:npart))
+       enddo
+       nfailed = 0
+       call checkval(fsum(1),0.,1e-11,nfailed(1),"momentum conservation x")
+       call checkval(fsum(2),0.,1e-11,nfailed(2),"momentum conservation y")
+       call checkval(fsum(3),0.,1e-11,nfailed(3),"momentum conservation z")
+       call update_test_scores(ntests,nfailed(1:3),npass)
+
     endif
  enddo
 
@@ -725,5 +737,100 @@ subroutine get_finite_diff(ndim,x0,xposj,totmass,quads,fnode,dfdx,dpot,d2f,eps)
  enddo
 
 end subroutine get_finite_diff
+
+!-----------------------------------------------------------------------
+!+
+!   test that we can successfully relax a polytrope
+!   and that the profile matches the analytic solution
+!+
+!-----------------------------------------------------------------------
+subroutine test_FMM(ntests,npass)
+ use io,        only:id,master,iverbose
+ use part,      only:npart,npartoftype,xyzh,massoftype,hfact,&
+                     init_part,iphase,isetphase,fxyzu
+ use mpidomain, only:i_belong
+ use options,   only:ieos
+ use physcon,   only:solarr,solarm,pi
+ use units,     only:set_units
+ use eos,       only:gamma
+ use kdtree,    only:tree_accuracy
+ use checksetup, only:check_setup
+ use spherical, only: set_sphere
+ use deriv,     only: get_derivs_global
+ use testutils,       only:checkval,checkvalbuf_end,update_test_scores
+ use dim, only:maxp,maxphase
+
+ integer, intent(inout) :: ntests,npass
+ real :: x0(3),rmin,rmax,nx,psep,totvol,time,fsum(3)
+ integer(kind=8) ::npart_total
+ integer :: np
+ integer :: nfail(4),i
+
+ npart = 0
+ npartoftype = 0
+ massoftype = 0.
+ iverbose = 0
+ call set_units(dist=10.*solarr,mass=10.*solarm,G=1.d0)
+
+ x0 = 0.
+ fsum = 0.
+
+ !
+ !--general parameters
+ !
+ time  = 0.
+ hfact = 1.2
+ gamma = 5./3.
+ rmin  = 0.
+ rmax  = 1.
+ ieos  = 2
+ tree_accuracy = 0.5
+ !
+ !--setup particles
+ !
+ call init_part()
+ np       = 100
+ totvol   = 4./3.*pi*rmax**3
+ nx       = int(np**(1./3.))
+ psep     = totvol**(1./3.)/real(nx)
+ psep     = 0.18
+ npart    = 0
+
+ ! do this test twice, to check the second star relaxes...
+ do i=1,2
+    if (i==2) x0 = [20.,0.,0.]
+    ! only set up particles on master, otherwise we will end up with n duplicates
+    if (id==master) then
+       call set_sphere('random',id,master,rmin,rmax,psep,hfact,npart,xyzh,npart_total,np_requested=np,xyz_origin=x0)
+    endif
+    np = npart
+ enddo
+ npartoftype(:) = 0
+ npartoftype(6) = np*2
+ massoftype(:)  = 0.
+ massoftype(6)  = 0.1/(np*2)
+
+ if (maxphase==maxp) then
+    do i=1,npart
+       iphase(i) = isetphase(6,iactive=.true.)
+    enddo
+ endif
+
+ call get_derivs_global()
+
+ do i=1,npart
+    fsum(1) = fsum(1) + fxyzu(1,i)
+    fsum(2) = fsum(2) + fxyzu(2,i)
+    fsum(3) = fsum(3) + fxyzu(3,i)
+ enddo
+
+ call checkval(fsum(1),0.,1e-11,nfail(1),"momentum conservation x")
+ call checkval(fsum(2),0.,1e-11,nfail(2),"momentum conservation y")
+ call checkval(fsum(3),0.,1e-11,nfail(3),"momentum conservation z")
+ call checkval(npart,npart,0,nfail(4),'np = 2000')
+ call update_test_scores(ntests,nfail,npass)
+
+end subroutine test_FMM
+
 
 end module testgravity

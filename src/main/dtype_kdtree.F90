@@ -18,6 +18,9 @@ module dtypekdtree
 !
  implicit none
 
+ integer, parameter, public :: lenfgrav = 20
+
+
 #ifdef TREEVIZ
  integer, parameter :: ndimtree = 2  ! 2D for visualisation/debugging only
 #else
@@ -34,6 +37,7 @@ module dtypekdtree
 #ifdef GRAVITY
                     + 8 &           ! mass
                     + 8*6 &         ! quads(6)
+                    + 8*lenfgrav &  ! fnode(20)
 #endif
 #ifdef TREEVIZ
  + 8*ndimtree &  ! xmin(ndimtree)
@@ -59,6 +63,7 @@ module dtypekdtree
 #ifdef GRAVITY
     real :: mass
     real :: quads(6)
+    real :: fnode(20)
 #endif
 #ifdef TREEVIZ
     real :: xmin(ndimtree)

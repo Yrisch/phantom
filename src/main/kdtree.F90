@@ -22,7 +22,7 @@ module kdtree
 !
  use dim,         only:maxp,ncellsmax,minpart,use_apr,use_sinktree,maxptmass,maxpsph
  use io,          only:nprocs
- use dtypekdtree, only:kdnode,ndimtree
+ use dtypekdtree, only:kdnode,ndimtree,lenfgrav
  use part,        only:ll,iphase,xyzh_soa,iphase_soa,maxphase,dxi, &
                        apr_level,apr_level_soa,aprmassoftype
 
@@ -55,8 +55,6 @@ module kdtree
  public :: maketreeglobal
  public :: empty_tree
  public :: compute_fnode, expand_fgrav_in_taylor_series
-
- integer, parameter, public :: lenfgrav = 20
 
  integer, public :: maxlevel_indexed, maxlevel
 
@@ -306,6 +304,8 @@ subroutine maketree(node, xyzh, np, ndim, ifirstincell, ncells, apr_tree, refine
     write(iprint,"(a,i10,3(a,i2))") ' maketree: nodes = ',ncells,', max level = ',maxlevel,&
        ', min leaf level = ',minlevel,' max level indexed = ',maxlevel_indexed
  endif
+
+ call compute_node_node(node)
 
 end subroutine maketree
 
@@ -798,6 +798,7 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
 #ifdef GRAVITY
  nodeentry%mass    = totmass_node
  nodeentry%quads   = quads
+ nodeentry%fnode   = 0.
 #endif
 #ifdef TREEVIZ
  nodeentry%xmin(:) = xmini(:)
@@ -1294,7 +1295,7 @@ subroutine getneigh(node,xpos,xsizei,rcuti,ndim,listneigh,nneigh,xyzcache,ixyzca
     endif
     rcut2 = (xsizei + xsizej + rcut)**2   ! node size + search radius
 #ifdef GRAVITY
-    open_tree_node = tree_acc2*r2 < xsizej*xsizej    ! tree opening criterion for self-gravity
+    open_tree_node = tree_acc2*r2 < rcut2  ! tree opening criterion for self-gravity
 #endif
     if_open_node: if ((r2 < rcut2) .or. open_tree_node) then
        if_leaf: if (ifirstincell(n) /= 0) then ! once we hit a leaf node, retrieve contents into trial neighbour cache
@@ -1485,6 +1486,269 @@ pure subroutine compute_fnode(dx,dy,dz,dr,totmass,quads,fnode)
  fnode(20) = fnode(20) - totmass*dr - 0.5*rijQij*dr3   ! potential
 
 end subroutine compute_fnode
+
+
+!-----------------------------------------------------------
+!+
+!  Compute the Taylor expansion coeffs between the node
+!  centres using the quadrupole moments (p=3)
+!
+!+
+!-----------------------------------------------------------
+pure subroutine compute_M2L(dx,dy,dz,dr,totmass,quads,fnode)
+ real, intent(in)    :: dx,dy,dz,dr,totmass
+ real, intent(in)    :: quads(6)
+ real, intent(inout) :: fnode(lenfgrav)
+ real :: dr2,dr3,dr5,dr7,dr3m,dr5m3,rx,ry,rz,qxx,qxy,qxz,qyy,qyz,qzz
+ real :: fqx,fqy,fqz
+ real :: mconst
+
+
+ ! note: dr == 1/sqrt(r2)
+ dr2  = dr*dr
+ dr3  = dr*dr2
+ dr5  = dr2*dr3
+ dr7  = dr2*dr5
+ dr3m  = totmass*dr3
+ dr5m3 = 3.*totmass*dr5
+ rx  = dx*dr
+ ry  = dy*dr
+ rz  = dz*dr
+ qxx = quads(1)
+ qxy = quads(2)
+ qxz = quads(3)
+ qyy = quads(4)
+ qyz = quads(5)
+ qzz = quads(6)
+ mconst = (-1.5*dr5*(qxx+qyy+qzz) + 7.5*dr7*(rx*rx*qxx + 2.*rx*ry*qxy + 2*rx*rz*qxz + ry*ry*qyy +&
+                                              2*ry*rz*qxz + rz*rz*qzz))
+ fqx = -3.*dr7*(rx*qxx + ry*qxy + rz*qxz)
+ fqy = -3.*dr7*(rx*qxy + ry*qyy + rz*qyz)
+ fqz = -3.*dr7*(rx*qxz + ry*qyz + rz*qzz)
+
+
+ fnode( 1) = fnode( 1) - dx*(dr3m+mconst) + fqx
+ fnode( 2) = fnode( 2) - dy*(dr3m+mconst) + fqy
+ fnode( 3) = fnode( 3) - dz*(dr3m+mconst) + fqz
+ fnode( 4) = fnode( 4) + dr5m3*rx*rx - dr3m    !+ dfxdxq ! dfx/dx
+ fnode( 5) = fnode( 5) + dr5m3*rx*ry           !+ dfxdyq ! dfx/dy = dfy/dx
+ fnode( 6) = fnode( 6) + dr5m3*rx*rz           !+ dfxdzq ! dfx/dz = dfz/dx
+ fnode( 7) = fnode( 7) + dr5m3*ry*ry - dr3m    !+ dfydyq ! dfy/dy
+ fnode( 8) = fnode( 8) + dr5m3*ry*rz           !+ dfydzq ! dfy/dz = dfz/dy
+ fnode( 9) = fnode( 9) + dr5m3*rz*rz - dr3m    !+ dfzdzq ! dfz/dz
+ fnode(10) = fnode(10) - dr5m3*(5.*rx*rx*rx*dr2 - 3.*rx) !+ d2fxxxq ! d2fxdxdx
+ fnode(11) = fnode(11) - dr5m3*(5.*rx*rx*ry*dr2 - ry)    !+ d2fxxyq ! d2fxdxdy
+ fnode(12) = fnode(12) - dr5m3*(5.*rx*rx*rz*dr2 - rz)    !+ d2fxxzq ! d2fxdxdz
+ fnode(13) = fnode(13) - dr5m3*(5.*rx*ry*ry*dr2 - rx)    !+ d2fxyyq ! d2fxdydy
+ fnode(14) = fnode(14) - dr5m3*(5.*rx*ry*rz*dr2)         !+ d2fxyzq ! d2fxdydz
+ fnode(15) = fnode(15) - dr5m3*(5.*rx*rz*rz*dr2 - rx)    !+ d2fxzzq ! d2fxdzdz
+ fnode(16) = fnode(16) - dr5m3*(5.*ry*ry*ry*dr2 - 3.*ry) !+ d2fyyyq ! d2fydydy
+ fnode(17) = fnode(17) - dr5m3*(5.*ry*ry*rz*dr2 - rz)    !+ d2fyyzq ! d2fydydz
+ fnode(18) = fnode(18) - dr5m3*(5.*ry*rz*rz*dr2 - ry)    !+ d2fyzzq ! d2fydzdz
+ fnode(19) = fnode(19) - dr5m3*(5.*rz*rz*rz*dr2 - 3.*rz) !+ d2fzzzq ! d2fzdzdz
+ fnode(20) = fnode(20)   ! potential
+
+end subroutine compute_M2L
+
+!----------------------------------------------------------------
+!+
+!   Dual tree walk procedure to compute all node-node
+!   interactions that are found well-separated...
+!
+!   Original algorithm from Dehnen 2002. adapted and implemented
+!   in Phantom by Yann BERNARD.
+!+
+!----------------------------------------------------------------
+subroutine compute_node_node(node)
+
+ use io, only:fatal
+ type(kdnode), intent(inout)  :: node(:) !ncellsmax+1)
+ integer, parameter :: istacksize = 4800
+ integer            :: istack,inodeA,inodeB,i,ichild,ibigA,il,ir
+ integer            :: nstack(3,istacksize)
+ real               :: fnodeB(20),dx,dy,dz
+ logical            :: stackit
+
+ istack = 1
+ nstack(:,:) = 0
+ nstack(1,1) = irootnode
+ nstack(2,1) = irootnode
+ nstack(3,1) = 0
+
+ stack_internode: do while(istack > 0)
+    inodeA = nstack(1,istack)
+    inodeB = nstack(2,istack)
+    ibigA  = nstack(3,istack)
+    istack = istack - 1
+
+    if (ibigA > 0) then
+       do i=1,2
+          if (i==1) then
+             ichild = node(inodeA)%leftchild
+          else
+             ichild = node(inodeA)%rightchild
+          endif
+          !print*,ichild,inodeB
+          if (ichild/=0) then
+             call node_interaction(node(ichild),node(inodeB),ibigA,stackit)
+             !if(.not.stackit) print*,ichild,inodeB
+          else
+             stackit = .false.
+          endif
+
+          if (stackit) then
+             if (istack+1 > istacksize) call fatal('getneigh','stack overflow in getneigh')
+             istack = istack + 1
+             nstack(1,istack) = ichild
+             nstack(2,istack) = inodeB
+             nstack(3,istack) = ibigA
+          endif
+       enddo
+    else
+       do i=1,2
+          if (i==1) then
+             ichild = node(inodeB)%leftchild
+          else
+             ichild = node(inodeB)%rightchild
+          endif
+          !print*,ichild,inodeA
+          if (ichild/=0) then
+             call node_interaction(node(inodeA),node(ichild),ibigA,stackit)
+             !if(.not.stackit) print*,inodeA,ichild
+          else
+             stackit = .false.
+          endif
+
+          if (stackit) then
+             if (istack+1 > istacksize) call fatal('FMMnodenode','stack overflow in node node interaction')
+             istack = istack + 1
+             nstack(1,istack) = inodeA
+             nstack(2,istack) = ichild
+             nstack(3,istack) = ibigA
+          endif
+       enddo
+    endif
+
+ enddo stack_internode
+
+ istack = 1
+ nstack(1,1) = irootnode
+ nstack(2,1) = irootnode
+ stack_downward: do while(istack > 0)
+    inodeA = nstack(1,istack)
+    inodeB = nstack(2,istack)
+    istack = istack - 1
+
+
+    fnodeB = node(inodeB)%fnode
+    dx = node(inodeB)%xcen(1) - node(inodeA)%xcen(1)
+    dy = node(inodeB)%xcen(2) - node(inodeA)%xcen(2)
+    dz = node(inodeB)%xcen(3) - node(inodeA)%xcen(3)
+    node(inodeA)%fnode(1) = node(inodeA)%fnode(1)  + dx*(fnodeB(1) + 0.5*(dx*fnodeB(10) + dy*fnodeB(11) +dz*fnodeB(12)))&
+                                                   + dy*(fnodeB(2) + 0.5*(dx*fnodeB(11) + dy*fnodeB(13) +dz*fnodeB(14)))&
+                                                   + dz*(fnodeB(3) + 0.5*(dx*fnodeB(12) + dy*fnodeB(14) +dz*fnodeB(15)))
+    node(inodeA)%fnode(2) = node(inodeA)%fnode(2)  + dx*(fnodeB(1) + 0.5*(dx*fnodeB(11) + dy*fnodeB(13) +dz*fnodeB(14)))&
+                                                   + dy*(fnodeB(2) + 0.5*(dx*fnodeB(13) + dy*fnodeB(16) +dz*fnodeB(17)))&
+                                                   + dz*(fnodeB(3) + 0.5*(dx*fnodeB(14) + dy*fnodeB(17) +dz*fnodeB(18)))
+    node(inodeA)%fnode(3) = node(inodeA)%fnode(3)  + dx*(fnodeB(1) + 0.5*(dx*fnodeB(12) + dy*fnodeB(14) +dz*fnodeB(15)))&
+                                                   + dy*(fnodeB(2) + 0.5*(dx*fnodeB(14) + dy*fnodeB(17) +dz*fnodeB(18)))&
+                                                   + dz*(fnodeB(3) + 0.5*(dx*fnodeB(15) + dy*fnodeB(18) +dz*fnodeB(19)))
+    node(inodeA)%fnode(4)  = node(inodeA)%fnode(4) + dx*fnodeB(10) + dy*fnodeB(11) +dz*fnodeB(12)
+    node(inodeA)%fnode(5)  = node(inodeA)%fnode(5) + dx*fnodeB(11) + dy*fnodeB(13) +dz*fnodeB(14)
+    node(inodeA)%fnode(6)  = node(inodeA)%fnode(6) + dx*fnodeB(12) + dy*fnodeB(14) +dz*fnodeB(15)
+    node(inodeA)%fnode(7)  = node(inodeA)%fnode(7) + dx*fnodeB(13) + dy*fnodeB(16) +dz*fnodeB(17)
+    node(inodeA)%fnode(8)  = node(inodeA)%fnode(8) + dx*fnodeB(14) + dy*fnodeB(17) +dz*fnodeB(18)
+    node(inodeA)%fnode(9)  = node(inodeA)%fnode(9) + dx*fnodeB(15) + dy*fnodeB(18) +dz*fnodeB(19)
+
+
+    il = node(inodeA)%leftchild
+    ir = node(inodeA)%rightchild
+    if (istack+2 > istacksize) call fatal('FMMnodenode','stack overflow in Local expansion eval')
+    if (il /= 0) then
+       istack = istack + 1
+       nstack(1,istack) = node(inodeA)%leftchild
+       nstack(2,istack) = inodeA
+    endif
+    if (ir /= 0) then
+       istack = istack + 1
+       nstack(1,istack) = node(inodeA)%rightchild
+       nstack(2,istack) = inodeA
+    endif
+
+
+ enddo stack_downward
+
+
+
+end subroutine compute_node_node
+
+
+!-----------------------------------------------------------
+!+
+!  Compute the gravitational force between the node centres
+!  along with the derivatives and second derivatives
+!  required for the Taylor series expansions.
+!+
+!-----------------------------------------------------------
+subroutine node_interaction(nodetgt,nodesrc,ibigA,stackit)
+ use kernel, only:radkern
+ integer,    intent(out)   :: ibigA
+ logical,    intent(out)   :: stackit
+ type(kdnode), intent(inout) :: nodetgt,nodesrc
+
+ real    :: xcenA,ycenA,zcenA,xsizeA,massA,rcutA
+ real    :: xcenB,ycenB,zcenB,xsizeB,massB,rcutB
+ real    :: dx,dy,dz,r2,dr1,tree_acc2,rcut
+ real    :: quadsA(6),quadsB(6)
+ integer :: ilA,irA,ilB,irB
+ logical :: wellsep
+
+ tree_acc2 = tree_accuracy*tree_accuracy
+
+ xcenA  = nodetgt%xcen(1)
+ ycenA  = nodetgt%xcen(2)
+ zcenA  = nodetgt%xcen(3)
+ xsizeA = nodetgt%size
+ massA  = nodetgt%mass
+ quadsA = nodetgt%quads
+ rcutA  = nodetgt%hmax*radkern
+ irA    = nodetgt%rightchild
+ ilA    = nodetgt%leftchild
+
+ xcenB  = nodesrc%xcen(1)
+ ycenB  = nodesrc%xcen(2)
+ zcenB  = nodesrc%xcen(3)
+ xsizeB = nodesrc%size
+ massB  = nodesrc%mass
+ quadsB = nodesrc%quads
+ rcutB  = nodesrc%hmax*radkern
+ irB    = nodesrc%rightchild
+ ilB    = nodesrc%leftchild
+
+ dx = xcenA - xcenB
+ dy = ycenA - ycenB
+ dz = zcenA - zcenB
+ r2    = dx*dx + dy*dy + dz*dz
+ rcut  = max(rcutA,rcutB)
+ wellsep = tree_acc2*r2 > (xsizeA+xsizeB+rcut)**2 !.and. (irB==ilB) .and. (irA==ilA)
+ !print*,r2,sqrt(r2),(xsizeA+xsizeB)**2,xsizeA,xsizeB
+
+ if (wellsep) then
+    print*,"WELL SEPARATED!!!!",r2,sqrt(r2),(xsizeA+xsizeB)**2,xsizeA,xsizeB,(xsizeA+xsizeB)**2/r2
+    dr1 = 1./sqrt(r2)
+    call compute_M2L(dx,dy,dz,dr1,massB,quadsB,nodetgt%fnode)
+    stackit = .false.
+ else
+    stackit = .true.
+    if (xsizeA > xsizeB) then
+       ibigA = 1
+    else
+       ibigA = 0
+    endif
+ endif
+
+end subroutine node_interaction
+
 
 !----------------------------------------------------------------
 !+
