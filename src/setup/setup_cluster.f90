@@ -205,16 +205,16 @@ subroutine setpart(id,npart,npartoftype,xyzh,massoftype,vxyzu,polyk,gamma,hfact,
  !--Set velocities (from pre-made velocity cubes)
  write(*,"(1x,a)") 'Setting up velocity field on the particles...'
  vxyzu(:,:) = 0.
- filex = find_phantom_datafile(filevx,'velfield')
- filey = find_phantom_datafile(filevy,'velfield')
- filez = find_phantom_datafile(filevz,'velfield')
+!  filex = find_phantom_datafile(filevx,'velfield')
+!  filey = find_phantom_datafile(filevy,'velfield')
+!  filez = find_phantom_datafile(filevz,'velfield')
 
- call set_velfield_from_cubes(xyzh,vxyzu,npartoftype(igas),filex,filey,filez,1.,rmax,.false.,ierr)
- if (ierr /= 0) call fatal('setup','error setting up velocity field')
+!  call set_velfield_from_cubes(xyzh,vxyzu,npartoftype(igas),filex,filey,filez,1.,rmax,.false.,ierr)
+!  if (ierr /= 0) call fatal('setup','error setting up velocity field')
 
- !--Normalise the energy
- call normalise_vfield(npart,vxyzu,ierr,ke=epotgrav)
- if (ierr /= 0) call fatal('setup','error normalising velocity field')
+!  !--Normalise the energy
+!  call normalise_vfield(npart,vxyzu,ierr,ke=epotgrav)
+!  if (ierr /= 0) call fatal('setup','error normalising velocity field')
 
  if (maxvxyzu >= 4) then
     if (gamma > 1.) then
