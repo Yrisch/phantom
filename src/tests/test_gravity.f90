@@ -789,7 +789,7 @@ subroutine test_FMM(ntests,npass)
  !--setup particles
  !
  call init_part()
- np       = 100
+ np       = 1000
  totvol   = 4./3.*pi*rmax**3
  nx       = int(np**(1./3.))
  psep     = totvol**(1./3.)/real(nx)

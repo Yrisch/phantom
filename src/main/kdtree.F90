@@ -1522,14 +1522,14 @@ pure subroutine compute_M2L(dx,dy,dz,dr,totmass,quads,fnode)
  qzz = quads(6)
  mconst = (-1.5*dr5*(qxx+qyy+qzz) + 7.5*dr7*(rx*rx*qxx + 2.*rx*ry*qxy + 2*rx*rz*qxz + ry*ry*qyy +&
                                               2*ry*rz*qxz + rz*rz*qzz))
- fqx = -3.*dr7*(rx*qxx + ry*qxy + rz*qxz)
- fqy = -3.*dr7*(rx*qxy + ry*qyy + rz*qyz)
- fqz = -3.*dr7*(rx*qxz + ry*qyz + rz*qzz)
+ fqx = 3.*dr5*(rx*qxx + ry*qxy + rz*qxz)
+ fqy = 3.*dr5*(rx*qxy + ry*qyy + rz*qyz)
+ fqz = 3.*dr5*(rx*qxz + ry*qyz + rz*qzz)
 
 
- fnode( 1) = fnode( 1) - dx*(dr3m+mconst) + fqx
- fnode( 2) = fnode( 2) - dy*(dr3m+mconst) + fqy
- fnode( 3) = fnode( 3) - dz*(dr3m+mconst) + fqz
+ fnode( 1) = fnode( 1) - rx*(dr3m+mconst) + fqx
+ fnode( 2) = fnode( 2) - ry*(dr3m+mconst) + fqy
+ fnode( 3) = fnode( 3) - rz*(dr3m+mconst) + fqz
  fnode( 4) = fnode( 4) + dr5m3*rx*rx - dr3m    !+ dfxdxq ! dfx/dx
  fnode( 5) = fnode( 5) + dr5m3*rx*ry           !+ dfxdyq ! dfx/dy = dfy/dx
  fnode( 6) = fnode( 6) + dr5m3*rx*rz           !+ dfxdzq ! dfx/dz = dfz/dx
@@ -1591,7 +1591,6 @@ subroutine compute_node_node(node)
           !print*,ichild,inodeB
           if (ichild/=0) then
              call node_interaction(node(ichild),node(inodeB),ibigA,stackit)
-             !if(.not.stackit) print*,ichild,inodeB
           else
              stackit = .false.
           endif
@@ -1614,7 +1613,6 @@ subroutine compute_node_node(node)
           !print*,ichild,inodeA
           if (ichild/=0) then
              call node_interaction(node(inodeA),node(ichild),ibigA,stackit)
-             !if(.not.stackit) print*,inodeA,ichild
           else
              stackit = .false.
           endif
@@ -1644,22 +1642,31 @@ subroutine compute_node_node(node)
     dx = node(inodeB)%xcen(1) - node(inodeA)%xcen(1)
     dy = node(inodeB)%xcen(2) - node(inodeA)%xcen(2)
     dz = node(inodeB)%xcen(3) - node(inodeA)%xcen(3)
-    node(inodeA)%fnode(1) = node(inodeA)%fnode(1)  + dx*(fnodeB(1) + 0.5*(dx*fnodeB(10) + dy*fnodeB(11) +dz*fnodeB(12)))&
-                                                   + dy*(fnodeB(2) + 0.5*(dx*fnodeB(11) + dy*fnodeB(13) +dz*fnodeB(14)))&
-                                                   + dz*(fnodeB(3) + 0.5*(dx*fnodeB(12) + dy*fnodeB(14) +dz*fnodeB(15)))
-    node(inodeA)%fnode(2) = node(inodeA)%fnode(2)  + dx*(fnodeB(1) + 0.5*(dx*fnodeB(11) + dy*fnodeB(13) +dz*fnodeB(14)))&
-                                                   + dy*(fnodeB(2) + 0.5*(dx*fnodeB(13) + dy*fnodeB(16) +dz*fnodeB(17)))&
-                                                   + dz*(fnodeB(3) + 0.5*(dx*fnodeB(14) + dy*fnodeB(17) +dz*fnodeB(18)))
-    node(inodeA)%fnode(3) = node(inodeA)%fnode(3)  + dx*(fnodeB(1) + 0.5*(dx*fnodeB(12) + dy*fnodeB(14) +dz*fnodeB(15)))&
-                                                   + dy*(fnodeB(2) + 0.5*(dx*fnodeB(14) + dy*fnodeB(17) +dz*fnodeB(18)))&
-                                                   + dz*(fnodeB(3) + 0.5*(dx*fnodeB(15) + dy*fnodeB(18) +dz*fnodeB(19)))
-    node(inodeA)%fnode(4)  = node(inodeA)%fnode(4) + dx*fnodeB(10) + dy*fnodeB(11) +dz*fnodeB(12)
-    node(inodeA)%fnode(5)  = node(inodeA)%fnode(5) + dx*fnodeB(11) + dy*fnodeB(13) +dz*fnodeB(14)
-    node(inodeA)%fnode(6)  = node(inodeA)%fnode(6) + dx*fnodeB(12) + dy*fnodeB(14) +dz*fnodeB(15)
-    node(inodeA)%fnode(7)  = node(inodeA)%fnode(7) + dx*fnodeB(13) + dy*fnodeB(16) +dz*fnodeB(17)
-    node(inodeA)%fnode(8)  = node(inodeA)%fnode(8) + dx*fnodeB(14) + dy*fnodeB(17) +dz*fnodeB(18)
-    node(inodeA)%fnode(9)  = node(inodeA)%fnode(9) + dx*fnodeB(15) + dy*fnodeB(18) +dz*fnodeB(19)
-
+    node(inodeA)%fnode(1) = node(inodeA)%fnode(1) + fnodeB(1) + dx*(fnodeB(4) + 0.5*(dx*fnodeB(10) + dy*fnodeB(11) +dz*fnodeB(12)))&
+                                                              + dy*(fnodeB(5) + 0.5*(dx*fnodeB(11) + dy*fnodeB(13) +dz*fnodeB(14)))&
+                                                              + dz*(fnodeB(6) + 0.5*(dx*fnodeB(12) + dy*fnodeB(14) +dz*fnodeB(15)))
+    node(inodeA)%fnode(2) = node(inodeA)%fnode(2) + fnodeB(2) + dx*(fnodeB(5) + 0.5*(dx*fnodeB(11) + dy*fnodeB(13) +dz*fnodeB(14)))&
+                                                              + dy*(fnodeB(7) + 0.5*(dx*fnodeB(13) + dy*fnodeB(16) +dz*fnodeB(17)))&
+                                                              + dz*(fnodeB(8) + 0.5*(dx*fnodeB(14) + dy*fnodeB(17) +dz*fnodeB(18)))
+    node(inodeA)%fnode(3) = node(inodeA)%fnode(3) + fnodeB(3) + dx*(fnodeB(6) + 0.5*(dx*fnodeB(12) + dy*fnodeB(14) +dz*fnodeB(15)))&
+                                                              + dy*(fnodeB(8) + 0.5*(dx*fnodeB(14) + dy*fnodeB(17) +dz*fnodeB(18)))&
+                                                              + dz*(fnodeB(9) + 0.5*(dx*fnodeB(15) + dy*fnodeB(18) +dz*fnodeB(19)))
+    node(inodeA)%fnode(4)  = node(inodeA)%fnode(4)  + fnodeB(4) + dx*fnodeB(10) + dy*fnodeB(11) +dz*fnodeB(12)
+    node(inodeA)%fnode(5)  = node(inodeA)%fnode(5)  + fnodeB(5) + dx*fnodeB(11) + dy*fnodeB(13) +dz*fnodeB(14)
+    node(inodeA)%fnode(6)  = node(inodeA)%fnode(6)  + fnodeB(6) + dx*fnodeB(12) + dy*fnodeB(14) +dz*fnodeB(15)
+    node(inodeA)%fnode(7)  = node(inodeA)%fnode(7)  + fnodeB(7) + dx*fnodeB(13) + dy*fnodeB(16) +dz*fnodeB(17)
+    node(inodeA)%fnode(8)  = node(inodeA)%fnode(8)  + fnodeB(8) + dx*fnodeB(14) + dy*fnodeB(17) +dz*fnodeB(18)
+    node(inodeA)%fnode(9)  = node(inodeA)%fnode(9)  + fnodeB(9) + dx*fnodeB(15) + dy*fnodeB(18) +dz*fnodeB(19)
+    node(inodeA)%fnode(10) = node(inodeA)%fnode(10) + fnodeB(10)
+    node(inodeA)%fnode(11) = node(inodeA)%fnode(11) + fnodeB(11)
+    node(inodeA)%fnode(12) = node(inodeA)%fnode(12) + fnodeB(12)
+    node(inodeA)%fnode(13) = node(inodeA)%fnode(13) + fnodeB(13)
+    node(inodeA)%fnode(14) = node(inodeA)%fnode(14) + fnodeB(14)
+    node(inodeA)%fnode(15) = node(inodeA)%fnode(15) + fnodeB(15)
+    node(inodeA)%fnode(16) = node(inodeA)%fnode(16) + fnodeB(16)
+    node(inodeA)%fnode(17) = node(inodeA)%fnode(17) + fnodeB(17)
+    node(inodeA)%fnode(18) = node(inodeA)%fnode(18) + fnodeB(18)
+    node(inodeA)%fnode(19) = node(inodeA)%fnode(19) + fnodeB(19)
 
     il = node(inodeA)%leftchild
     ir = node(inodeA)%rightchild
@@ -1734,7 +1741,7 @@ subroutine node_interaction(nodetgt,nodesrc,ibigA,stackit)
  !print*,r2,sqrt(r2),(xsizeA+xsizeB)**2,xsizeA,xsizeB
 
  if (wellsep) then
-    print*,"WELL SEPARATED!!!!",r2,sqrt(r2),(xsizeA+xsizeB)**2,xsizeA,xsizeB,(xsizeA+xsizeB)**2/r2
+    !print*,"WELL SEPARATED!!!!",r2,sqrt(r2),(xsizeA+xsizeB)**2,xsizeA,xsizeB,(xsizeA+xsizeB)**2/r2
     dr1 = 1./sqrt(r2)
     call compute_M2L(dx,dy,dz,dr1,massB,quadsB,nodetgt%fnode)
     stackit = .false.
