@@ -54,7 +54,7 @@ module kdtree
  public :: maketree, revtree, getneigh, kdnode
  public :: maketreeglobal
  public :: empty_tree
- public :: compute_fnode, expand_fgrav_in_taylor_series
+ public :: compute_fnode, expand_fgrav_in_taylor_series,compute_node_node
 
  integer, public :: maxlevel_indexed, maxlevel
 
@@ -304,8 +304,6 @@ subroutine maketree(node, xyzh, np, ndim, ifirstincell, ncells, apr_tree, refine
     write(iprint,"(a,i10,3(a,i2))") ' maketree: nodes = ',ncells,', max level = ',maxlevel,&
        ', min leaf level = ',minlevel,' max level indexed = ',maxlevel_indexed
  endif
-
- call compute_node_node(node)
 
 end subroutine maketree
 
@@ -1564,8 +1562,8 @@ subroutine compute_node_node(node)
  use io, only:fatal
  type(kdnode), intent(inout)  :: node(:) !ncellsmax+1)
  integer, parameter :: istacksize = 4800
- integer            :: istack,inodeA,inodeB,i,ichild,ibigA,il,ir
- integer            :: nstack(3,istacksize)
+ integer            :: istack,inodeA,inodeB,il,ir
+ integer            :: nstack(2,istacksize)
  real               :: fnodeB(20),dx,dy,dz
  logical            :: stackit
 
@@ -1573,58 +1571,23 @@ subroutine compute_node_node(node)
  nstack(:,:) = 0
  nstack(1,1) = irootnode
  nstack(2,1) = irootnode
- nstack(3,1) = 0
 
  stack_internode: do while(istack > 0)
     inodeA = nstack(1,istack)
     inodeB = nstack(2,istack)
-    ibigA  = nstack(3,istack)
+
     istack = istack - 1
-
-    if (ibigA > 0) then
-       do i=1,2
-          if (i==1) then
-             ichild = node(inodeA)%leftchild
-          else
-             ichild = node(inodeA)%rightchild
-          endif
-          !print*,ichild,inodeB
-          if (ichild/=0) then
-             call node_interaction(node(ichild),node(inodeB),ibigA,stackit)
-          else
-             stackit = .false.
-          endif
-
-          if (stackit) then
-             if (istack+1 > istacksize) call fatal('getneigh','stack overflow in getneigh')
-             istack = istack + 1
-             nstack(1,istack) = ichild
-             nstack(2,istack) = inodeB
-             nstack(3,istack) = ibigA
-          endif
-       enddo
+    if (inodeA == inodeB) then
+       if (istack+4 > istacksize) call fatal('getneigh','stack overflow in getneigh')
+       call open_both(nstack,istack,node(inodeA),node(inodeA))
     else
-       do i=1,2
-          if (i==1) then
-             ichild = node(inodeB)%leftchild
-          else
-             ichild = node(inodeB)%rightchild
-          endif
-          !print*,ichild,inodeA
-          if (ichild/=0) then
-             call node_interaction(node(inodeA),node(ichild),ibigA,stackit)
-          else
-             stackit = .false.
-          endif
+       call node_interaction(inodeA,inodeB,node(inodeA),node(inodeB),stackit)
 
-          if (stackit) then
-             if (istack+1 > istacksize) call fatal('FMMnodenode','stack overflow in node node interaction')
-             istack = istack + 1
-             nstack(1,istack) = inodeA
-             nstack(2,istack) = ichild
-             nstack(3,istack) = ibigA
-          endif
-       enddo
+       if (stackit) then
+          if (istack+4 > istacksize) call fatal('getneigh','stack overflow in getneigh')
+          call open_both(nstack,istack,node(inodeA),node(inodeB))
+       endif
+
     endif
 
  enddo stack_internode
@@ -1689,6 +1652,38 @@ subroutine compute_node_node(node)
 
 end subroutine compute_node_node
 
+subroutine open_both(nstack,istack,nodetgt,nodesrc)
+ use io, only:fatal
+ integer,      intent(inout) :: nstack(:,:)
+ integer,      intent(inout) :: istack
+ type(kdnode), intent(in)    :: nodetgt,nodesrc
+
+ integer :: irT,ilT,irS,ilS
+ logical :: isleaf
+
+ ilT    = nodetgt%leftchild
+ irT    = nodetgt%rightchild
+ ilS    = nodesrc%leftchild
+ irS    = nodesrc%rightchild
+ isleaf = (irT==0 .or. irS==0)
+
+ if (.not.isleaf) then
+    istack = istack + 1
+    nstack(1,istack) = irT
+    nstack(2,istack) = irS
+    istack = istack + 1
+    nstack(1,istack) = irT
+    nstack(2,istack) = ilS
+    istack = istack + 1
+    nstack(1,istack) = ilT
+    nstack(2,istack) = irS
+    istack = istack + 1
+    nstack(1,istack) = ilT
+    nstack(2,istack) = ilS
+ endif
+
+end subroutine open_both
+
 
 !-----------------------------------------------------------
 !+
@@ -1697,9 +1692,9 @@ end subroutine compute_node_node
 !  required for the Taylor series expansions.
 !+
 !-----------------------------------------------------------
-subroutine node_interaction(nodetgt,nodesrc,ibigA,stackit)
+subroutine node_interaction(itgt,isrc,nodetgt,nodesrc,stackit)
  use kernel, only:radkern
- integer,    intent(out)   :: ibigA
+ integer,    intent(in)    :: itgt,isrc
  logical,    intent(out)   :: stackit
  type(kdnode), intent(inout) :: nodetgt,nodesrc
 
@@ -1737,21 +1732,15 @@ subroutine node_interaction(nodetgt,nodesrc,ibigA,stackit)
  dz = zcenA - zcenB
  r2    = dx*dx + dy*dy + dz*dz
  rcut  = max(rcutA,rcutB)
- wellsep = tree_acc2*r2 > (xsizeA+xsizeB+rcut)**2 !.and. (irB==ilB) .and. (irA==ilA)
- !print*,r2,sqrt(r2),(xsizeA+xsizeB)**2,xsizeA,xsizeB
+ wellsep = tree_acc2*r2 > (xsizeA+xsizeB+rcut)**2
 
  if (wellsep) then
-    !print*,"WELL SEPARATED!!!!",r2,sqrt(r2),(xsizeA+xsizeB)**2,xsizeA,xsizeB,(xsizeA+xsizeB)**2/r2
+    !print*,"WELL SEPARATED!!!!",xsizeA,xsizeB,sqrt((xsizeA+xsizeB+rcut)**2/r2),nodetgt%parent,nodesrc%parent
     dr1 = 1./sqrt(r2)
     call compute_M2L(dx,dy,dz,dr1,massB,quadsB,nodetgt%fnode)
     stackit = .false.
  else
     stackit = .true.
-    if (xsizeA > xsizeB) then
-       ibigA = 1
-    else
-       ibigA = 0
-    endif
  endif
 
 end subroutine node_interaction

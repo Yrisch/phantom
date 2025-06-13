@@ -42,7 +42,7 @@ module linklist
 
  public :: allocate_linklist, deallocate_linklist
  public :: set_linklist, get_neighbour_list, write_inopts_link, read_inopts_link
- public :: get_distance_from_centre_of_mass, getneigh_pos
+ public :: get_distance_from_centre_of_mass, getneigh_pos,set_FMM
  public :: set_hmaxcell,get_hmaxcell,update_hmax_remote
  public :: get_cell_location
  public :: sync_hmax_mpi
@@ -187,6 +187,13 @@ subroutine set_linklist(npart,nactive,xyzh,vxyzu,for_apr)
  endif
 
 end subroutine set_linklist
+
+subroutine set_FMM()
+ use kdtree, only:compute_node_node
+
+ call compute_node_node(node)
+
+end subroutine set_FMM
 
 !-----------------------------------------------------------------------
 !+
