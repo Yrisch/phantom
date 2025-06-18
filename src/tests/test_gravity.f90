@@ -44,7 +44,7 @@ subroutine test_gravity(ntests,npass,string)
  select case(string)
  case('taylorseries')
     testtaylorseries = .true.
- case('directsum')
+ case('directsum','grav')
     testdirectsum = .true.
  case('fmm')
     testpolytrope = .true.
@@ -403,6 +403,7 @@ subroutine test_directsum(ntests,npass)
        do j=1,3
           fsum(j)=sum(fxyzu(j,1:npart))
        enddo
+       fsum = fsum*massoftype(k)
        nfailed = 0
        call checkval(fsum(1),0.,1e-11,nfailed(1),"momentum conservation x")
        call checkval(fsum(2),0.,1e-11,nfailed(2),"momentum conservation y")
@@ -635,6 +636,187 @@ subroutine test_directsum(ntests,npass)
 
 end subroutine test_directsum
 
+!-----------------------------------------------------------------------
+!+
+!  Unit tests of the tree code gravity, checking the long-range interactions
+!  agree with gravity computed via direct summation
+!+
+!-----------------------------------------------------------------------
+subroutine test_longrange(ntests,npass)
+ use io,              only:id,master,nprocs
+ use dim,             only:maxp,maxptmass,mpi,use_apr,use_sinktree,maxpsph
+ use part,            only:init_part,npart,npartoftype,massoftype,xyzh,hfact,vxyzu,fxyzu, &
+                             gradh,poten,maxphase,labeltype,set_particle_type,&
+                             nptmass,xyzmh_ptmass,fxyz_ptmass,dsdt_ptmass,ibelong,&
+                             fxyz_ptmass_tree,istar,shortsinktree
+ use eos,             only:polyk,gamma
+ use options,         only:ieos,alpha,alphau,alphaB,tolh
+ use spherical,       only:set_sphere
+ use deriv,           only:get_derivs_global
+ use physcon,         only:pi
+ use timing,          only:getused,printused
+ use directsum,       only:directsum_grav
+ use energies,        only:compute_energies,epot
+ use kdtree,          only:tree_accuracy
+ use testutils,       only:checkval,checkvalbuf_end,update_test_scores
+ use ptmass,          only:get_accel_sink_sink,get_accel_sink_gas,h_soft_sinksink
+ use mpiutils,        only:reduceall_mpi,bcast_mpi
+ use linklist,        only:set_linklist
+ use sort_particles,  only:sort_part_id
+ use mpibalance,      only:balancedomains
+ use testapr,         only:setup_apr_region_for_test
+ use setup_params,    only:npart_total
+
+ integer, intent(inout) :: ntests,npass
+ integer :: nfailed(18),boundi,boundf,j
+ integer :: maxvxyzu,nx,np,i,nfgrav
+ real :: psep,totvol,totmass,rhozero,tol,pmassi,fsum(3)
+ real :: time,rmin,rmax,phitot,dtsinksink,fonrmax,phii,epot_gas_sink
+ real(kind=4) :: t1,t2
+ real :: epoti,tree_acc_prev
+ real, allocatable :: fgrav(:,:),fxyz_ptmass_gas(:,:)
+
+ maxvxyzu = size(vxyzu(:,1))
+ tree_acc_prev = tree_accuracy
+ if (id==master) write(*,"(/,3a)") '--> testing gravity force in densityforce for ',labeltype(istar),' particles'
+ !
+ !--general parameters
+ !
+ time  = 0.
+ hfact = 1.2
+ gamma = 5./3.
+ rmin  = 0.
+ rmax  = 1.
+ ieos  = 2
+ tree_accuracy = 0.5
+ !
+ !--setup particles
+ !
+ call init_part()
+ np       = 1000
+ totvol   = 4./3.*pi*rmax**3
+ nx       = int(np**(1./3.))
+ psep     = totvol**(1./3.)/real(nx)
+ psep     = 0.18
+ npart    = 0
+ npart_total = 0
+ ! only set up particles on master, otherwise we will end up with n duplicates
+ if (id==master) then
+    call set_sphere('random',id,master,rmin,rmax,psep,hfact,npart,xyzh,npart_total,np_requested=np)
+ endif
+ np       = npart
+ !
+ !--set particle properties
+ !
+ totmass        = 1.
+ rhozero        = totmass/totvol
+ npartoftype(:) = 0
+ npartoftype(istar) = int(reduceall_mpi('+',npart),kind=kind(npartoftype))
+ massoftype(:)  = 0.0
+ massoftype(istar)  = totmass/npartoftype(istar)
+ if (maxphase==maxp) then
+    do i=1,npart
+       call set_particle_type(i,istar)
+    enddo
+ endif
+ !
+ !--call apr setup if using it - this must be called after massoftype is set
+ !       we're not using this right now, this test fails as is
+ !       if (use_apr) call setup_apr_region_for_test()
+
+ !
+ !--set thermal terms and velocity to zero, so only force is gravity
+ !
+ polyk      = 0.
+ vxyzu(:,:) = 0.
+ !
+ !--make sure AV is off
+ !
+ alpha  = 0.
+ alphau = 0.
+ alphaB = 0.
+ tolh = 1.e-5
+
+ fxyzu = 0.0
+ !
+ !--call derivs to get everything initialised
+ !
+ call get_derivs_global()
+
+
+ !
+ !--reset force to zero
+ !
+ fxyzu = 0.0
+ !
+ !--move particles to master and sort for direct summation
+ !
+ if (mpi) then
+    ibelong(:) = 0
+    call balancedomains(npart)
+ endif
+ call sort_part_id
+ !
+ !--allocate array for storing direct sum gravitational force
+ !
+ allocate(fgrav(maxvxyzu,npart))
+ fgrav = 0.0
+ !
+ !--compute gravitational forces by direct summation
+ !
+ if (id == master) then
+    call directsum_grav(xyzh,gradh,fgrav,phitot,npart)
+ endif
+ !
+ !--send phitot to all tasks
+ !
+ call bcast_mpi(phitot)
+ !
+ !--calculate derivatives
+ !
+ call getused(t1)
+ call get_derivs_global()
+ call getused(t2)
+ if (id==master) call printused(t1)
+ !
+ !--move particles to master and sort for test comparison
+ !
+ if (mpi) then
+    ibelong(:) = 0
+    call balancedomains(npart)
+ endif
+ call sort_part_id
+ !
+ !--compare the results
+ !
+ call checkval(npart,fxyzu(1,:),fgrav(1,:),5.e-3,nfailed(1),'fgrav(x)')
+ call checkval(npart,fxyzu(2,:),fgrav(2,:),6.e-3,nfailed(2),'fgrav(y)')
+ call checkval(npart,fxyzu(3,:),fgrav(3,:),9.4e-3,nfailed(3),'fgrav(z)')
+ deallocate(fgrav)
+ epoti = 0.
+ do i=1,npart
+    epoti = epoti + poten(i)
+ enddo
+ epoti = reduceall_mpi('+',epoti)
+ call checkval(epoti,phitot,5.2e-4,nfailed(4),'potential')
+ call checkval(epoti,-3./5.*totmass**2/rmax,3.6e-2,nfailed(5),'potential=-3/5 GMM/R')
+ ! check that potential energy computed via compute_energies is also correct
+ call compute_energies(0.)
+ call checkval(epot,phitot,5.2e-4,nfailed(6),'epot in compute_energies')
+ call update_test_scores(ntests,nfailed(1:6),npass)
+
+ do j=1,3
+    fsum(j)=sum(fxyzu(j,1:npart))
+ enddo
+ fsum = fsum*massoftype(istar)
+ nfailed = 0
+ call checkval(fsum(1),0.,1e-11,nfailed(1),"momentum conservation x")
+ call checkval(fsum(2),0.,1e-11,nfailed(2),"momentum conservation y")
+ call checkval(fsum(3),0.,1e-11,nfailed(3),"momentum conservation z")
+ call update_test_scores(ntests,nfailed(1:3),npass)
+
+end subroutine test_longrange
+
 subroutine copy_gas_particles_to_sinks(npart,nptmass,xyzh,xyzmh_ptmass,massi)
  integer, intent(in)  :: npart
  integer, intent(out) :: nptmass
@@ -747,7 +929,7 @@ end subroutine get_finite_diff
 subroutine test_FMM(ntests,npass)
  use io,        only:id,master,iverbose
  use part,      only:npart,npartoftype,xyzh,massoftype,hfact,&
-                     init_part,iphase,isetphase,fxyzu
+                     init_part,fxyzu,istar,set_particle_type
  use mpidomain, only:i_belong
  use options,   only:ieos
  use physcon,   only:solarr,solarm,pi
@@ -789,7 +971,7 @@ subroutine test_FMM(ntests,npass)
  !--setup particles
  !
  call init_part()
- np       = 1000
+ np       = 10000
  totvol   = 4./3.*pi*rmax**3
  nx       = int(np**(1./3.))
  psep     = totvol**(1./3.)/real(nx)
@@ -806,13 +988,13 @@ subroutine test_FMM(ntests,npass)
     np = npart
  enddo
  npartoftype(:) = 0
- npartoftype(6) = np*2
+ npartoftype(istar) = np*2
  massoftype(:)  = 0.
- massoftype(6)  = 0.1/(np*2)
+ massoftype(istar)  = 0.1/(np*2)
 
  if (maxphase==maxp) then
     do i=1,npart
-       iphase(i) = isetphase(6,iactive=.true.)
+       call set_particle_type(i,istar)
     enddo
  endif
 
@@ -823,7 +1005,7 @@ subroutine test_FMM(ntests,npass)
     fsum(2) = fsum(2) + fxyzu(2,i)
     fsum(3) = fsum(3) + fxyzu(3,i)
  enddo
-
+ fsum = fsum*massoftype(istar)
  call checkval(fsum(1),0.,1e-11,nfail(1),"momentum conservation x")
  call checkval(fsum(2),0.,1e-11,nfail(2),"momentum conservation y")
  call checkval(fsum(3),0.,1e-11,nfail(3),"momentum conservation z")

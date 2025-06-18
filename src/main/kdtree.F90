@@ -1294,6 +1294,7 @@ subroutine getneigh(node,xpos,xsizei,rcuti,ndim,listneigh,nneigh,xyzcache,ixyzca
     rcut2 = (xsizei + xsizej + rcut)**2   ! node size + search radius
 #ifdef GRAVITY
     open_tree_node = tree_acc2*r2 < rcut2  ! tree opening criterion for self-gravity
+    open_tree_node = .false.
 #endif
     if_open_node: if ((r2 < rcut2) .or. open_tree_node) then
        if_leaf: if (ifirstincell(n) /= 0) then ! once we hit a leaf node, retrieve contents into trial neighbour cache
@@ -1497,18 +1498,17 @@ pure subroutine compute_M2L(dx,dy,dz,dr,totmass,quads,fnode)
  real, intent(in)    :: dx,dy,dz,dr,totmass
  real, intent(in)    :: quads(6)
  real, intent(inout) :: fnode(lenfgrav)
- real :: dr2,dr3,dr5,dr7,dr3m,dr5m3,rx,ry,rz,qxx,qxy,qxz,qyy,qyz,qzz
- real :: fqx,fqy,fqz
- real :: mconst
+ real :: dr2,dr3,dr4,dr5,dr3m,dr4m3,rx,ry,rz,qxx,qxy,qxz,qyy,qyz,qzz
+ real :: fqx,fqy,fqz,rijQij
 
 
  ! note: dr == 1/sqrt(r2)
  dr2  = dr*dr
- dr3  = dr*dr2
- dr5  = dr2*dr3
- dr7  = dr2*dr5
+ dr3  = dr2*dr
+ dr4  = dr2*dr2
+ dr5  = dr4*dr
  dr3m  = totmass*dr3
- dr5m3 = 3.*totmass*dr5
+ dr4m3 = 3.*totmass*dr4
  rx  = dx*dr
  ry  = dy*dr
  rz  = dz*dr
@@ -1518,32 +1518,31 @@ pure subroutine compute_M2L(dx,dy,dz,dr,totmass,quads,fnode)
  qyy = quads(4)
  qyz = quads(5)
  qzz = quads(6)
- mconst = (-1.5*dr5*(qxx+qyy+qzz) + 7.5*dr7*(rx*rx*qxx + 2.*rx*ry*qxy + 2*rx*rz*qxz + ry*ry*qyy +&
-                                              2*ry*rz*qxz + rz*rz*qzz))
- fqx = 3.*dr5*(rx*qxx + ry*qxy + rz*qxz)
- fqy = 3.*dr5*(rx*qxy + ry*qyy + rz*qyz)
- fqz = 3.*dr5*(rx*qxz + ry*qyz + rz*qzz)
+ rijQij = (rx*rx*qxx + 2.*ry*rx*qxy + 2*ry*rz*qyz + ry*ry*qyy + 2*rx*rz*qxz + rz*rz*qzz)
+ fqx = dr4*(1.5*(rx*(3*qxx+qyy+qzz) + 2.*ry*qxy + 2.*rz*qxz) - 7.5*rx*rijQij)
+ fqy = dr4*(1.5*(ry*(3*qyy+qxx+qzz) + 2.*rx*qxy + 2.*rz*qyz) - 7.5*ry*rijQij)
+ fqz = dr4*(1.5*(rz*(3*qzz+qyy+qxx) + 2.*rz*qyz + 2.*rx*qxz) - 7.5*rz*rijQij)
 
 
- fnode( 1) = fnode( 1) - rx*(dr3m+mconst) + fqx
- fnode( 2) = fnode( 2) - ry*(dr3m+mconst) + fqy
- fnode( 3) = fnode( 3) - rz*(dr3m+mconst) + fqz
- fnode( 4) = fnode( 4) + dr5m3*rx*rx - dr3m    !+ dfxdxq ! dfx/dx
- fnode( 5) = fnode( 5) + dr5m3*rx*ry           !+ dfxdyq ! dfx/dy = dfy/dx
- fnode( 6) = fnode( 6) + dr5m3*rx*rz           !+ dfxdzq ! dfx/dz = dfz/dx
- fnode( 7) = fnode( 7) + dr5m3*ry*ry - dr3m    !+ dfydyq ! dfy/dy
- fnode( 8) = fnode( 8) + dr5m3*ry*rz           !+ dfydzq ! dfy/dz = dfz/dy
- fnode( 9) = fnode( 9) + dr5m3*rz*rz - dr3m    !+ dfzdzq ! dfz/dz
- fnode(10) = fnode(10) - dr5m3*(5.*rx*rx*rx*dr2 - 3.*rx) !+ d2fxxxq ! d2fxdxdx
- fnode(11) = fnode(11) - dr5m3*(5.*rx*rx*ry*dr2 - ry)    !+ d2fxxyq ! d2fxdxdy
- fnode(12) = fnode(12) - dr5m3*(5.*rx*rx*rz*dr2 - rz)    !+ d2fxxzq ! d2fxdxdz
- fnode(13) = fnode(13) - dr5m3*(5.*rx*ry*ry*dr2 - rx)    !+ d2fxyyq ! d2fxdydy
- fnode(14) = fnode(14) - dr5m3*(5.*rx*ry*rz*dr2)         !+ d2fxyzq ! d2fxdydz
- fnode(15) = fnode(15) - dr5m3*(5.*rx*rz*rz*dr2 - rx)    !+ d2fxzzq ! d2fxdzdz
- fnode(16) = fnode(16) - dr5m3*(5.*ry*ry*ry*dr2 - 3.*ry) !+ d2fyyyq ! d2fydydy
- fnode(17) = fnode(17) - dr5m3*(5.*ry*ry*rz*dr2 - rz)    !+ d2fyyzq ! d2fydydz
- fnode(18) = fnode(18) - dr5m3*(5.*ry*rz*rz*dr2 - ry)    !+ d2fyzzq ! d2fydzdz
- fnode(19) = fnode(19) - dr5m3*(5.*rz*rz*rz*dr2 - 3.*rz) !+ d2fzzzq ! d2fzdzdz
+ fnode( 1) = fnode( 1) - dr3m*dx + fqx
+ fnode( 2) = fnode( 2) - dr3m*dy + fqy
+ fnode( 3) = fnode( 3) - dr3m*dz + fqz
+ fnode( 4) = fnode( 4) + dr3m*(3.*rx*rx -   1.)   !+ dfxdxq ! dfx/dx
+ fnode( 5) = fnode( 5) + dr3m*(3.*rx*ry       )   !+ dfxdyq ! dfx/dy = dfy/dx
+ fnode( 6) = fnode( 6) + dr3m*(3.*rx*rz       )   !+ dfxdzq ! dfx/dz = dfz/dx
+ fnode( 7) = fnode( 7) + dr3m*(3.*ry*ry -   1.)   !+ dfydyq ! dfy/dy
+ fnode( 8) = fnode( 8) + dr3m*(3.*ry*rz       )   !+ dfydzq ! dfy/dz = dfz/dy
+ fnode( 9) = fnode( 9) + dr3m*(3.*rz*rz -   1.)   !+ dfzdzq ! dfz/dz
+ fnode(10) = fnode(10) - dr4m3*(5.*rx*rx*rx - 3.*rx) !+ d2fxxxq ! d2fxdxdx
+ fnode(11) = fnode(11) - dr4m3*(5.*rx*rx*ry - ry)    !+ d2fxxyq ! d2fxdxdy
+ fnode(12) = fnode(12) - dr4m3*(5.*rx*rx*rz - rz)    !+ d2fxxzq ! d2fxdxdz
+ fnode(13) = fnode(13) - dr4m3*(5.*rx*ry*ry - rx)    !+ d2fxyyq ! d2fxdydy
+ fnode(14) = fnode(14) - dr4m3*(5.*rx*ry*rz)        !+ d2fxyzq ! d2fxdydz
+ fnode(15) = fnode(15) - dr4m3*(5.*rx*rz*rz - rx)    !+ d2fxzzq ! d2fxdzdz
+ fnode(16) = fnode(16) - dr4m3*(5.*ry*ry*ry - 3.*ry) !+ d2fyyyq ! d2fydydy
+ fnode(17) = fnode(17) - dr4m3*(5.*ry*ry*rz - rz)    !+ d2fyyzq ! d2fydydz
+ fnode(18) = fnode(18) - dr4m3*(5.*ry*rz*rz - ry)    !+ d2fyzzq ! d2fydzdz
+ fnode(19) = fnode(19) - dr4m3*(5.*rz*rz*rz - 3.*rz) !+ d2fzzzq ! d2fzdzdz
  fnode(20) = fnode(20)   ! potential
 
 end subroutine compute_M2L
@@ -1579,13 +1578,14 @@ subroutine compute_node_node(node)
     istack = istack - 1
     if (inodeA == inodeB) then
        if (istack+4 > istacksize) call fatal('getneigh','stack overflow in getneigh')
-       call open_both(nstack,istack,node(inodeA),node(inodeA))
+       call open_nodes(nstack,istack,inodeA,inodeB,node(inodeA),node(inodeA))
     else
+       if (inodeB==0) inodeB = inodeA
        call node_interaction(inodeA,inodeB,node(inodeA),node(inodeB),stackit)
 
        if (stackit) then
           if (istack+4 > istacksize) call fatal('getneigh','stack overflow in getneigh')
-          call open_both(nstack,istack,node(inodeA),node(inodeB))
+          call open_nodes(nstack,istack,inodeA,inodeB,node(inodeA),node(inodeB))
        endif
 
     endif
@@ -1600,26 +1600,25 @@ subroutine compute_node_node(node)
     inodeB = nstack(2,istack)
     istack = istack - 1
 
-
     fnodeB = node(inodeB)%fnode
-    dx = node(inodeB)%xcen(1) - node(inodeA)%xcen(1)
-    dy = node(inodeB)%xcen(2) - node(inodeA)%xcen(2)
-    dz = node(inodeB)%xcen(3) - node(inodeA)%xcen(3)
-    node(inodeA)%fnode(1) = node(inodeA)%fnode(1) + fnodeB(1) + dx*(fnodeB(4) + 0.5*(dx*fnodeB(10) + dy*fnodeB(11) +dz*fnodeB(12)))&
-                                                              + dy*(fnodeB(5) + 0.5*(dx*fnodeB(11) + dy*fnodeB(13) +dz*fnodeB(14)))&
-                                                              + dz*(fnodeB(6) + 0.5*(dx*fnodeB(12) + dy*fnodeB(14) +dz*fnodeB(15)))
-    node(inodeA)%fnode(2) = node(inodeA)%fnode(2) + fnodeB(2) + dx*(fnodeB(5) + 0.5*(dx*fnodeB(11) + dy*fnodeB(13) +dz*fnodeB(14)))&
-                                                              + dy*(fnodeB(7) + 0.5*(dx*fnodeB(13) + dy*fnodeB(16) +dz*fnodeB(17)))&
-                                                              + dz*(fnodeB(8) + 0.5*(dx*fnodeB(14) + dy*fnodeB(17) +dz*fnodeB(18)))
-    node(inodeA)%fnode(3) = node(inodeA)%fnode(3) + fnodeB(3) + dx*(fnodeB(6) + 0.5*(dx*fnodeB(12) + dy*fnodeB(14) +dz*fnodeB(15)))&
-                                                              + dy*(fnodeB(8) + 0.5*(dx*fnodeB(14) + dy*fnodeB(17) +dz*fnodeB(18)))&
-                                                              + dz*(fnodeB(9) + 0.5*(dx*fnodeB(15) + dy*fnodeB(18) +dz*fnodeB(19)))
-    node(inodeA)%fnode(4)  = node(inodeA)%fnode(4)  + fnodeB(4) + dx*fnodeB(10) + dy*fnodeB(11) +dz*fnodeB(12)
-    node(inodeA)%fnode(5)  = node(inodeA)%fnode(5)  + fnodeB(5) + dx*fnodeB(11) + dy*fnodeB(13) +dz*fnodeB(14)
-    node(inodeA)%fnode(6)  = node(inodeA)%fnode(6)  + fnodeB(6) + dx*fnodeB(12) + dy*fnodeB(14) +dz*fnodeB(15)
-    node(inodeA)%fnode(7)  = node(inodeA)%fnode(7)  + fnodeB(7) + dx*fnodeB(13) + dy*fnodeB(16) +dz*fnodeB(17)
-    node(inodeA)%fnode(8)  = node(inodeA)%fnode(8)  + fnodeB(8) + dx*fnodeB(14) + dy*fnodeB(17) +dz*fnodeB(18)
-    node(inodeA)%fnode(9)  = node(inodeA)%fnode(9)  + fnodeB(9) + dx*fnodeB(15) + dy*fnodeB(18) +dz*fnodeB(19)
+    dx = node(inodeA)%xcen(1) - node(inodeB)%xcen(1)
+    dy = node(inodeA)%xcen(2) - node(inodeB)%xcen(2)
+    dz = node(inodeA)%xcen(3) - node(inodeB)%xcen(3)
+    node(inodeA)%fnode(1) = node(inodeA)%fnode(1) + fnodeB(1) + dx*(fnodeB(4) + 0.5*(dx*fnodeB(10) + dy*fnodeB(11) +dz*fnodeB(12)))& ! xx +0.5(xxx+xxy+xxz)
+                                                              + dy*(fnodeB(5) + 0.5*(dx*fnodeB(11) + dy*fnodeB(13) +dz*fnodeB(14)))& ! xy +0.5(xxy+xyy+xyz)
+                                                              + dz*(fnodeB(6) + 0.5*(dx*fnodeB(12) + dy*fnodeB(14) +dz*fnodeB(15)))  ! xz +0.5(xxz+xyz+xzz)
+    node(inodeA)%fnode(2) = node(inodeA)%fnode(2) + fnodeB(2) + dx*(fnodeB(5) + 0.5*(dx*fnodeB(11) + dy*fnodeB(13) +dz*fnodeB(14)))& ! xy +0.5(xxy+xyy+xyz)
+                                                              + dy*(fnodeB(7) + 0.5*(dx*fnodeB(13) + dy*fnodeB(16) +dz*fnodeB(17)))& ! yy +0.5(xyy+yyy+yyz)
+                                                              + dz*(fnodeB(8) + 0.5*(dx*fnodeB(14) + dy*fnodeB(17) +dz*fnodeB(18)))  ! yz +0.5(xyz+yyz+yyz)
+    node(inodeA)%fnode(3) = node(inodeA)%fnode(3) + fnodeB(3) + dx*(fnodeB(6) + 0.5*(dx*fnodeB(12) + dy*fnodeB(14) +dz*fnodeB(15)))& ! xz +0.5(xxz+xyz+xzz)
+                                                              + dy*(fnodeB(8) + 0.5*(dx*fnodeB(14) + dy*fnodeB(17) +dz*fnodeB(18)))& ! yz +0.5(xyz+yyz+yzz)
+                                                              + dz*(fnodeB(9) + 0.5*(dx*fnodeB(15) + dy*fnodeB(18) +dz*fnodeB(19)))  ! zz +0.5(xzz+yzz+zzz)
+    node(inodeA)%fnode(4)  = node(inodeA)%fnode(4)  + fnodeB(4) + dx*fnodeB(10) + dy*fnodeB(11) + dz*fnodeB(12) ! xxx + xxy + xxz
+    node(inodeA)%fnode(5)  = node(inodeA)%fnode(5)  + fnodeB(5) + dx*fnodeB(11) + dy*fnodeB(13) + dz*fnodeB(14) ! xxy + xyy + xyz
+    node(inodeA)%fnode(6)  = node(inodeA)%fnode(6)  + fnodeB(6) + dx*fnodeB(12) + dy*fnodeB(14) + dz*fnodeB(15) ! xxz + xyz + xzz
+    node(inodeA)%fnode(7)  = node(inodeA)%fnode(7)  + fnodeB(7) + dx*fnodeB(13) + dy*fnodeB(16) + dz*fnodeB(17) ! xyy + yyy + yyz
+    node(inodeA)%fnode(8)  = node(inodeA)%fnode(8)  + fnodeB(8) + dx*fnodeB(14) + dy*fnodeB(17) + dz*fnodeB(18) ! xyz + yyz + yzz
+    node(inodeA)%fnode(9)  = node(inodeA)%fnode(9)  + fnodeB(9) + dx*fnodeB(15) + dy*fnodeB(18) + dz*fnodeB(19) ! xzz + yzz + zzz
     node(inodeA)%fnode(10) = node(inodeA)%fnode(10) + fnodeB(10)
     node(inodeA)%fnode(11) = node(inodeA)%fnode(11) + fnodeB(11)
     node(inodeA)%fnode(12) = node(inodeA)%fnode(12) + fnodeB(12)
@@ -1631,17 +1630,19 @@ subroutine compute_node_node(node)
     node(inodeA)%fnode(18) = node(inodeA)%fnode(18) + fnodeB(18)
     node(inodeA)%fnode(19) = node(inodeA)%fnode(19) + fnodeB(19)
 
+
+
     il = node(inodeA)%leftchild
     ir = node(inodeA)%rightchild
     if (istack+2 > istacksize) call fatal('FMMnodenode','stack overflow in Local expansion eval')
     if (il /= 0) then
        istack = istack + 1
-       nstack(1,istack) = node(inodeA)%leftchild
+       nstack(1,istack) = il
        nstack(2,istack) = inodeA
     endif
     if (ir /= 0) then
        istack = istack + 1
-       nstack(1,istack) = node(inodeA)%rightchild
+       nstack(1,istack) = ir
        nstack(2,istack) = inodeA
     endif
 
@@ -1652,37 +1653,62 @@ subroutine compute_node_node(node)
 
 end subroutine compute_node_node
 
-subroutine open_both(nstack,istack,nodetgt,nodesrc)
+subroutine open_nodes(nstack,istack,itgt,isrc,nodetgt,nodesrc)
  use io, only:fatal
  integer,      intent(inout) :: nstack(:,:)
  integer,      intent(inout) :: istack
+ integer,      intent(in)    :: itgt,isrc
  type(kdnode), intent(in)    :: nodetgt,nodesrc
 
  integer :: irT,ilT,irS,ilS
- logical :: isleaf
+ logical :: isnleaf
 
  ilT    = nodetgt%leftchild
  irT    = nodetgt%rightchild
  ilS    = nodesrc%leftchild
  irS    = nodesrc%rightchild
- isleaf = (irT==0 .or. irS==0)
+ isnleaf = (irT/=0)
 
- if (.not.isleaf) then
-    istack = istack + 1
-    nstack(1,istack) = irT
-    nstack(2,istack) = irS
-    istack = istack + 1
-    nstack(1,istack) = irT
-    nstack(2,istack) = ilS
-    istack = istack + 1
-    nstack(1,istack) = ilT
-    nstack(2,istack) = irS
-    istack = istack + 1
-    nstack(1,istack) = ilT
-    nstack(2,istack) = ilS
+ if (isnleaf) then
+    if (irS/=0) then
+       istack = istack + 1
+       nstack(1,istack) = irT
+       nstack(2,istack) = irS
+       istack = istack + 1
+       nstack(1,istack) = irT
+       nstack(2,istack) = ilS
+       istack = istack + 1
+       nstack(1,istack) = ilT
+       nstack(2,istack) = irS
+       istack = istack + 1
+       nstack(1,istack) = ilT
+       nstack(2,istack) = ilS
+    else
+       istack = istack + 1
+       nstack(1,istack) = irT
+       nstack(2,istack) = isrc
+       istack = istack + 1
+       nstack(1,istack) = ilT
+       nstack(2,istack) = isrc
+    endif
+ else
+    if (irS/=0) then
+       istack = istack + 1
+       nstack(1,istack) = itgt
+       nstack(2,istack) = ilS
+       istack = istack + 1
+       nstack(1,istack) = itgt
+       nstack(2,istack) = irS
+    else! self interaction with leaf node. Source to zero
+       if(itgt==isrc) then
+          istack = istack + 1
+          nstack(1,istack) = itgt
+          nstack(2,istack) = 0
+       endif
+    endif
  endif
 
-end subroutine open_both
+end subroutine open_nodes
 
 
 !-----------------------------------------------------------
@@ -1694,6 +1720,8 @@ end subroutine open_both
 !-----------------------------------------------------------
 subroutine node_interaction(itgt,isrc,nodetgt,nodesrc,stackit)
  use kernel, only:radkern
+ use part,   only:xyzh,gradh,massoftype,iamtype,iphase,fxyzu
+ use kernel,    only:grkern,kernel_softening,radkern2,cnormk
  integer,    intent(in)    :: itgt,isrc
  logical,    intent(out)   :: stackit
  type(kdnode), intent(inout) :: nodetgt,nodesrc
@@ -1701,8 +1729,11 @@ subroutine node_interaction(itgt,isrc,nodetgt,nodesrc,stackit)
  real    :: xcenA,ycenA,zcenA,xsizeA,massA,rcutA
  real    :: xcenB,ycenB,zcenB,xsizeB,massB,rcutB
  real    :: dx,dy,dz,r2,dr1,tree_acc2,rcut
+ real    :: hi,hi1,hi21,hi41,gradhi,gradsofti,fgravi(3),dxij(3),drij(3),xi(3)
+ real    :: hj,hj1,hj21,hj41,rij,rij2,rij21,rij1,pmassi,pmassj,q2i,q2j,qi,qj
+ real    :: grkerni,grkernj,fmi,fmj,dsofti,dsoftj,fm,phii,phij
  real    :: quadsA(6),quadsB(6)
- integer :: ilA,irA,ilB,irB
+ integer :: ilA,irA,ilB,irB,i,j,k,l,iamtypei
  logical :: wellsep
 
  tree_acc2 = tree_accuracy*tree_accuracy
@@ -1735,12 +1766,81 @@ subroutine node_interaction(itgt,isrc,nodetgt,nodesrc,stackit)
  wellsep = tree_acc2*r2 > (xsizeA+xsizeB+rcut)**2
 
  if (wellsep) then
-    !print*,"WELL SEPARATED!!!!",xsizeA,xsizeB,sqrt((xsizeA+xsizeB+rcut)**2/r2),nodetgt%parent,nodesrc%parent
+    !print*,"WELL SEPARATED!!!!",isrc,(xsizeA+xsizeB+rcut)**2/r2
     dr1 = 1./sqrt(r2)
     call compute_M2L(dx,dy,dz,dr1,massB,quadsB,nodetgt%fnode)
     stackit = .false.
  else
-    stackit = .true.
+    if (irA==irB .and. irA==0) then
+       ilA = inoderange(1,itgt)
+       irA = inoderange(2,itgt)
+       ilB = inoderange(1,isrc)
+       irB = inoderange(2,isrc)
+       do k=ilA,irA
+          i = inodeparts(k)
+          xi(1:3) = xyzh(1:3,i)
+          hi      = xyzh(4,i)
+
+          iamtypei = iamtype(iphase(i))
+          pmassi = massoftype(iamtypei)
+
+
+          hi1  = 1./hi
+          hi21 = hi1*hi1
+          hi41 = hi21*hi21
+          gradhi    = gradh(1,i)
+          gradsofti = gradh(2,i)
+          fgravi(:) = 0.
+
+          do l=ilB,irB
+             j = inodeparts(l)
+             if (i==j) cycle
+             dxij(1) = xi(1) - xyzh(1,j)
+             dxij(2) = xi(2) - xyzh(2,j)
+             dxij(3) = xi(3) - xyzh(3,j)
+             hj    = xyzh(4,j)
+             hj1   = 1./hj
+             rij2  = dot_product(dxij,dxij)
+             rij   = sqrt(rij2)
+             rij1  = 1./rij
+             rij21 = rij1*rij1
+             drij(:) = dxij(:)*rij1
+             hj21  = hj1*hj1
+             hj41  = hj21*hj21
+             pmassj = massoftype(iamtypei)
+             q2i = rij2*hi21
+             q2j = rij2*hj21
+             if (q2i < radkern2) then
+                qi = sqrt(q2i)
+                grkerni = grkern(q2i,qi)
+                call kernel_softening(q2i,qi,phii,fmi)
+                fmi        = fmi*hi21
+                grkerni    = cnormk*grkerni*hi41*gradhi
+                dsofti     = 0.5*grkerni*gradsofti
+                fgravi(:)  = fgravi(:) - pmassj*dsofti*drij(:)
+             else
+                fmi  = rij21
+             endif
+             if (q2j < radkern2) then
+                qj = sqrt(q2j)
+                grkernj = grkern(q2j,qj)
+                call kernel_softening(q2j,qj,phij,fmj)
+                fmj        = fmj*hj21
+                grkernj    = cnormk*grkernj*hj41*gradh(1,j)
+                dsoftj     = 0.5*grkernj*gradh(2,j)
+                fgravi(:)  = fgravi(:) - pmassj*dsoftj*drij(:)
+             else
+                fmj  = rij21
+             endif
+             fm = 0.5*(fmi + fmj)
+             fgravi(1:3) = fgravi(1:3) - pmassj*drij(1:3)*fm
+          enddo
+          fxyzu(1:3,i) = fxyzu(1:3,i) + fgravi(1:3)
+       enddo
+       stackit = .false.
+    else
+       stackit = .true.
+    endif
  endif
 
 end subroutine node_interaction

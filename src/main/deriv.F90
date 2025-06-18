@@ -41,7 +41,7 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  use dim,            only:maxvxyzu,mhd,fast_divcurlB,gr,periodic,do_radiation,&
                           sink_radiation,use_dustgrowth,ind_timesteps
  use io,             only:iprint,fatal,error
- use linklist,       only:set_linklist,set_FMM
+ use linklist,       only:set_linklist
  use densityforce,   only:densityiterate
  use ptmass,         only:ipart_rhomax,ptmass_calc_enclosed_mass,ptmass_boundary_crossing
  use externalforces, only:externalforce
@@ -163,7 +163,6 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
     call do_timing('radiation',tlast,tcpulast)
  endif
 
- call set_FMM()
 
 !
 ! compute forces

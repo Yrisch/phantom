@@ -194,7 +194,7 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
  use dim,          only:maxvxyzu,maxneigh,mhd,mhd_nonideal,lightcurve,mpi,use_dust,use_apr,&
                         use_sinktree
  use io,           only:iprint,fatal,iverbose,id,master,real4,warning,error,nprocs
- use linklist,     only:ncells,get_neighbour_list,get_hmaxcell,get_cell_location,listneigh
+ use linklist,     only:ncells,get_neighbour_list,get_hmaxcell,get_cell_location,listneigh,set_FMM
  use options,      only:iresistive_heating
  use part,         only:rhoh,dhdrho,rhoanddhdrho,alphaind,iactive,gradh,&
                         hrho,iphase,igas,maxgradh,dvdx,eta_nimhd,deltav,poten,iamtype,&
@@ -401,6 +401,8 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
     call reset_stacks
     call reset_cell_counters(cell_counters)
  endif
+ fxyzu(:,:)=0.
+ call set_FMM()
 
 !
 !-- verification for non-ideal MHD
@@ -1782,9 +1784,9 @@ subroutine compute_forces(i,iamgasi,iamdusti,xpartveci,hi,hi1,hi21,hi41,gradhi,g
           projsy = projsyi + projsyj
           projsz = projszi + projszj
 
-          fsum(ifxi) = fsum(ifxi) - runix*(gradp + fgrav) - projsx
-          fsum(ifyi) = fsum(ifyi) - runiy*(gradp + fgrav) - projsy
-          fsum(ifzi) = fsum(ifzi) - runiz*(gradp + fgrav) - projsz
+          fsum(ifxi) = fsum(ifxi) - runix*(gradp ) - projsx !+ fgrav
+          fsum(ifyi) = fsum(ifyi) - runiy*(gradp ) - projsy !+ fgrav
+          fsum(ifzi) = fsum(ifzi) - runiz*(gradp ) - projsz !+ fgrav
           fsum(ipot) = fsum(ipot) + pmassj*phii ! no need to symmetrise (see PM07)
           if (icooling == 9) then
              gradpx = gradpx + runix*(gradP_cooli + gradP_coolj)
@@ -1908,10 +1910,10 @@ subroutine compute_forces(i,iamgasi,iamdusti,xpartveci,hi,hi1,hi21,hi41,gradhi,g
           !
           !  gravity between particles of different types, or between gas pairs that are hidden by a sink
           !
-          fsum(ifxi) = fsum(ifxi) - fgrav*runix
-          fsum(ifyi) = fsum(ifyi) - fgrav*runiy
-          fsum(ifzi) = fsum(ifzi) - fgrav*runiz
-          fsum(ipot) = fsum(ipot) + pmassj*phii ! no need to symmetrise (see PM07)
+          fsum(ifxi) = fsum(ifxi) !- fgrav*runix
+          fsum(ifyi) = fsum(ifyi) !- fgrav*runiy
+          fsum(ifzi) = fsum(ifzi) !- fgrav*runiz
+          fsum(ipot) = fsum(ipot) !+ pmassj*phii ! no need to symmetrise (see PM07)
 
           !
           ! gas-dust: compute drag terms
@@ -2033,7 +2035,7 @@ subroutine compute_forces(i,iamgasi,iamdusti,xpartveci,hi,hi1,hi21,hi41,gradhi,g
        endif
 
 #ifdef GRAVITY
-    else !is_sph_neighbour or sinkinpair
+    elseif(.false.) then!is_sph_neighbour or sinkinpair
        !
        !--if particle is a trial neighbour, but not an SPH neighbour
        !  then compute the 1/r^2 force contribution
@@ -3031,9 +3033,9 @@ subroutine finish_cell_and_store_results(icall,cell,fxyzu,xyzh,vxyzu,poten,dt,dv
     fxyzu(2,i) = fxyzu(2,i) + fsum(ifyi)
     fxyzu(3,i) = fxyzu(3,i) + fsum(ifzi)
 #else
-    fxyzu(1,i) = fsum(ifxi)
-    fxyzu(2,i) = fsum(ifyi)
-    fxyzu(3,i) = fsum(ifzi)
+    fxyzu(1,i) = fxyzu(1,i) + fsum(ifxi)
+    fxyzu(2,i) = fxyzu(2,i) + fsum(ifyi)
+    fxyzu(3,i) = fxyzu(3,i) + fsum(ifzi)
 #endif
     if (use_dust) then
        if (drag_implicit) then
