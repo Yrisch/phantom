@@ -149,6 +149,8 @@ subroutine testsuite(string,first,last,ntests,npass,nfail)
  if (index(string,'part')      /= 0) dopart    = .true.
  if (index(string,'polytrope') /= 0) dogravity = .true.
  if (index(string,'directsum') /= 0) dogravity = .true.
+ if (index(string,'convsg')    /= 0) dogravity = .true.
+ if (index(string,'fmm')       /= 0) dogravity = .true.
  if (index(string,'dust')      /= 0) dodust    = .true.
  if (index(string,'growth')    /= 0) dogrowth  = .true.
  if (index(string,'nimhd')     /= 0) donimhd   = .true.
@@ -194,7 +196,7 @@ subroutine testsuite(string,first,last,ntests,npass,nfail)
     dosedov = .true.
  case('indtstep','ind')
     doindtstep = .true.
- case('gravity','grav','fmm')
+ case('gravity','grav')
     dogravity = .true.
  case('dump','rwdump','dumprw')
     dorwdump = .true.

@@ -402,6 +402,7 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
     call reset_cell_counters(cell_counters)
  endif
  fxyzu(:,:)=0.
+ poten(:)=0.
  call set_FMM()
 
 !
@@ -1787,7 +1788,7 @@ subroutine compute_forces(i,iamgasi,iamdusti,xpartveci,hi,hi1,hi21,hi41,gradhi,g
           fsum(ifxi) = fsum(ifxi) - runix*(gradp ) - projsx !+ fgrav
           fsum(ifyi) = fsum(ifyi) - runiy*(gradp ) - projsy !+ fgrav
           fsum(ifzi) = fsum(ifzi) - runiz*(gradp ) - projsz !+ fgrav
-          fsum(ipot) = fsum(ipot) + pmassj*phii ! no need to symmetrise (see PM07)
+          fsum(ipot) = fsum(ipot) !+ pmassj*phii ! no need to symmetrise (see PM07)
           if (icooling == 9) then
              gradpx = gradpx + runix*(gradP_cooli + gradP_coolj)
              gradpy = gradpy + runiy*(gradP_cooli + gradP_coolj)
@@ -2985,7 +2986,7 @@ subroutine finish_cell_and_store_results(icall,cell,fxyzu,xyzh,vxyzu,poten,dt,dv
        fsum(idudtdissi) = fsum(idudtdissi) + vxi*fxi + vyi*fyi + vzi*fzi
     endif
     epoti = epoti + 0.5*pmassi*poti
-    poten(i) = real(epoti,kind=kind(poten))
+    poten(i) = poten(i) + real(epoti,kind=kind(poten))
     if (use_sinktree) then
        if (iamsinki) then
           fxyz_ptmass_tree(1,i-maxpsph) = fsum(ifxi) + fsum(ifskxi)

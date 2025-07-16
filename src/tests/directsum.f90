@@ -58,7 +58,7 @@ subroutine directsum_grav(xyzh,gradh,fgrav,phitot,ntot)
  real,         intent(inout) :: fgrav(maxvxyzu,ntot)
  real,         intent(out)   :: phitot
  integer :: i,j,iamtypei,iamtypej
- real :: dx(3),dr(3),fgravi(3),fgravj(3),xi(3)
+ real :: dx(3),dr(3),fgravi(3),xi(3)!,fgravj(3)
  real :: rij,rij1,rij2,rij21,pmassi,pmassj
  real :: gradhi,gradsofti,grkerni,grkernj,dsofti,dsoftj
  real :: phii,phij,phiterm,fm,fmi,fmj,phitemp,potensoft0,qi,qj
@@ -89,6 +89,15 @@ subroutine directsum_grav(xyzh,gradh,fgrav,phitot,ntot)
 !
 !--calculate gravitational force by direct summation on all particles
 !
+!$omp parallel do schedule(static) default(none)&
+!$omp shared(xyzh,iphase,gradh,apr_level,fgrav)&
+!$omp shared(ntot,maxphase,maxp,massoftype,potensoft0)&
+!$omp private(i,j,xi,hi,hi1,hi21,hi41,gradhi,gradsofti,fgravi)&
+!$omp private(dx,dr,hj,hj1,hj21,hj41,rij2,rij,rij1,rij21,q2i,q2j,qi,qj)&
+!$omp private(grkerni,phii,fmi,grkernj,fmj,phij,dsoftj,dsofti,fm)&
+!$omp firstprivate(iamtypei,iactivei,pmassi,iamtypej,iactivej,pmassj)&
+!$omp private(phiterm,phitemp)&
+!$omp reduction(+:phitot)
  overi: do i=1,ntot
     xi(1:3) = xyzh(1:3,i)
     hi      = xyzh(4,i)
@@ -114,7 +123,8 @@ subroutine directsum_grav(xyzh,gradh,fgrav,phitot,ntot)
     fgravi(:) = 0.
     phitemp   = 0.
 
-    overj: do j=i+1,ntot
+    overj: do j=1,ntot
+       if (i==j) cycle
        dx(1) = xi(1) - xyzh(1,j)
        dx(2) = xi(2) - xyzh(2,j)
        dx(3) = xi(3) - xyzh(3,j)
@@ -133,7 +143,7 @@ subroutine directsum_grav(xyzh,gradh,fgrav,phitot,ntot)
           iactivej = iactive(iphase(j))
           pmassj = massoftype(iamtypej)
        endif
-       fgravj(:) = 0.
+       !fgravj(:) = 0.
        q2i = rij2*hi21
        q2j = rij2*hj21
        if (q2i < radkern2) then
@@ -145,7 +155,7 @@ subroutine directsum_grav(xyzh,gradh,fgrav,phitot,ntot)
           grkerni    = cnormk*grkerni*hi41*gradhi
           dsofti     = 0.5*grkerni*gradsofti
           fgravi(:)  = fgravi(:) - pmassj*dsofti*dr(:)
-          fgravj(:)  = fgravj(:) + pmassi*dsofti*dr(:)
+          !fgravj(:)  = fgravj(:) + pmassi*dsofti*dr(:)
        else
           phii = -rij1
           fmi  = rij21
@@ -159,7 +169,7 @@ subroutine directsum_grav(xyzh,gradh,fgrav,phitot,ntot)
           grkernj    = cnormk*grkernj*hj41*gradh(1,j)
           dsoftj     = 0.5*grkernj*gradh(2,j)
           fgravi(:)  = fgravi(:) - pmassj*dsoftj*dr(:)
-          fgravj(:)  = fgravj(:) + pmassi*dsoftj*dr(:)
+          !fgravj(:)  = fgravj(:) + pmassi*dsoftj*dr(:)
        else
           phij = -rij1
           fmj  = rij21
@@ -168,13 +178,13 @@ subroutine directsum_grav(xyzh,gradh,fgrav,phitot,ntot)
        phiterm = 0.5*(phii + phij)
        phitemp = phitemp + pmassj*phiterm
        !phi(j) = phi(j) + pmassi*phiterm
-       phitot = phitot + pmassj*pmassi*phiterm
+       !phitot = phitot + pmassj*pmassi*phiterm
 
        fm = 0.5*(fmi + fmj)
        fgravi(1:3) = fgravi(1:3) - pmassj*dr(1:3)*fm
-       if (iactivej) then
-          fgrav(1:3,j) = fgrav(1:3,j) + pmassi*dr(1:3)*fm + fgravj(1:3)
-       endif
+       !if (iactivej) then
+       !   fgrav(1:3,j) = fgrav(1:3,j) + pmassi*dr(1:3)*fm + fgravj(1:3)
+       !endif
     enddo overj
 !
 !--add self contribution to potential
@@ -185,6 +195,7 @@ subroutine directsum_grav(xyzh,gradh,fgrav,phitot,ntot)
     !phi(i) = phitemp + pmassi*potensoft0*hi1
     phitot = phitot + pmassi*phitemp + pmassi*pmassi*potensoft0*hi1
  enddo overi
+ !$omp end parallel do
 
 ! phitot = 0.
 ! do i=1,ntot

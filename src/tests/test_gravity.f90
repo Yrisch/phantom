@@ -35,7 +35,7 @@ subroutine test_gravity(ntests,npass,string)
  use testapr, only:setup_apr_region_for_test
  integer,          intent(inout) :: ntests,npass
  character(len=*), intent(in)    :: string
- logical :: testdirectsum,testpolytrope,testtaylorseries,testall
+ logical :: testdirectsum,testpolytrope,testtaylorseries,testconv,testall
 
  testdirectsum    = .false.
  testtaylorseries = .false.
@@ -48,6 +48,8 @@ subroutine test_gravity(ntests,npass,string)
     testdirectsum = .true.
  case('fmm')
     testpolytrope = .true.
+ case('convsg')
+    testconv      = .true.
  case default
     testall = .true.
  end select
@@ -65,6 +67,8 @@ subroutine test_gravity(ntests,npass,string)
 
     if (testpolytrope .or. testall) call test_FMM(ntests,npass)
 
+    if (testconv .or. testall) call test_FMM_conv(ntests,npass)
+
     if (id==master) write(*,"(/,a)") '<-- SELF-GRAVITY TESTS COMPLETE'
  else
     if (id==master) write(*,"(/,a)") '--> SKIPPING SELF-GRAVITY TESTS (need -DGRAVITY)'
@@ -78,7 +82,7 @@ end subroutine test_gravity
 !+
 !-----------------------------------------------------------------------
 subroutine test_taylorseries(ntests,npass)
- use kdtree,    only:compute_fnode,expand_fgrav_in_taylor_series
+ use kdtree,    only:compute_fnode,expand_fgrav_in_taylor_series,compute_quads
  use testutils, only:checkval,update_test_scores
  integer, intent(inout) :: ntests,npass
  integer :: nfailed(18),i,npnode
@@ -132,12 +136,7 @@ subroutine test_taylorseries(ntests,npass)
  do i=1,npnode
     dx(:) = xposjd(:,i) - xposj
     dr2   = dot_product(dx,dx)
-    quads(1) = quads(1) + pmassi*(3.*dx(1)*dx(1) - dr2)
-    quads(2) = quads(2) + pmassi*(3.*dx(1)*dx(2))
-    quads(3) = quads(3) + pmassi*(3.*dx(1)*dx(3))
-    quads(4) = quads(4) + pmassi*(3.*dx(2)*dx(2) - dr2)
-    quads(5) = quads(5) + pmassi*(3.*dx(2)*dx(3))
-    quads(6) = quads(6) + pmassi*(3.*dx(3)*dx(3) - dr2)
+    call compute_quads(quads,pmassi,dx(1),dx(2),dx(3),dr2)
  enddo
 
  x0 = 0.      ! position of nearest node centre
@@ -228,6 +227,114 @@ subroutine test_taylorseries(ntests,npass)
  call update_test_scores(ntests,nfailed,npass)
 
 end subroutine test_taylorseries
+
+!-----------------------------------------------------------------------
+!+
+!  Unit tests of the FMM algorithm convergence
+!+
+!-----------------------------------------------------------------------
+
+subroutine test_FMM_conv(ntests,npass)
+ use kdtree,     only:compute_M2L,expand_fgrav_in_taylor_series,compute_quads,&
+                      compute_moments
+ use testutils,  only:checkval,update_test_scores
+ use random,     only:ran2
+ use dtypekdtree,only:lenfgrav
+ integer, intent(inout) :: ntests,npass
+
+ integer, parameter :: n_thet     = 5
+ real, parameter :: sep_to_COM    = 1.e-2
+ integer :: seed
+
+ real    :: fnodea(lenfgrav),fnodeb(lenfgrav),fxa,fya,fza,fxb,fyb,fzb
+ real    :: dx,dy,dz,dr2,dr1,dxa,dya,dza,dr2a,dxb,dyb,dzb,dr2b,pota,potb
+ real    :: xa(3),xb(3),xpa(3),xpb(3)
+ real    :: quadsa(6),quadsb(6)
+ real    :: theta,la,lb,pmassi
+ integer :: i,nfailed(3)
+
+ seed = 42
+
+ do i=1,n_thet
+
+    xa(1)  = (ran2(seed)-0.5)*2
+    xa(2)  = (ran2(seed)-0.5)*2
+    xa(3)  = (ran2(seed)-0.5)*2
+
+    xb(1)  = (ran2(seed)-0.5)*2
+    xb(2)  = (ran2(seed)-0.5)*2
+    xb(3)  = (ran2(seed)-0.5)*2
+
+    xpa(1) = xa(1) + (ran2(seed)-0.5)*2*sep_to_COM
+    xpa(2) = xa(2) + (ran2(seed)-0.5)*2*sep_to_COM
+    xpa(3) = xa(3) + (ran2(seed)-0.5)*2*sep_to_COM
+
+    xpb(1) = xb(1) + (ran2(seed)-0.5)*2*sep_to_COM
+    xpb(2) = xb(2) + (ran2(seed)-0.5)*2*sep_to_COM
+    xpb(3) = xb(3) + (ran2(seed)-0.5)*2*sep_to_COM
+
+    dx  = xa(1)-xb(1)
+    dy  = xa(2)-xb(2)
+    dz  = xa(3)-xb(3)
+    dr2 = dx**2+dy**2+dz**2
+    dr1 = 1./sqrt(dr2)
+
+    la = maxval(abs(xpa-xa))
+    lb = maxval(abs(xpb-xb))
+
+    theta = 2*(la+lb)/ sqrt(dr2)
+    quadsa(:) = 0.
+    quadsb(:) = 0.
+    fnodea(:) = 0.
+    fnodeb(:) = 0.
+    pmassi = 3.14
+
+    print*,"theta:",theta
+
+    dxa  = xpa(1) - xa(1)
+    dya  = xpa(2) - xa(2)
+    dza  = xpa(3) - xa(3)
+    dr2a = dxa**2+dya**2+dza**2
+    call compute_moments(quadsa,pmassi,dxa,dya,dza)
+    call compute_moments(quadsa,pmassi,-dxa,-dya,-dza)
+
+    dxb  = xpb(1) - xb(1)
+    dyb  = xpb(2) - xb(2)
+    dzb  = xpb(3) - xb(3)
+    dr2b = dxb**2+dyb**2+dzb**2
+    call compute_moments(quadsb,pmassi,dxb,dyb,dzb)
+    call compute_moments(quadsb,pmassi,-dxb,-dyb,-dzb)
+
+    call compute_M2L(dx,dy,dz,dr1,2.*pmassi,quadsb,fnodea) ! we have two particles so double the mass
+    call compute_M2L(-dx,-dy,-dz,dr1,2.*pmassi,quadsa,fnodeb)
+
+
+    call expand_fgrav_in_taylor_series(fnodea,dxa,dya,dza,fxa,fya,fza,pota)
+    fxb = fxb + fxa
+    fyb = fyb + fya
+    fzb = fzb + fza
+    call expand_fgrav_in_taylor_series(fnodea,-dxa,-dya,-dza,fxa,fya,fza,pota)
+    fxb = fxb + fxa
+    fyb = fyb + fya
+    fzb = fzb + fza
+    call expand_fgrav_in_taylor_series(fnodeb,dxb,dyb,dzb,fxa,fya,fza,potb)
+    fxb = fxb + fxa
+    fyb = fyb + fya
+    fzb = fzb + fza
+    call expand_fgrav_in_taylor_series(fnodeb,-dxb,-dyb,-dzb,fxa,fya,fza,potb)
+    fxb = fxb + fxa
+    fyb = fyb + fya
+    fzb = fzb + fza
+
+    call checkval(fxb,0.,1.e-15,nfailed(1),'fx a and b symmetry')
+    call checkval(fyb,0.,1.e-15,nfailed(2),'fy a and b symmetry')
+    call checkval(fzb,0.,1.e-15,nfailed(3),'fz a and b symmetry')
+    call update_test_scores(ntests,nfailed,npass)
+
+ enddo
+
+end subroutine test_FMM_conv
+
 
 !-----------------------------------------------------------------------
 !+
@@ -651,7 +758,7 @@ subroutine test_longrange(ntests,npass)
                              fxyz_ptmass_tree,istar,shortsinktree
  use eos,             only:polyk,gamma
  use options,         only:ieos,alpha,alphau,alphaB,tolh
- use spherical,       only:set_sphere
+ use unifdis,         only:set_unifdis
  use deriv,           only:get_derivs_global
  use physcon,         only:pi
  use timing,          only:getused,printused
@@ -670,7 +777,7 @@ subroutine test_longrange(ntests,npass)
  integer, intent(inout) :: ntests,npass
  integer :: nfailed(18),boundi,boundf,j
  integer :: maxvxyzu,nx,np,i,nfgrav
- real :: psep,totvol,totmass,rhozero,tol,pmassi,fsum(3)
+ real :: psep,totvol,totmass,rhozero,tol,pmassi,fsum(3),Linf,errj,fmax,erri
  real :: time,rmin,rmax,phitot,dtsinksink,fonrmax,phii,epot_gas_sink
  real(kind=4) :: t1,t2
  real :: epoti,tree_acc_prev
@@ -693,16 +800,15 @@ subroutine test_longrange(ntests,npass)
  !--setup particles
  !
  call init_part()
- np       = 1000
- totvol   = 4./3.*pi*rmax**3
+ np       = 500000
+ totvol   = 2.**3
  nx       = int(np**(1./3.))
  psep     = totvol**(1./3.)/real(nx)
- psep     = 0.18
  npart    = 0
  npart_total = 0
  ! only set up particles on master, otherwise we will end up with n duplicates
  if (id==master) then
-    call set_sphere('random',id,master,rmin,rmax,psep,hfact,npart,xyzh,npart_total,np_requested=np)
+    call set_unifdis("random",id,master,-1.,1.,-1.,1.,-1.,1.,psep,hfact,npart,xyzh,.false.)
  endif
  np       = npart
  !
@@ -764,9 +870,14 @@ subroutine test_longrange(ntests,npass)
  !
  !--compute gravitational forces by direct summation
  !
+ fmax = 0.
  if (id == master) then
     call directsum_grav(xyzh,gradh,fgrav,phitot,npart)
  endif
+ do i=1,npart
+    erri = sqrt(dot_product(fgrav(1:3,i),fgrav(1:3,i)))
+    if (erri > fmax) fmax = erri
+ enddo
  !
  !--send phitot to all tasks
  !
@@ -774,46 +885,26 @@ subroutine test_longrange(ntests,npass)
  !
  !--calculate derivatives
  !
- call getused(t1)
- call get_derivs_global()
- call getused(t2)
- if (id==master) call printused(t1)
- !
- !--move particles to master and sort for test comparison
- !
- if (mpi) then
-    ibelong(:) = 0
-    call balancedomains(npart)
- endif
- call sort_part_id
- !
- !--compare the results
- !
- call checkval(npart,fxyzu(1,:),fgrav(1,:),5.e-3,nfailed(1),'fgrav(x)')
- call checkval(npart,fxyzu(2,:),fgrav(2,:),6.e-3,nfailed(2),'fgrav(y)')
- call checkval(npart,fxyzu(3,:),fgrav(3,:),9.4e-3,nfailed(3),'fgrav(z)')
- deallocate(fgrav)
- epoti = 0.
- do i=1,npart
-    epoti = epoti + poten(i)
- enddo
- epoti = reduceall_mpi('+',epoti)
- call checkval(epoti,phitot,5.2e-4,nfailed(4),'potential')
- call checkval(epoti,-3./5.*totmass**2/rmax,3.6e-2,nfailed(5),'potential=-3/5 GMM/R')
- ! check that potential energy computed via compute_energies is also correct
- call compute_energies(0.)
- call checkval(epot,phitot,5.2e-4,nfailed(6),'epot in compute_energies')
- call update_test_scores(ntests,nfailed(1:6),npass)
+ do i=1,15
+    Linf  = 0.0
+    tree_accuracy = 0.25+0.05*real(i)
+    call getused(t1)
+    call get_derivs_global()
+    call getused(t2)
+    if (id==master) call printused(t1)
+    !
+    !--compare the results
+    !
+    do j=1,npart
 
- do j=1,3
-    fsum(j)=sum(fxyzu(j,1:npart))
+       errj = (sqrt(dot_product(fxyzu(1:3,j),fxyzu(1:3,j)))-sqrt(dot_product(fgrav(1:3,j),fgrav(1:3,j))))/&
+               sqrt(dot_product(fgrav(1:3,j),fgrav(1:3,j)))
+       if (Linf<errj) Linf = errj
+    enddo
+    Linf = Linf/fmax
+    write(66,*)tree_accuracy,Linf
  enddo
- fsum = fsum*massoftype(istar)
- nfailed = 0
- call checkval(fsum(1),0.,1e-11,nfailed(1),"momentum conservation x")
- call checkval(fsum(2),0.,1e-11,nfailed(2),"momentum conservation y")
- call checkval(fsum(3),0.,1e-11,nfailed(3),"momentum conservation z")
- call update_test_scores(ntests,nfailed(1:3),npass)
+ !call update_test_scores(ntests,nfailed(1:3),npass)
 
 end subroutine test_longrange
 

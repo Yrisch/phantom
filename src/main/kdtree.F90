@@ -54,7 +54,7 @@ module kdtree
  public :: maketree, revtree, getneigh, kdnode
  public :: maketreeglobal
  public :: empty_tree
- public :: compute_fnode, expand_fgrav_in_taylor_series,compute_node_node
+ public :: compute_fnode, expand_fgrav_in_taylor_series,compute_node_node,compute_quads,compute_M2L,compute_moments
 
  integer, public :: maxlevel_indexed, maxlevel
 
@@ -753,12 +753,7 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
           pmassi = massoftype(iamtype(iphase_soa(i)))
        endif
     endif
-    quads(1) = quads(1) + pmassi*(3.*dx*dx - dr2)  ! Q_xx
-    quads(2) = quads(2) + pmassi*(3.*dx*dy)        ! Q_xy = Q_yx
-    quads(3) = quads(3) + pmassi*(3.*dx*dz)        ! Q_xz = Q_zx
-    quads(4) = quads(4) + pmassi*(3.*dy*dy - dr2)  ! Q_yy
-    quads(5) = quads(5) + pmassi*(3.*dy*dz)        ! Q_yz = Q_zy
-    quads(6) = quads(6) + pmassi*(3.*dz*dz - dr2)  ! Q_zz
+    call compute_quads(quads,pmassi,dx,dy,dz,dr2)
 #endif
  enddo
  !!$omp end parallel do
@@ -1400,6 +1395,34 @@ end subroutine getneigh
 
 !-----------------------------------------------------------
 !+
+!  Compute the contribution of one particule on the
+!  quadrupole moments of a tree cell
+!+
+!-----------------------------------------------------------
+subroutine compute_quads(quads,pmassi,dx,dy,dz,dr2)
+ real,intent(inout) :: quads(6)
+ real,intent(in)    :: pmassi,dx,dy,dz,dr2
+ quads(1) = quads(1) + pmassi*(3.*dx*dx - dr2)  ! Q_xx
+ quads(2) = quads(2) + pmassi*(3.*dx*dy)        ! Q_xy = Q_yx
+ quads(3) = quads(3) + pmassi*(3.*dx*dz)        ! Q_xz = Q_zx
+ quads(4) = quads(4) + pmassi*(3.*dy*dy - dr2)  ! Q_yy
+ quads(5) = quads(5) + pmassi*(3.*dy*dz)        ! Q_yz = Q_zy
+ quads(6) = quads(6) + pmassi*(3.*dz*dz - dr2)  ! Q_zz
+end subroutine compute_quads
+
+
+subroutine compute_moments(quads,pmassi,dx,dy,dz)
+ real,intent(inout) :: quads(6)
+ real,intent(in)    :: pmassi,dx,dy,dz
+ quads(1) = quads(1) + pmassi*dx*dx  ! Q_xx
+ quads(2) = quads(2) + pmassi*dx*dy        ! Q_xy = Q_yx
+ quads(3) = quads(3) + pmassi*dx*dz        ! Q_xz = Q_zx
+ quads(4) = quads(4) + pmassi*dy*dy  ! Q_yy
+ quads(5) = quads(5) + pmassi*dy*dz        ! Q_yz = Q_zy
+ quads(6) = quads(6) + pmassi*dz*dz  ! Q_zz
+end subroutine compute_moments
+!-----------------------------------------------------------
+!+
 !  Compute the gravitational force between the node centres
 !  along with the derivatives and second derivatives
 !  required for the Taylor series expansions.
@@ -1491,7 +1514,6 @@ end subroutine compute_fnode
 !+
 !  Compute the Taylor expansion coeffs between the node
 !  centres using the quadrupole moments (p=3)
-!
 !+
 !-----------------------------------------------------------
 pure subroutine compute_M2L(dx,dy,dz,dr,totmass,quads,fnode)
@@ -1521,18 +1543,18 @@ pure subroutine compute_M2L(dx,dy,dz,dr,totmass,quads,fnode)
  rijQij = (rx*rx*qxx + 2.*ry*rx*qxy + 2*ry*rz*qyz + ry*ry*qyy + 2*rx*rz*qxz + rz*rz*qzz)
  fqx = dr4*(1.5*(rx*(3*qxx+qyy+qzz) + 2.*ry*qxy + 2.*rz*qxz) - 7.5*rx*rijQij)
  fqy = dr4*(1.5*(ry*(3*qyy+qxx+qzz) + 2.*rx*qxy + 2.*rz*qyz) - 7.5*ry*rijQij)
- fqz = dr4*(1.5*(rz*(3*qzz+qyy+qxx) + 2.*rz*qyz + 2.*rx*qxz) - 7.5*rz*rijQij)
+ fqz = dr4*(1.5*(rz*(3*qzz+qyy+qxx) + 2.*ry*qyz + 2.*rx*qxz) - 7.5*rz*rijQij)
 
 
- fnode( 1) = fnode( 1) - dr3m*dx + fqx
- fnode( 2) = fnode( 2) - dr3m*dy + fqy
- fnode( 3) = fnode( 3) - dr3m*dz + fqz
- fnode( 4) = fnode( 4) + dr3m*(3.*rx*rx -   1.)   !+ dfxdxq ! dfx/dx
- fnode( 5) = fnode( 5) + dr3m*(3.*rx*ry       )   !+ dfxdyq ! dfx/dy = dfy/dx
- fnode( 6) = fnode( 6) + dr3m*(3.*rx*rz       )   !+ dfxdzq ! dfx/dz = dfz/dx
- fnode( 7) = fnode( 7) + dr3m*(3.*ry*ry -   1.)   !+ dfydyq ! dfy/dy
- fnode( 8) = fnode( 8) + dr3m*(3.*ry*rz       )   !+ dfydzq ! dfy/dz = dfz/dy
- fnode( 9) = fnode( 9) + dr3m*(3.*rz*rz -   1.)   !+ dfzdzq ! dfz/dz
+ fnode(1)  = fnode(1)  - dr3m*dx + fqx
+ fnode(2)  = fnode(2)  - dr3m*dy + fqy
+ fnode(3)  = fnode(3)  - dr3m*dz + fqz
+ fnode(4)  = fnode(4)  + dr3m*(3.*rx*rx -   1.)   !+ dfxdxq ! dfx/dx
+ fnode(5)  = fnode(5)  + dr3m*(3.*rx*ry       )   !+ dfxdyq ! dfx/dy = dfy/dx
+ fnode(6)  = fnode(6)  + dr3m*(3.*rx*rz       )   !+ dfxdzq ! dfx/dz = dfz/dx
+ fnode(7)  = fnode(7)  + dr3m*(3.*ry*ry -   1.)   !+ dfydyq ! dfy/dy
+ fnode(8)  = fnode(8)  + dr3m*(3.*ry*rz       )   !+ dfydzq ! dfy/dz = dfz/dy
+ fnode(9)  = fnode(9)  + dr3m*(3.*rz*rz -   1.)   !+ dfzdzq ! dfz/dz
  fnode(10) = fnode(10) - dr4m3*(5.*rx*rx*rx - 3.*rx) !+ d2fxxxq ! d2fxdxdx
  fnode(11) = fnode(11) - dr4m3*(5.*rx*rx*ry - ry)    !+ d2fxxyq ! d2fxdxdy
  fnode(12) = fnode(12) - dr4m3*(5.*rx*rx*rz - rz)    !+ d2fxxzq ! d2fxdxdz
@@ -1543,7 +1565,7 @@ pure subroutine compute_M2L(dx,dy,dz,dr,totmass,quads,fnode)
  fnode(17) = fnode(17) - dr4m3*(5.*ry*ry*rz - rz)    !+ d2fyyzq ! d2fydydz
  fnode(18) = fnode(18) - dr4m3*(5.*ry*rz*rz - ry)    !+ d2fyzzq ! d2fydzdz
  fnode(19) = fnode(19) - dr4m3*(5.*rz*rz*rz - 3.*rz) !+ d2fzzzq ! d2fzdzdz
- fnode(20) = fnode(20)   ! potential
+ fnode(20) = fnode(20) - totmass*dr !- 0.5*rijQij*dr3    ! potential
 
 end subroutine compute_M2L
 
@@ -1629,6 +1651,8 @@ subroutine compute_node_node(node)
     node(inodeA)%fnode(17) = node(inodeA)%fnode(17) + fnodeB(17)
     node(inodeA)%fnode(18) = node(inodeA)%fnode(18) + fnodeB(18)
     node(inodeA)%fnode(19) = node(inodeA)%fnode(19) + fnodeB(19)
+    node(inodeA)%fnode(20) = node(inodeA)%fnode(20) + (dx*fnodeB(1)+dy*fnodeB(2)+dz*fnodeB(3))
+
 
 
 
@@ -1720,7 +1744,7 @@ end subroutine open_nodes
 !-----------------------------------------------------------
 subroutine node_interaction(itgt,isrc,nodetgt,nodesrc,stackit)
  use kernel, only:radkern
- use part,   only:xyzh,gradh,massoftype,iamtype,iphase,fxyzu
+ use part,   only:xyzh,gradh,massoftype,iamtype,iphase,fxyzu,poten
  use kernel,    only:grkern,kernel_softening,radkern2,cnormk
  integer,    intent(in)    :: itgt,isrc
  logical,    intent(out)   :: stackit
@@ -1731,7 +1755,7 @@ subroutine node_interaction(itgt,isrc,nodetgt,nodesrc,stackit)
  real    :: dx,dy,dz,r2,dr1,tree_acc2,rcut
  real    :: hi,hi1,hi21,hi41,gradhi,gradsofti,fgravi(3),dxij(3),drij(3),xi(3)
  real    :: hj,hj1,hj21,hj41,rij,rij2,rij21,rij1,pmassi,pmassj,q2i,q2j,qi,qj
- real    :: grkerni,grkernj,fmi,fmj,dsofti,dsoftj,fm,phii,phij
+ real    :: grkerni,grkernj,fmi,fmj,dsofti,dsoftj,fm,phii,phij,phitemp
  real    :: quadsA(6),quadsB(6)
  integer :: ilA,irA,ilB,irB,i,j,k,l,iamtypei
  logical :: wellsep
@@ -1777,6 +1801,7 @@ subroutine node_interaction(itgt,isrc,nodetgt,nodesrc,stackit)
        ilB = inoderange(1,isrc)
        irB = inoderange(2,isrc)
        do k=ilA,irA
+          phitemp = 0.
           i = inodeparts(k)
           xi(1:3) = xyzh(1:3,i)
           hi      = xyzh(4,i)
@@ -1814,28 +1839,34 @@ subroutine node_interaction(itgt,isrc,nodetgt,nodesrc,stackit)
                 qi = sqrt(q2i)
                 grkerni = grkern(q2i,qi)
                 call kernel_softening(q2i,qi,phii,fmi)
+                phii       = phii*hi1
                 fmi        = fmi*hi21
                 grkerni    = cnormk*grkerni*hi41*gradhi
                 dsofti     = 0.5*grkerni*gradsofti
                 fgravi(:)  = fgravi(:) - pmassj*dsofti*drij(:)
              else
+                phii = -rij1
                 fmi  = rij21
              endif
              if (q2j < radkern2) then
                 qj = sqrt(q2j)
                 grkernj = grkern(q2j,qj)
                 call kernel_softening(q2j,qj,phij,fmj)
+                phij       = phij*hj1
                 fmj        = fmj*hj21
                 grkernj    = cnormk*grkernj*hj41*gradh(1,j)
                 dsoftj     = 0.5*grkernj*gradh(2,j)
                 fgravi(:)  = fgravi(:) - pmassj*dsoftj*drij(:)
              else
+                phij = -rij1
                 fmj  = rij21
              endif
              fm = 0.5*(fmi + fmj)
+             phitemp = phitemp + pmassj*(0.5*(phii + phij))
              fgravi(1:3) = fgravi(1:3) - pmassj*drij(1:3)*fm
           enddo
           fxyzu(1:3,i) = fxyzu(1:3,i) + fgravi(1:3)
+          poten(i) = poten(i) + 0.5*pmassi*phitemp
        enddo
        stackit = .false.
     else
