@@ -228,7 +228,7 @@ subroutine HII_feedback(nptmass,npart,xyzh,xyzmh_ptmass,vxyzu,eos_vars,dt)
        yi     = xyzmh_ptmass(2,i)
        zi     = xyzmh_ptmass(3,i)
        hcheck = xyzmh_ptmass(irstrom,i)
-       do while (.not.max_search)
+       iterations:do while (.not.max_search)
           if (hcheck > 0. ) then
              hcheck = hcheck + 6.*csion*dt
              if (hcheck > Rmax) then
@@ -255,11 +255,12 @@ subroutine HII_feedback(nptmass,npart,xyzh,xyzmh_ptmass,vxyzu,eos_vars,dt)
                       ! ionising photons needed to fully ionise the current particle
                       DNdot = DNcoeff + log10(rhoh(xyzh(4,j),pmass))
                       if (DNdot < Ndot) then
-                         if (eos_vars(imu,j) > muion ) then ! is ionised ?
+                         if (eos_vars(imu,j) - muion > epsilon(muion) ) then ! is ionised ?
                             logNdiff = DNdot - Ndot
                             Ndot = Ndot + log10(1.-10.**(logNdiff))
                             eos_vars(itemp,j)  = Tion
                             eos_vars(imu,j) = muion
+                            npartin = npartin + 1
                             if (maxvxyzu >= 4) vxyzu(4,j) = uIon
                          endif
                       else
@@ -276,16 +277,15 @@ subroutine HII_feedback(nptmass,npart,xyzh,xyzmh_ptmass,vxyzu,eos_vars,dt)
                          else ! unresolved case
                             r = epsilon(r)
                          endif
-                         npartin = k
                          xyzmh_ptmass(irstrom,i) = r
                          converged = .true.
-                         exit
+                         exit iterations
                       endif
                    endif
                 endif
              enddo
           endif
-       enddo
+       enddo iterations
        if (iverbose == 2) write(iprint,*)'Rstrom from sink ',i,' = ',r," with N = ",npartin,&
                                          ' ionised particle, remaining Nphot : ',Ndot,DNdot,"in ",its," iterations."
        if (.not.converged) call warning('HII_feedback','Photon march did not converge...',var='Ndot',&
