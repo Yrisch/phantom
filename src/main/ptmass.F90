@@ -867,7 +867,6 @@ subroutine ptmass_check_acc(i,icand,itypei,nptmass,epartprev,ibin_wakei,accreted
  integer                :: ifail
 
 
-
  !
  ! Verify particle is 'accretable'
  !
@@ -1019,8 +1018,10 @@ subroutine ptmass_accrete(imode,is,nptmass,xi,yi,zi,hi,pxi,pyi,pzi,fxi,fyi,fzi, 
                              time,ifail)
     enddo
     if (ifail == 5) return
+    i = icand
  elseif (imode == 2) then
     accreted = is > 0
+    i = is
     ifail    = -1
  endif
 
@@ -1028,7 +1029,6 @@ subroutine ptmass_accrete(imode,is,nptmass,xi,yi,zi,hi,pxi,pyi,pzi,fxi,fyi,fzi, 
 ! if accreted==true, then checks all passed => accrete particle
 !
  if ( accreted ) then
-
 ! Set new position for the sink particles
     dptmass(idxmsi,i) = dptmass(idxmsi,i) + xi*pmassi
     dptmass(idymsi,i) = dptmass(idymsi,i) + yi*pmassi

@@ -511,16 +511,17 @@ subroutine kick(dki,dt,npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,
 
  if (present(timei) .and. present(ibin_wake) .and. present(nbinmax) .and. present(accreted)) then
     is_accretion = .true.
+    imode  = 1
  else
     is_accretion = .false.
+    imode  = 0
  endif
 
  itype  = igas
  pmassi = massoftype(igas)
  dkdt   = dki*dt
- imode  = 1
 
- if ((nptmass > 100)) imode = 2
+ if ((nptmass > 1)) imode = 2
 
  ! Kick sink particles
  if (nptmass > 0) then
@@ -565,6 +566,7 @@ subroutine kick(dki,dt,npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,
     naccreted    = 0
     nlive        = 0
     ibin_wakei   = 0
+    dptmass(:,1:nptmass) = 0.
     !$omp parallel default(none) &
     !$omp shared(iexternalforce,listcand,ebound,imode) &
     !$omp shared(nptmass,npart,ifirstincell,sts_it_n)&
@@ -584,7 +586,6 @@ subroutine kick(dki,dt,npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,
     if (imode==2) then
        !$omp do
        do j = 1, nptmass
-          dptmass(:,j) = 0.
           xpos = xyzmh_ptmass(1:3,j)
           hcheck = xyzmh_ptmass(ihacc,j)
           call getneigh_pos(xpos,0.,hcheck,3,listneigh,nneigh,xyzhcache,maxcache,ifirstincell)
@@ -606,7 +607,7 @@ subroutine kick(dki,dt,npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,
                    hi = xyzh(4,i)
                 endif
 !$              call omp_set_lock(ipart_omp_lock(i))
-                call ptmass_check_acc(i,listcand(i),itype,nptmass,ebound(i),ibin_wake(i),&
+                call ptmass_check_acc(j,listcand(i),itype,nptmass,ebound(i),ibin_wake(i),&
                                       was_accreted,xi,yi,zi,hi,pxyzu(1,i),pxyzu(2,i),&
                                       pxyzu(3,i),xyzmh_ptmass,pxyz_ptmass,f_acc,timei,nfaili)
 !$              call omp_unset_lock(ipart_omp_lock(i))
