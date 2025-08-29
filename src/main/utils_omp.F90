@@ -19,10 +19,12 @@ module omputils
 
 !$ use dim, only:maxp
  implicit none
-!$ integer, parameter :: nlocks = maxp
-!$ integer(kind=8), dimension(0:nlocks) :: ipart_omp_lock
+!$ integer :: nlocks
+!$ integer(kind=8), allocatable :: ipart_omp_lock(:)
 
  integer :: omp_num_threads
+ public  :: init_omp,info_omp
+
 
 contains
 !----------------------------------------------------------------
@@ -59,6 +61,8 @@ subroutine init_omp
 !$ integer, external :: omp_get_num_threads
 
  omp_num_threads = 1
+!$ nlocks = maxp
+!$ allocate(ipart_omp_lock(nlocks))
 
 !$ do i = 0, nlocks
 !$  call omp_init_lock(ipart_omp_lock(i))
