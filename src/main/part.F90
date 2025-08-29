@@ -357,6 +357,7 @@ module part
  real(kind=4), allocatable :: divBsymm(:)
  real, allocatable         :: fext(:,:)
  real, allocatable         :: fext_old(:,:)
+ real, allocatable         :: ebound(:)
  real, allocatable         :: ddustevol(:,:)
  real, allocatable         :: ddustprop(:,:) !--grainmass is the only prop that evolves for now
  real, allocatable         :: drad(:,:)
@@ -513,6 +514,7 @@ subroutine allocate_part
  call allocate_array('divBsymm', divBsymm, maxmhdan)
  call allocate_array('fext', fext, 3, maxan)
  call allocate_array('fext_old', fext_old, 3, maxan)
+ call allocate_array('ebound', ebound, maxan)
  call allocate_array('vpred', vpred, maxvxyzu, maxan)
  call allocate_array('ppred', ppred, maxvxyzu, maxgran)
  call allocate_array('dustpred', dustpred, maxdustsmall, maxdustan)
@@ -612,6 +614,7 @@ subroutine deallocate_part
  if (allocated(divBsymm))     deallocate(divBsymm)
  if (allocated(fext))         deallocate(fext)
  if (allocated(fext_old))     deallocate(fext_old)
+ if (allocated(ebound))       deallocate(ebound)
  if (allocated(vpred))        deallocate(vpred)
  if (allocated(ppred))        deallocate(ppred)
  if (allocated(dustpred))     deallocate(dustpred)
