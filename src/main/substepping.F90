@@ -474,8 +474,8 @@ subroutine kick(dki,dt,npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,
                 fext,fxyz_ptmass,dsdt_ptmass,dptmass,ibin_wake, &
                 nbinmax,timei,fxyz_ptmass_sinksink,accreted)
  use part,           only:isdead_or_accreted,massoftype,iamtype,iamboundary,iphase,ispinx,ispiny,ispinz,igas,ndptmass
- use part,           only:apr_level,aprmassoftype,get_partinfo,ihacc
- use ptmass,         only:f_acc,ptmass_accrete,pt_write_sinkev,update_ptmass,ptmass_kick
+ use part,           only:apr_level,aprmassoftype,get_partinfo,ihacc,ebound
+ use ptmass,         only:f_acc,ptmass_accrete,pt_write_sinkev,update_ptmass,ptmass_kick,ptmass_check_acc
  use linklist,       only:listneigh,listcand=>listneigh_global,ifirstincell,getneigh_pos
  use externalforces, only:accrete_particles
  use options,        only:iexternalforce
@@ -498,14 +498,14 @@ subroutine kick(dki,dt,npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,
  integer(kind=1), optional, intent(in)    :: nbinmax
  logical        , optional, intent(inout) :: accreted
  integer,parameter      :: maxcache=128
- real, save             :: xyzcache(maxcache,3)
- !$omp threadprivate(xyzcache)
+ real, save             :: xyzhcache(maxcache,4)
+ !$omp threadprivate(xyzhcache)
  integer(kind=1)        :: ibin_wakei
  real(kind=4)           :: t1,t2,tcpu1,tcpu2
  logical                :: is_accretion,was_accreted
- integer                :: i,j,k,icand,itype,nfaili,nneigh
- integer                :: naccreted,nfail,nlive
- real                   :: dkdt,pmassi,fxi,fyi,fzi,xi,yi,zi,accretedmass
+ integer                :: i,j,k,itype,nfaili,nneigh
+ integer                :: naccreted,nfail,nlive,imode
+ real                   :: dkdt,pmassi,fxi,fyi,fzi,xi,yi,zi,hi,accretedmass
  real                   :: xpos(3),hcheck
 !$ external         :: omp_set_lock,omp_unset_lock
 
@@ -515,10 +515,12 @@ subroutine kick(dki,dt,npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,
     is_accretion = .false.
  endif
 
- itype = igas
+ itype  = igas
  pmassi = massoftype(igas)
+ dkdt   = dki*dt
+ imode  = 1
 
- dkdt = dki*dt
+ if ((nptmass > 100)) imode = 2
 
  ! Kick sink particles
  if (nptmass > 0) then
@@ -534,8 +536,8 @@ subroutine kick(dki,dt,npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,
 
  ! Kick gas particles
  !$omp parallel do default(none) &
- !$omp shared(maxp,maxphase) &
- !$omp shared(iphase,ntypes) &
+ !$omp shared(maxp,maxphase,imode) &
+ !$omp shared(iphase,ntypes,listcand,ebound) &
  !$omp shared(npart,fext,xyzh,pxyzu,dkdt) &
  !$omp firstprivate(itype) &
  !$omp private(i)
@@ -545,50 +547,71 @@ subroutine kick(dki,dt,npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,
           itype = iamtype(iphase(i))
           if (iamboundary(itype)) cycle
        endif
-       pxyzu(1,i) = pxyzu(1,i) + dkdt*fext(1,i)
-       pxyzu(2,i) = pxyzu(2,i) + dkdt*fext(2,i)
-       pxyzu(3,i) = pxyzu(3,i) + dkdt*fext(3,i)
+       pxyzu(1,i)  = pxyzu(1,i) + dkdt*fext(1,i)
+       pxyzu(2,i)  = pxyzu(2,i) + dkdt*fext(2,i)
+       pxyzu(3,i)  = pxyzu(3,i) + dkdt*fext(3,i)
+       if (imode==2) then
+          listcand(i) = 0
+          ebound(i)   = huge(dkdt)
+       endif
     endif
  enddo
  !$omp end parallel do
+
  if (is_accretion) then
     call get_timings(t1,tcpu1)
     accretedmass = 0.
     nfail        = 0
     naccreted    = 0
     nlive        = 0
-    ncand        = 0
     ibin_wakei   = 0
-    listcand(1:npart) = 0
-    if ((nptmass > 100)) then
-       !$omp parallel default(none) &
-       !$omp shared(iexternalforce) &
-       !$omp shared(nptmass,ifirstincell,sts_it_n)&
-       !$omp shared(ntypes,maxphase,maxp,aprmassoftype,massoftype)&
-       !$omp shared(apr_level,xyzmh_ptmass,pxyz_ptmass,timei)&
-       !$omp shared(fxyz_ptmass,nbinmax,ibin_wake,f_acc)&
-       !$omp shared(xyzh,pxyzu,fext,dkdt,iphase,dptmass)&
-       !$omp private(i,xpos,xi,yi,zi,hcheck,nneigh)&
-       !$omp private(was_accreted,nfaili)&
-       !$omp private(fxi,fyi,fzi,j)&
-       !$omp firstprivate(itype,pmassi,ibin_wakei) &
-       !$omp reduction(+:accretedmass) &
-       !$omp reduction(+:nfail) &
-       !$omp reduction(+:naccreted) &
-       !$omp reduction(+:nlive)&
-       !$omp reduction(+:dptmass)
+    !$omp parallel default(none) &
+    !$omp shared(iexternalforce,listcand,ebound,imode) &
+    !$omp shared(nptmass,npart,ifirstincell,sts_it_n)&
+    !$omp shared(ntypes,maxphase,maxp,aprmassoftype,massoftype)&
+    !$omp shared(apr_level,xyzmh_ptmass,pxyz_ptmass,timei)&
+    !$omp shared(fxyz_ptmass,nbinmax,ibin_wake,f_acc)&
+    !$omp shared(xyzh,pxyzu,fext,dkdt,iphase,ipart_omp_lock)&
+    !$omp private(i,xpos,xi,yi,zi,hi,hcheck,nneigh)&
+    !$omp private(was_accreted,nfaili)&
+    !$omp private(fxi,fyi,fzi,j)&
+    !$omp firstprivate(itype,pmassi,ibin_wakei) &
+    !$omp reduction(+:accretedmass) &
+    !$omp reduction(+:nfail) &
+    !$omp reduction(+:naccreted) &
+    !$omp reduction(+:nlive)&
+    !$omp reduction(+:dptmass)
+    if (imode==2) then
        !$omp do
        do j = 1, nptmass
           dptmass(:,j) = 0.
           xpos = xyzmh_ptmass(1:3,j)
           hcheck = xyzmh_ptmass(ihacc,j)
-          call getneigh_pos(xpos,0.,hcheck,3,listneigh,nneigh,xyzcache,maxcache,ifirstincell)
+          call getneigh_pos(xpos,0.,hcheck,3,listneigh,nneigh,xyzhcache,maxcache,ifirstincell)
           do k=1,nneigh
              i = listneigh(k)
-!$           call omp_set_lock(ipart_omp_lock(i))
-             icand = listcand(i)
-             call ptmass_compare_acc(i,icand)
-!$           call omp_unset_lock(ipart_omp_lock(i))
+             if (.not.isdead_or_accreted(xyzh(4,i))) then
+                if (ntypes > 1 .and. maxphase==maxp) then
+                   itype = iamtype(iphase(i))
+                endif
+                if (k<maxcache) then
+                   xi = xyzhcache(k,1)
+                   yi = xyzhcache(k,2)
+                   zi = xyzhcache(k,3)
+                   hi = xyzhcache(k,4)
+                else
+                   xi = xyzh(1,i)
+                   yi = xyzh(2,i)
+                   zi = xyzh(3,i)
+                   hi = xyzh(4,i)
+                endif
+!$              call omp_set_lock(ipart_omp_lock(i))
+                call ptmass_check_acc(i,listcand(i),itype,nptmass,ebound(i),ibin_wake(i),&
+                                      was_accreted,xi,yi,zi,hi,pxyzu(1,i),pxyzu(2,i),&
+                                      pxyzu(3,i),xyzmh_ptmass,pxyz_ptmass,f_acc,timei,nfaili)
+!$              call omp_unset_lock(ipart_omp_lock(i))
+             endif
+             if (nfaili > 1) nfail = nfail + 1
           enddo
        enddo
        !$omp enddo
@@ -612,7 +635,11 @@ subroutine kick(dki,dt,npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,
           if (iexternalforce > 0) then
              call accrete_particles(iexternalforce,xyzh(1,i),xyzh(2,i), &
                                     xyzh(3,i),xyzh(4,i),pmassi,timei,was_accreted)
-             if (was_accreted) accretedmass = accretedmass + pmassi
+             if (was_accreted) then
+                accretedmass = accretedmass + pmassi
+                naccreted = naccreted + 1
+                cycle accreteloop
+             endif
           endif
           !
           ! accretion onto sink particles
@@ -621,14 +648,18 @@ subroutine kick(dki,dt,npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,
           ! Note: requiring sts_it_n since this is supertimestep with the most active particles
           !
           if (nptmass > 0 .and. sts_it_n) then
-             j   = abs(listcand(i))
+             if (imode == 1) then
+                j = 1 ! in mode 1 we need to search between 1 to nptmass
+             elseif (imode == 2) then
+                j = listcand(i) ! in mode 2 we just need to add part contribution to sink j
+             endif
              if (j > 0) then
                 fxi = fext(1,i)
                 fyi = fext(2,i)
                 fzi = fext(3,i)
-                if (ind_timesteps) ibin_wakei = ibin_wake(i)
+                if (ind_timesteps .and. imode==1) ibin_wakei = ibin_wake(i)
 
-                call ptmass_accrete(1,nptmass,xyzh(1,i),xyzh(2,i),xyzh(3,i),xyzh(4,i),&
+                call ptmass_accrete(imode,j,nptmass,xyzh(1,i),xyzh(2,i),xyzh(3,i),xyzh(4,i),&
                                     pxyzu(1,i),pxyzu(2,i),pxyzu(3,i),fxi,fyi,fzi,&
                                     itype,pmassi,xyzmh_ptmass,pxyz_ptmass,was_accreted, &
                                     dptmass,timei,f_acc,nbinmax,ibin_wakei,nfaili)
@@ -636,10 +667,12 @@ subroutine kick(dki,dt,npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,
                    naccreted = naccreted + 1
                    cycle accreteloop
                 else
-                   if (ind_timesteps) ibin_wake(i) = ibin_wakei
+                   if (ind_timesteps .and. imode==1) ibin_wake(i) = ibin_wakei
                 endif
-                if (nfaili > 1) nfail = nfail + 1
+             else
              endif
+             if (nfaili > 1) nfail = nfail + 1
+
           endif
           nlive = nlive + 1
        endif
