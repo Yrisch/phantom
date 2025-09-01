@@ -521,7 +521,7 @@ subroutine kick(dki,dt,npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,
  pmassi = massoftype(igas)
  dkdt   = dki*dt
 
- if ((nptmass > 1)) imode = 2
+ if ((nptmass > 100)) imode = 2
 
  ! Kick sink particles
  if (nptmass > 0) then
@@ -566,7 +566,7 @@ subroutine kick(dki,dt,npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,
     naccreted    = 0
     nlive        = 0
     ibin_wakei   = 0
-    dptmass(:,1:nptmass) = 0.
+    dptmass(ndptmass,1:nptmass) = 0.
     !$omp parallel default(none) &
     !$omp shared(iexternalforce,listcand,ebound,imode) &
     !$omp shared(nptmass,npart,ifirstincell,sts_it_n)&
@@ -595,7 +595,7 @@ subroutine kick(dki,dt,npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,
                 if (ntypes > 1 .and. maxphase==maxp) then
                    itype = iamtype(iphase(i))
                 endif
-                if (k<maxcache) then
+                if (k<=maxcache) then
                    xi = xyzhcache(k,1)
                    yi = xyzhcache(k,2)
                    zi = xyzhcache(k,3)
@@ -607,9 +607,12 @@ subroutine kick(dki,dt,npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,
                    hi = xyzh(4,i)
                 endif
 !$              call omp_set_lock(ipart_omp_lock(i))
-                call ptmass_check_acc(j,listcand(i),itype,nptmass,ebound(i),ibin_wake(i),&
+                if (ind_timesteps) ibin_wakei = ibin_wake(i)
+
+                call ptmass_check_acc(j,listcand(i),itype,nptmass,ebound(i),ibin_wakei,&
                                       was_accreted,xi,yi,zi,hi,pxyzu(1,i),pxyzu(2,i),&
                                       pxyzu(3,i),xyzmh_ptmass,pxyz_ptmass,f_acc,timei,nfaili)
+                if (ind_timesteps) ibin_wake(i) = ibin_wakei
 !$              call omp_unset_lock(ipart_omp_lock(i))
              endif
              if (nfaili > 1) nfail = nfail + 1
@@ -617,6 +620,7 @@ subroutine kick(dki,dt,npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,
        enddo
        !$omp enddo
     endif
+    !$omp barrier
     !$omp do
     accreteloop: do i=1,npart
        if (.not.isdead_or_accreted(xyzh(4,i))) then
@@ -669,11 +673,9 @@ subroutine kick(dki,dt,npart,nptmass,ntypes,xyzh,pxyzu,xyzmh_ptmass,pxyz_ptmass,
                    cycle accreteloop
                 else
                    if (ind_timesteps .and. imode==1) ibin_wake(i) = ibin_wakei
+                   if (nfaili > 1 .and. imode==1) nfail = nfail + 1
                 endif
-             else
              endif
-             if (nfaili > 1) nfail = nfail + 1
-
           endif
           nlive = nlive + 1
        endif

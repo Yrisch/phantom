@@ -28,6 +28,7 @@ subroutine allocate_memory(ntot, part_only)
  use io,         only:iprint,warning,nprocs,id,master
  use dim,        only:update_max_sizes,maxp,mpi
  use allocutils, only:nbytes_allocated,bytes2human
+ use omputils,   only:init_omp_locks
  use part,       only:allocate_part
  use linklist,   only:allocate_linklist,ifirstincell
  use mpimemory,  only:allocate_mpi_memory
@@ -91,6 +92,8 @@ subroutine allocate_memory(ntot, part_only)
     call allocate_cell_comms_arrays ! some dummy arrays need to be allocated when mpi=.false.
 
  endif
+
+!$ call init_omp_locks
 
  call bytes2human(nbytes_allocated, sizestring)
  if (nprocs == 1) then

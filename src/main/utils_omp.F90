@@ -23,7 +23,7 @@ module omputils
 !$ integer(kind=8), allocatable :: ipart_omp_lock(:)
 
  integer :: omp_num_threads
- public  :: init_omp,info_omp
+ public  :: init_omp_threads,init_omp_locks,info_omp
 
 
 contains
@@ -52,27 +52,39 @@ end subroutine info_omp
 
 !----------------------------------------------------------------
 !+
-!  initialisation routine necessary if locks are used
+!  initialisation routine that set the number of omp threads
 !+
 !----------------------------------------------------------------
-subroutine init_omp
-!$ integer :: i
-!$ external :: omp_init_lock
+subroutine init_omp_threads
 !$ integer, external :: omp_get_num_threads
 
  omp_num_threads = 1
-!$ nlocks = maxp
-!$ allocate(ipart_omp_lock(nlocks))
-
-!$ do i = 0, nlocks
-!$  call omp_init_lock(ipart_omp_lock(i))
-!$ enddo
 
 !$omp parallel
 !$ omp_num_threads = omp_get_num_threads()
 !$omp end parallel
 
-end subroutine init_omp
+end subroutine init_omp_threads
+
+!----------------------------------------------------------------
+!+
+!  initialisation routine necessary if locks are used
+!+
+!----------------------------------------------------------------
+subroutine init_omp_locks
+!$ integer :: i
+!$ external :: omp_init_lock
+!$ integer, external :: omp_get_num_threads
+
+!$ nlocks = maxp
+!$ if (allocated(ipart_omp_lock)) deallocate(ipart_omp_lock)
+!$ allocate(ipart_omp_lock(nlocks))
+
+!$ do i = 1, nlocks
+!$  call omp_init_lock(ipart_omp_lock(i))
+!$ enddo
+
+end subroutine init_omp_locks
 
 !----------------------------------------------------------------
 !+

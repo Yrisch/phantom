@@ -46,7 +46,7 @@ subroutine initialise()
 #ifdef FINVSQRT
  use fastmath,         only:testsqrt
 #endif
- use omputils,         only:init_omp,info_omp
+ use omputils,         only:init_omp_threads,info_omp
  use options,          only:set_default_options
  use io_summary,       only:summary_initialise
  use boundary,         only:set_boundary
@@ -96,7 +96,7 @@ subroutine initialise()
 !
  if (id==master) call print_cpuinfo()
  if (id==master) call info_omp
- call init_omp
+ call init_omp_threads
 !
 !--initialise MPI domains
 !
