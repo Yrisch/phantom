@@ -22,18 +22,18 @@ module neighkdtree
 !   kdtree, kernel, mpiutils, part
 !
  use dim,          only:ncellsmax,ncellsmaxglobal
- use dtypekdtree,  only:kdnode
+ use dtypekdtree,  only:kdnode,Tkdtree
  implicit none
 
- integer,               allocatable :: cellatid(:)
- integer,               allocatable :: nodemap(:)
- type(kdnode),          allocatable :: nodeglobal(:)
- type(kdnode), public,  allocatable :: node(:)
- integer,      public,  allocatable :: leaf_is_active(:) ! : 0 internal node or empty cell, : 1 active cell, :- inactive cell
- integer,      public , allocatable :: listneigh(:)
- integer,      public , allocatable :: listneigh_global(:)
+ integer,               allocatable  :: cellatid(:)
+ integer,               allocatable  :: nodemap(:)
+ type(kdnode),          allocatable  :: nodeglobal(:)
+ type(kdnode) , public,  allocatable :: node(:)
+ type(Tkdtree), public               :: maintree
+ integer,       public,  allocatable :: leaf_is_active(:) ! : 0 internal node or empty cell, : 1 active cell, :- inactive cell
+ integer,       public , allocatable :: listneigh(:)
+ integer,       public , allocatable :: listneigh_global(:)
 !$omp threadprivate(listneigh)
- integer(kind=8), public            :: ncells
  real, public                       :: dxcell
  real, public                       :: dcellx = 0.,dcelly = 0.,dcellz = 0.
  integer                            :: globallevel,refinelevels
@@ -51,15 +51,18 @@ contains
 
 subroutine allocate_neigh
  use allocutils, only:allocate_array
- use kdtree,     only:allocate_kdtree
- use dim,        only:maxp
+ use kdtree,     only:allocate_kdtree,refinementnode
+ use dim,        only:maxp,mpi
 
- call allocate_array('cellatid',   cellatid,  ncellsmaxglobal+1 )
- call allocate_array('leaf_is_active',  leaf_is_active, ncellsmax+1       )
- call allocate_array('nodeglobal', nodeglobal,ncellsmaxglobal+1 )
- call allocate_array('node',       node,      ncellsmax+1       )
- call allocate_array('nodemap',    nodemap,   ncellsmax+1       )
- call allocate_kdtree()
+ if (mpi) then
+    call allocate_array('cellatid',        cellatid,       ncellsmaxglobal+1 )
+    call allocate_array('nodeglobal',      nodeglobal,     ncellsmaxglobal+1 )
+    call allocate_array('nodemap',         nodemap,        ncellsmax+1       )
+    call allocate_array('refinementnode',  refinementnode, ncellsmax+1       )
+ endif
+
+ call allocate_kdtree(maintree)
+
 !$omp parallel
  call allocate_array('listneigh',listneigh,maxp)
 !$omp end parallel
@@ -68,32 +71,34 @@ subroutine allocate_neigh
 end subroutine allocate_neigh
 
 subroutine deallocate_neigh
- use kdtree,   only:deallocate_kdtree
+ use kdtree,   only:deallocate_kdtree,refinementnode
 
  if (allocated(cellatid)) deallocate(cellatid)
- if (allocated(leaf_is_active)) deallocate(leaf_is_active)
  if (allocated(nodeglobal)) deallocate(nodeglobal)
- if (allocated(node)) deallocate(node)
  if (allocated(nodemap)) deallocate(nodemap)
+ if (allocated(refinementnode)) deallocate(refinementnode)
+
+ call deallocate_kdtree(maintree)
+
 !$omp parallel
  if (allocated(listneigh)) deallocate(listneigh)
 !$omp end parallel
  if (allocated(listneigh_global)) deallocate(listneigh_global)
- call deallocate_kdtree()
 
 end subroutine deallocate_neigh
 
-subroutine get_hmaxcell(inode,hmaxcell)
- integer, intent(in)  :: inode
- real,    intent(out) :: hmaxcell
+subroutine get_hmaxcell(node,hmaxcell)
+ type(kdnode), intent(inout) :: node
+ real,         intent(out)   :: hmaxcell
 
- hmaxcell = node(inode)%hmax
+ hmaxcell = node%hmax
 
 end subroutine get_hmaxcell
 
-subroutine set_hmaxcell(inode,hmaxcell)
- integer, intent(in) :: inode
- real,    intent(in) :: hmaxcell
+subroutine set_hmaxcell(inode,node,hmaxcell)
+ integer,      intent(in)    :: inode
+ type(kdnode), intent(inout) :: node(:)
+ real,         intent(in)    :: hmaxcell
  integer :: n
 
  n = inode
@@ -109,49 +114,26 @@ subroutine set_hmaxcell(inode,hmaxcell)
 
 end subroutine set_hmaxcell
 
-subroutine update_hmax_remote(ncells)
- use mpiutils, only:reduceall_mpi
- integer(kind=8), intent(in) :: ncells
- integer :: n,j
- real :: hmaxcell
 
- ! could do only active cells by checking leaf_is_active >= 0
- do n=1,int(ncells)
-    if (leaf_is_active(n) > 0) then
-       ! reduce on leaf nodes
-       node(n)%hmax = reduceall_mpi('max',node(n)%hmax)
-
-       ! propagate up local tree from active cells
-       hmaxcell = node(n)%hmax
-       j = n
-       do while (node(j)%parent  /=  0)
-          j = node(j)%parent
-          node(j)%hmax = max(node(j)%hmax, hmaxcell)
-       enddo
-    endif
- enddo
-
-end subroutine update_hmax_remote
-
-subroutine get_distance_from_centre_of_mass(inode,xi,yi,zi,dx,dy,dz,xcen)
- integer,   intent(in)           :: inode
- real,      intent(in)           :: xi,yi,zi
- real,      intent(out)          :: dx,dy,dz
- real,      intent(in), optional :: xcen(3)
+subroutine get_distance_from_centre_of_mass(node,xi,yi,zi,dx,dy,dz,xcen)
+ type(kdnode), intent(in)           :: node
+ real,         intent(in)           :: xi,yi,zi
+ real,         intent(out)          :: dx,dy,dz
+ real,         intent(in), optional :: xcen(3)
 
  if (present(xcen)) then
     dx = xi - xcen(1)
     dy = yi - xcen(2)
     dz = zi - xcen(3)
  else
-    dx = xi - node(inode)%xcen(1)
-    dy = yi - node(inode)%xcen(2)
-    dz = zi - node(inode)%xcen(3)
+    dx = xi - node%xcen(1)
+    dy = yi - node%xcen(2)
+    dz = zi - node%xcen(3)
  endif
 
 end subroutine get_distance_from_centre_of_mass
 
-subroutine build_tree(npart,xyzh,iphase,xyzh_soa,iphase_soa,for_apr)
+subroutine build_tree(npart,xyzh,iphase,for_apr)
  use io,           only:nprocs
  use dtypekdtree,  only:ndimtree
  use kdtree,       only:maketree,maketreeglobal
@@ -159,8 +141,8 @@ subroutine build_tree(npart,xyzh,iphase,xyzh_soa,iphase_soa,for_apr)
  use part,         only:nptmass,xyzmh_ptmass,maxp
  use allocutils,   only:allocate_array
  integer,           intent(inout) :: npart
- real,              intent(inout) :: xyzh(:,:),xyzh_soa(:,:)
- integer(kind=1),   intent(inout) :: iphase(:),iphase_soa(:)
+ real,              intent(inout) :: xyzh(:,:)
+ integer(kind=1),   intent(inout) :: iphase(:)
  logical, optional, intent(in)    :: for_apr
  logical :: apr_tree
 
@@ -188,12 +170,9 @@ subroutine build_tree(npart,xyzh,iphase,xyzh_soa,iphase_soa,for_apr)
     endif
  else
     if (use_sinktree) then
-       call maketree(node,xyzh,iphase,xyzh_soa,iphase_soa,npart,ndimtree,&
-                     leaf_is_active,ncells,apr_tree,nptmass=nptmass,&
-                     xyzmh_ptmass=xyzmh_ptmass)
+       call maketree(maintree,xyzh,iphase,npart,ndimtree,apr_tree,nptmass=nptmass,xyzmh_ptmass=xyzmh_ptmass)
     else
-       call maketree(node,xyzh,iphase,xyzh_soa,iphase_soa,npart,ndimtree,&
-                     leaf_is_active,ncells,apr_tree)
+       call maketree(maintree,xyzh,iphase,npart,ndimtree,apr_tree)
     endif
  endif
 
@@ -349,16 +328,16 @@ subroutine read_inopts_tree(name,valstring,imatch,igotall,ierr)
 
 end subroutine read_inopts_tree
 
-subroutine get_cell_location(inode,xpos,xsizei,rcuti)
+subroutine get_cell_location(node,xpos,xsizei,rcuti)
  use kernel, only:radkern
- integer,            intent(in)     :: inode
+ type(kdnode),       intent(in)     :: node
  real,               intent(out)    :: xpos(3)
  real,               intent(out)    :: xsizei
  real,               intent(out)    :: rcuti
 
- xpos    = node(inode)%xcen(1:3)
- xsizei  = node(inode)%size
- rcuti   = radkern*node(inode)%hmax
+ xpos    = node%xcen(1:3)
+ xsizei  = node%size
+ rcuti   = radkern*node%hmax
 
 end subroutine get_cell_location
 

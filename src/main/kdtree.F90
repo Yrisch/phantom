@@ -28,14 +28,12 @@ module kdtree
 
  implicit none
 
- integer, public,  allocatable :: inoderange(:,:)
- integer, public,  allocatable :: inodeparts(:)
- type(kdnode),     allocatable :: refinementnode(:)
+ type(kdnode), public, allocatable :: refinementnode(:)
 
 !
 !--tree parameters
 !
- integer, public :: irootnode
+ integer, parameter :: irootnode = 1
  character(len=1), parameter, public :: labelax(3) = (/'x','y','z'/)
  integer, parameter :: maxlevelcrazy = 31
 !
@@ -69,25 +67,48 @@ module kdtree
     real    :: xmax(ndimtree)
  end type kdbuildstack
 
+ type Tkdtree
+    integer                      :: ncellsmax
+    integer                      :: maxp
+    integer(kind=8)              :: ncells
+    real,            allocatable :: inoderange(:,:)
+    real,            allocatable :: inodeparts(:)
+    type(kdnode),    allocatable :: node(:)
+    real,            allocatable :: xyzh_buffer(:,:)
+    integer(kind=1), allocatable :: iphase_buffer(:)
+    integer,         allocatable :: leaf_is_active(:)
+contains
+procedure :: allocate_kdtree,deallocate_kdtree
+procedure :: maketree
+
+ end type Tkdtree
+
  private
 
 contains
 
-subroutine allocate_kdtree
- use dim, only:mpi
+subroutine allocate_kdtree(tree)
  use allocutils, only:allocate_array
+ class(Tkdtree), intent(inout) :: tree
+ call allocate_array('leaf_is_active', tree%leaf_is_active, tree%ncellsmax+1)
+ call allocate_array('node',           tree%node,           tree%ncellsmax+1)
+ call allocate_array('inodeparts',     tree%inodeparts,            tree%maxp)
+ call allocate_array('xyzh_buffer',    tree%xyzh_buffer, 4,        tree%maxp)
+ call allocate_array('iphase_buffer',  tree%iphase_buffer,         tree%maxp)
+ call allocate_array('inoderange',     tree%inoderange,  2, tree%ncellsmax+1)
 
- call allocate_array('inoderange', inoderange, 2, ncellsmax+1)
- call allocate_array('inodeparts', inodeparts, maxp)
- if (mpi) call allocate_array('refinementnode', refinementnode, ncellsmax+1)
+
 
 end subroutine allocate_kdtree
 
-subroutine deallocate_kdtree
- use dim, only:mpi
- if (allocated(inoderange)) deallocate(inoderange)
- if (allocated(inodeparts)) deallocate(inodeparts)
- if (mpi .and. allocated(refinementnode)) deallocate(refinementnode)
+subroutine deallocate_kdtree(tree)
+ class(Tkdtree), intent(inout) :: tree
+ if (allocated(tree%node))           deallocate(tree%node)
+ if (allocated(tree%inodeparts))     deallocate(tree%inodeparts)
+ if (allocated(tree%inoderange))     deallocate(tree%inoderange)
+ if (allocated(tree%xyzh_buffer))    deallocate(tree%xyzh_buffer)
+ if (allocated(tree%iphase_buffer))  deallocate(tree%iphase_buffer)
+ if (allocated(tree%leaf_is_active)) deallocate(tree%leaf_is_active)
 
 end subroutine deallocate_kdtree
 
@@ -111,7 +132,6 @@ end subroutine deallocate_kdtree
 subroutine maketree(node, xyzh, iphase, xyzh_soa, iphase_soa, np, ndim, leaf_is_active, ncells, &
                     apr_tree, refinelevels, nptmass, xyzmh_ptmass)
  use io,   only:fatal,warning,iprint,iverbose
-!$ use omp_lib
  type(kdnode),      intent(out)   :: node(:) !ncellsmax+1)
  integer,           intent(in)    :: np,ndim
  real,              intent(inout) :: xyzh(:,:),xyzh_soa(:,:)  ! inout because of boundary crossing
@@ -139,7 +159,6 @@ subroutine maketree(node, xyzh, iphase, xyzh_soa, iphase_soa, np, ndim, leaf_is_
     sinktree = .true.
  endif
 
- irootnode = 1
  leaf_is_active = 0
 
  ir = 0
@@ -1827,7 +1846,6 @@ subroutine maketreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,
 
  sinktree = .false.
  if (present(nptmass).and.present(xyzmh_ptmass)) sinktree=.true.
- irootnode = 1
  parent = 0
  iself = irootnode
  leaf_is_active = 0
