@@ -17,8 +17,6 @@ module dtypekdtree
 ! :Dependencies: io, mpi, mpiutils
 !
  implicit none
-
-
  integer, parameter :: ndimtree = 3
 
  integer, parameter :: kdnode_bytes = &
@@ -41,17 +39,16 @@ module dtypekdtree
  public :: get_mpitype_of_kdnode
  type kdnode
     sequence
-    real    :: xcen(ndimtree)
-    real    :: size
-    real    :: hmax
-    real    :: dum   ! avoid ifort warning: align on 4-byte boundary
+    real :: xcen(ndimtree)
+    real :: size
+    real :: hmax
+    real :: mass   ! avoid ifort warning: align on 4-byte boundary
     integer :: leftchild
     integer :: rightchild
     integer :: parent
     integer :: idum ! avoid ifort warning: align on 4-byte boundary
 #ifdef GRAVITY
-    real    :: mass
-    real    :: quads(6)
+    real :: quads(6)
 #endif
  end type kdnode
 

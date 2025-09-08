@@ -381,14 +381,12 @@ end subroutine empty_tree
 !---------------------------------
 subroutine construct_root_node(np,nproot,irootnode,ndim,xmini,xmaxi,leaf_is_active,xyzh,iphase,&
                                inodeparts,inoderange,xyzh_soa,iphase_soa,xyzmh_ptmass,nptmass)
-#ifdef PERIODIC
  use boundary, only:cross_boundary
  use mpidomain,only:isperiodic
-#endif
- use part, only:iactive
+ use part, only:iphase,iactive
  use part, only:isdead_or_accreted,ibelong
  use io,   only:fatal,id
- use dim,  only:ind_timesteps,mpi
+ use dim,  only:ind_timesteps,mpi,periodic
  use part, only:isink
  integer,          intent(in)    :: np,irootnode,ndim
  integer,          intent(out)   :: nproot
@@ -415,19 +413,15 @@ subroutine construct_root_node(np,nproot,irootnode,ndim,xmini,xmaxi,leaf_is_acti
  !$omp shared(np,xyzh,nptmass,xyzmh_ptmass) &
  !$omp shared(inodeparts,iphase,xyzh_soa,iphase_soa,nproot,apr_level_soa) &
  !$omp shared(id) &
-#ifdef PERIODIC
  !$omp shared(isperiodic) &
- !$omp reduction(+:ncross) &
-#endif
  !$omp private(i,xi,yi,zi) &
  !$omp reduction(min:xminpart,yminpart,zminpart) &
- !$omp reduction(max:xmaxpart,ymaxpart,zmaxpart)
+ !$omp reduction(max:xmaxpart,ymaxpart,zmaxpart) &
+ !$omp reduction(+:ncross)
  !$omp do schedule(guided,1)
  do i=1,np
     if (.not.isdead_or_accreted(xyzh(4,i))) then
-#ifdef PERIODIC
-       call cross_boundary(isperiodic,xyzh(:,i),ncross)
-#endif
+       if (periodic) call cross_boundary(isperiodic,xyzh(:,i),ncross)
        xi = xyzh(1,i)
        yi = xyzh(2,i)
        zi = xyzh(3,i)
@@ -449,9 +443,7 @@ subroutine construct_root_node(np,nproot,irootnode,ndim,xmini,xmaxi,leaf_is_acti
        !$omp do schedule(guided,1)
        do i=1,nptmass
           if (xyzmh_ptmass(4,i)>0.) then
-#ifdef PERIODIC
-             call cross_boundary(isperiodic,xyzmh_ptmass(1:3,i),ncross)
-#endif
+             if (periodic) call cross_boundary(isperiodic,xyzmh_ptmass(1:3,i),ncross)
              xi = xyzmh_ptmass(1,i)
              yi = xyzmh_ptmass(2,i)
              zi = xyzmh_ptmass(3,i)
@@ -575,7 +567,7 @@ subroutine construct_node(nodeentry,inodeparts,inoderange,nnode, mymum, level, x
                           npnode, doparallel,il, ir, nl, nr, xminl, xmaxl, xminr, xmaxr,ncells, &
                           leaf_is_active,minlevel, maxlevel, ndim, xyzh_soa, iphase_soa,wassplit, &
                           global_build,apr_tree,xyzmh_ptmass)
- use dim,       only:maxtypes,mpi
+ use dim,       only:maxtypes,mpi,ind_timesteps
  use part,      only:massoftype,igas,iamtype,maxphase,maxp,npartoftype,isink,ihsoft
  use io,        only:fatal,error
  use mpitree,   only:get_group_cofm,reduce_group
@@ -850,19 +842,19 @@ subroutine construct_node(nodeentry,inodeparts,inoderange,nnode, mymum, level, x
     maxlevel = max(level,maxlevel)
     minlevel = min(level,minlevel)
     ! individual timesteps where we mark leaf node as active/inactive
-#ifdef IND_TIMESTEPS
-    !
-    !--mark leaf node as active (contains some active particles)
-    !  or inactive by setting the firstincell to +ve (active) or -ve (inactive)
-    !
-    if (nodeisactive) then
-       leaf_is_active(nnode) = 1
+    if (ind_timesteps) then
+       !
+       !--mark leaf node as active (contains some active particles)
+       !  or inactive by setting the firstincell to +ve (active) or -ve (inactive)
+       !
+       if (nodeisactive) then
+          leaf_is_active(nnode) = 1
+       else
+          leaf_is_active(nnode) = -1
+       endif
     else
-       leaf_is_active(nnode) = -1
+       leaf_is_active(nnode) = 1
     endif
-#else
-    leaf_is_active(nnode) = 1
-#endif
  else ! split this node and add children to stack
     iaxis  = maxloc(xmaxi - xmini,1) ! split along longest axis
     xpivot = xyzcofm(iaxis)          ! split on centre of mass
@@ -1834,9 +1826,10 @@ subroutine maketreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,
  use io,           only:fatal,warning,id,nprocs,master
  use mpiutils,     only:reduceall_mpi
  use mpibalance,   only:balancedomains
- use mpitree,    only:tree_sync,tree_bcast
+ use mpitree,      only:tree_sync,tree_bcast
  use part,         only:isdead_or_accreted,iactive,ibelong,isink
  use timing,       only:increment_timer,get_timings,itimer_balance
+ use dim,          only:ind_timesteps
 
  type(kdnode),     intent(out)     :: nodeglobal(:)    ! ncellsmax+1
  type(kdnode),     intent(out)     :: node(:)          ! ncellsmax+1
@@ -1960,27 +1953,28 @@ subroutine maketreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,
     npnode = 0
     do i=1,np
        npnode = npnode + 1
-#ifdef IND_TIMESTEPS
-       if (iactive(iphase(i))) then
-          inodeparts(npnode) = i
+       !
+       ! tag inactive particles with negative index
+       ! in the particle list for the node
+       !
+       if (ind_timesteps) then
+          if (iactive(iphase(i))) then
+             inodeparts(npnode) = i
+          else
+             inodeparts(npnode) = -i
+          endif
        else
-          inodeparts(npnode) = -i
+          inodeparts(npnode) = i
        endif
-       !if (use_apr) inodeparts(npnode) = abs(inodeparts(npnode)) ! Don't think this is necessary anymore
-#else
-       inodeparts(npnode) = i
-#endif
        xyzh_soa(npnode,:) = xyzh(:,i)
        iphase_soa(npnode) = iphase(i)
-       if (use_apr) then
-          apr_level_soa(npnode) = apr_level(i)
-       endif
+       if (use_apr) apr_level_soa(npnode) = apr_level(i)
     enddo
     if (sinktree) then
        if (nptmass > 0) then
           do i=1,nptmass
              if (ibelong(maxpsph + i) /= id) cycle
-             if (xyzmh_ptmass(4,i)<0.) cycle
+             if (xyzmh_ptmass(4,i) < 0.) cycle ! dead sink particle
              npnode = npnode + 1
              inodeparts(npnode) = maxpsph + i
              xyzh_soa(npnode,:) = xyzmh_ptmass(1:4,i)
