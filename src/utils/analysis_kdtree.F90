@@ -68,22 +68,13 @@ subroutine viz_kdtree(xyzh,np,tree,numnodes)
  print*,'> Plotting particles '
  call giza_points(np,xyzh(1,1:np),xyzh(2,1:np),1)
 
-#ifdef TREEVIZ
- !--plot lines bounding nodes
- print*,'> Plotting kd tree '
- call giza_set_line_width(1.5)
- call giza_set_colour_index(2)
- call plot_nodes(irootnode,0,ndimtree,tree)
-#else
  !--visualise the neighbour finding
  print*,'> Checking neighbour find'
  call check_neighbours(xyzh,tree)
-#endif
  call giza_close()
 
 end subroutine viz_kdtree
 
-#ifdef TREEVIZ
 recursive subroutine plot_nodes(inode,level,ndim,tree)
  use kdtree,      only:labelax
  use giza
@@ -157,7 +148,6 @@ recursive subroutine plot_nodes(inode,level,ndim,tree)
  call plot_nodes(tree(inode)%rightchild,level+1,ndim,tree)
 
 end subroutine plot_nodes
-#endif
 
 subroutine check_neighbours(xyzh,tree)
  use dim,         only:maxp

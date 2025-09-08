@@ -748,11 +748,7 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
     zi = xyzh_soa(i,3)
     dx    = xi - x0(1)
     dy    = yi - x0(2)
-#ifdef TREEVIZ
-    dz    = 0.
-#else
     dz    = zi - x0(3)
-#endif
     dr2   = dx*dx + dy*dy + dz*dz
     r2max = max(r2max,dr2)
 #ifdef GRAVITY
@@ -808,10 +804,6 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
 #ifdef GRAVITY
  nodeentry%mass    = totmass_node
  nodeentry%quads   = quads
-#endif
-#ifdef TREEVIZ
- nodeentry%xmin(:) = xmini(:)
- nodeentry%xmax(:) = xmaxi(:)
 #endif
 
  wassplit = (npnodetot > minpart)
@@ -1267,9 +1259,7 @@ subroutine getneigh(node,xpos,xsizei,rcuti,ndim,listneigh,nneigh,xyzcache,ixyzca
     istack = istack - 1
     dx = xpos(1) - node(n)%xcen(1)      ! distance between node centres
     dy = xpos(2) - node(n)%xcen(2)
-#ifndef TREEVIZ
     dz = xpos(3) - node(n)%xcen(3)
-#endif
     xsizej       = node(n)%size
 #ifdef GRAVITY
     totmass_node = node(n)%mass
