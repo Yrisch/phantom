@@ -79,7 +79,8 @@ module kdtree
     integer,         allocatable :: leaf_is_active(:)
 contains
 procedure :: allocate_kdtree,deallocate_kdtree
-procedure :: maketree
+procedure :: maketree,empty_tree
+procedure :: getneigh
 
  end type Tkdtree
 
@@ -129,35 +130,49 @@ end subroutine deallocate_kdtree
 !  -implement revtree routine to update tree w/out rebuilding (done - Sep 2015)
 !+
 !-------------------------------------------------------------------------------
-subroutine maketree(node, xyzh, iphase, xyzh_soa, iphase_soa, np, ndim, leaf_is_active, ncells, &
-                    apr_tree, refinelevels, nptmass, xyzmh_ptmass)
+subroutine maketree(tree, xyzh, iphase, np, ndim, apr_tree, refinelevels, nptmass, xyzmh_ptmass)
  use io,   only:fatal,warning,iprint,iverbose
- type(kdnode),      intent(out)   :: node(:) !ncellsmax+1)
+ class(Tkdtree),      intent(out) :: tree
  integer,           intent(in)    :: np,ndim
- real,              intent(inout) :: xyzh(:,:),xyzh_soa(:,:)  ! inout because of boundary crossing
- integer(kind=1),   intent(inout) :: iphase(:),iphase_soa(:)
- integer,           intent(out)   :: leaf_is_active(:) !ncellsmax+1)
- integer(kind=8),   intent(out)   :: ncells
+ real,              intent(inout) :: xyzh(:,:) ! inout because of boundary crossing
+ integer(kind=1),   intent(inout) :: iphase(:)
  logical,           intent(in)    :: apr_tree
  integer, optional, intent(out)   :: refinelevels
  integer, optional, intent(in)    :: nptmass
  real,    optional, intent(inout) :: xyzmh_ptmass(:,:)
 
- integer :: i,npnode,il,ir,istack,nl,nr,mymum
- integer :: nnode,minlevel,level,nqueue
- real :: xmini(ndimtree),xmaxi(ndimtree),xminl(ndimtree),xmaxl(ndimtree),xminr(ndimtree),xmaxr(ndimtree)
- integer, parameter :: istacksize = 512
+ integer, parameter       :: istacksize = 512
  type(kdbuildstack), save :: stack(istacksize)
  !$omp threadprivate(stack)
- type(kdbuildstack) :: queue(istacksize)
-!$ integer :: threadid
- integer :: npcounter
- logical :: wassplit,finished,sinktree
+ type(kdbuildstack)       :: queue(istacksize)
+
+
+ real,           pointer  :: xyzh_soa(:,:)
+ integer,        pointer  :: leaf_is_active(:),inodeparts(:),inoderange(:,:)
+ integer(kind=1),pointer  :: iphase_soa(:)
+ integer(kind=8),pointer  :: ncells
+ type(kdnode),   pointer  :: node(:)
+
  character(len=10) :: string
+ integer           :: i,npnode,il,ir,istack,nl,nr,mymum
+ integer           :: nnode,minlevel,level,nqueue
+ real              :: xmini(ndimtree),xmaxi(ndimtree),xminl(ndimtree),xmaxl(ndimtree),xminr(ndimtree),xmaxr(ndimtree)
+ integer           :: npcounter
+ logical           :: wassplit,finished,sinktree
 
  if (present(nptmass) .and. present(xyzmh_ptmass)) then
     sinktree = .true.
  endif
+!
+!-- unpack the tree on pointer to use pre-built routines
+!
+ xyzh_soa       = tree%xyzh_buffer
+ iphase_soa     = tree%iphase_buffer
+ leaf_is_active = tree%leaf_is_active
+ ncells         = tree%ncells
+ inodeparts     = tree%inodeparts
+ inoderange     = tree%inoderange
+ node           = tree%node
 
  leaf_is_active = 0
 
@@ -171,10 +186,10 @@ subroutine maketree(node, xyzh, iphase, xyzh_soa, iphase_soa, np, ndim, leaf_is_
  ! construct root node, i.e. find bounds of all particles
  if (sinktree) then
     call construct_root_node(np,npcounter,irootnode,ndim,xmini,xmaxi,leaf_is_active,xyzh,&
-                             iphase,xyzh_soa,iphase_soa,xyzmh_ptmass,nptmass)
+                             iphase,inodeparts,inoderange,xyzh_soa,iphase_soa,xyzmh_ptmass,nptmass)
  else
     call construct_root_node(np,npcounter,irootnode,ndim,xmini,xmaxi,leaf_is_active,xyzh,&
-                             iphase,xyzh_soa,iphase_soa)
+                             iphase,inodeparts,inoderange,xyzh_soa,iphase_soa)
  endif
 
  if (inoderange(1,irootnode)==0 .or. inoderange(2,irootnode)==0 ) then
@@ -230,12 +245,12 @@ subroutine maketree(node, xyzh, iphase, xyzh_soa, iphase_soa, np, ndim, leaf_is_
 
     ! construct node
     if (sinktree) then
-       call construct_node(node(nnode), nnode, mymum, level, xmini, xmaxi, npnode, .true., &  ! construct in parallel
+       call construct_node(node(nnode), inodeparts, inoderange, nnode, mymum, level, xmini, xmaxi, npnode, .true., &  ! construct in parallel
                            il, ir, nl, nr, xminl, xmaxl, xminr, xmaxr, ncells, leaf_is_active, &
                            minlevel, maxlevel, ndim, xyzh_soa, iphase_soa, wassplit, .false., &
                            apr_tree,xyzmh_ptmass)
     else
-       call construct_node(node(nnode), nnode, mymum, level, xmini, xmaxi, npnode, .true., &  ! construct in parallel
+       call construct_node(node(nnode), inodeparts, inoderange, nnode, mymum, level, xmini, xmaxi, npnode, .true., &  ! construct in parallel
                            il, ir, nl, nr, xminl, xmaxl, xminr, xmaxr, ncells, leaf_is_active, &
                            minlevel, maxlevel, ndim, xyzh_soa, iphase_soa, wassplit, .false.,apr_tree)
     endif
@@ -270,7 +285,6 @@ subroutine maketree(node, xyzh, iphase, xyzh_soa, iphase_soa, np, ndim, leaf_is_
     !$omp private(nnode, mymum, level, npnode, xmini, xmaxi) &
     !$omp private(ir, il, nl, nr) &
     !$omp private(xminr, xmaxr, xminl, xmaxl) &
-    !$omp private(threadid) &
     !$omp private(wassplit) &
     !$omp reduction(min:minlevel) &
     !$omp reduction(max:maxlevel)
@@ -287,12 +301,12 @@ subroutine maketree(node, xyzh, iphase, xyzh_soa, iphase_soa, np, ndim, leaf_is_
 
           ! construct node
           if (sinktree) then
-             call construct_node(node(nnode), nnode, mymum, level, xmini, xmaxi, npnode, .false., &  ! don't construct in parallel
+             call construct_node(node(nnode), inodeparts, inoderange, nnode, mymum, level, xmini, xmaxi, npnode, .false., &  ! don't construct in parallel
                                  il, ir, nl, nr, xminl, xmaxl, xminr, xmaxr, ncells, leaf_is_active, &
                                  minlevel, maxlevel, ndim, xyzh_soa, iphase_soa, wassplit, .false.,&
                                  apr_tree,xyzmh_ptmass)
           else
-             call construct_node(node(nnode), nnode, mymum, level, xmini, xmaxi, npnode, .false., &  ! don't construct in parallel
+             call construct_node(node(nnode), inodeparts, inoderange, nnode, mymum, level, xmini, xmaxi, npnode, .false., &  ! don't construct in parallel
                                  il, ir, nl, nr, xminl, xmaxl, xminr, xmaxr, ncells, leaf_is_active, &
                                  minlevel, maxlevel, ndim, xyzh_soa, iphase_soa, wassplit, .false.,apr_tree)
           endif
@@ -338,10 +352,11 @@ end subroutine maketree
 ! routine to empty the tree
 !+
 !----------------------------
-subroutine empty_tree(node)
- type(kdnode), intent(out) :: node(:)
+subroutine empty_tree(tree)
+ class(Tkdtree), intent(out) :: tree
+ type(kdnode), pointer       :: node(:)
  integer :: i
-
+ node = tree%node
 !$omp parallel do private(i)
  do i=1,size(node)
     node(i)%xcen = 0.
@@ -365,7 +380,7 @@ end subroutine empty_tree
 !+
 !---------------------------------
 subroutine construct_root_node(np,nproot,irootnode,ndim,xmini,xmaxi,leaf_is_active,xyzh,iphase,&
-                               xyzh_soa,iphase_soa,xyzmh_ptmass,nptmass)
+                               inodeparts,inoderange,xyzh_soa,iphase_soa,xyzmh_ptmass,nptmass)
 #ifdef PERIODIC
  use boundary, only:cross_boundary
  use mpidomain,only:isperiodic
@@ -378,7 +393,7 @@ subroutine construct_root_node(np,nproot,irootnode,ndim,xmini,xmaxi,leaf_is_acti
  integer,          intent(in)    :: np,irootnode,ndim
  integer,          intent(out)   :: nproot
  real,             intent(out)   :: xmini(ndim), xmaxi(ndim)
- integer,          intent(inout) :: leaf_is_active(:)
+ integer,          intent(inout) :: leaf_is_active(:),inodeparts(:),inoderange(:,:)
  integer(kind=1),  intent(inout) :: iphase(:),iphase_soa(:)
  real,             intent(inout) :: xyzh(:,:),xyzh_soa(:,:)
  real,   optional, intent(inout) :: xyzmh_ptmass(:,:)
@@ -556,15 +571,16 @@ end subroutine pop_off_stack
 !  returns the left and right child information if split
 !+
 !--------------------------------------------------------------------
-subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, doparallel,&
-                          il, ir, nl, nr, xminl, xmaxl, xminr, xmaxr,ncells, leaf_is_active, &
-                          minlevel, maxlevel, ndim, xyzh_soa, iphase_soa, wassplit, &
+subroutine construct_node(nodeentry,inodeparts,inoderange,nnode, mymum, level, xmini, xmaxi,&
+                          npnode, doparallel,il, ir, nl, nr, xminl, xmaxl, xminr, xmaxr,ncells, &
+                          leaf_is_active,minlevel, maxlevel, ndim, xyzh_soa, iphase_soa,wassplit, &
                           global_build,apr_tree,xyzmh_ptmass)
  use dim,       only:maxtypes,mpi
  use part,      only:massoftype,igas,iamtype,maxphase,maxp,npartoftype,isink,ihsoft
  use io,        only:fatal,error
  use mpitree,   only:get_group_cofm,reduce_group
  type(kdnode),      intent(out)   :: nodeentry
+ integer,           intent(inout) :: inodeparts(:),inoderange(:,:)
  integer,           intent(in)    :: nnode, mymum, level
  integer,           intent(in)    :: ndim
  real,              intent(inout) :: xmini(ndim), xmaxi(ndim)
@@ -1210,7 +1226,7 @@ end subroutine special_sort_particles_in_cell
 !  (all particles within a given h_i and optionally within h_j)
 !+
 !----------------------------------------------------------------
-subroutine getneigh(node,xpos,xsizei,rcuti,ndim,listneigh,nneigh,xyzcache,ixyzcachesize,xyzh_soa,&
+subroutine getneigh(tree,xpos,xsizei,rcuti,ndim,listneigh,nneigh,xyzcache,ixyzcachesize,&
                     leaf_is_active,get_hj,get_f,fnode,remote_export)
 #ifdef PERIODIC
  use boundary, only:dxbound,dybound,dzbound
@@ -1218,19 +1234,23 @@ subroutine getneigh(node,xpos,xsizei,rcuti,ndim,listneigh,nneigh,xyzcache,ixyzca
  use io,       only:fatal,id
  use part,     only:gravity
  use kernel,   only:radkern
- type(kdnode), intent(in)           :: node(:) !ncellsmax+1)
- integer, intent(in)                :: ndim,ixyzcachesize
- real,    intent(in)                :: xpos(ndim)
- real,    intent(in)                :: xsizei,rcuti
- integer, intent(out)               :: listneigh(:)
- integer, intent(out)               :: nneigh
- real,    intent(out)               :: xyzcache(:,:)
- real,    intent(in)                :: xyzh_soa(:,:)
- integer, intent(in)                :: leaf_is_active(:)
- logical, intent(in)                :: get_hj
- logical, intent(in)                :: get_f
- real,    intent(out),    optional  :: fnode(lenfgrav)
- logical, intent(out),    optional  :: remote_export(:)
+ class(Tkdtree), intent(in)             :: tree(:) !ncellsmax+1)
+ integer,        intent(in)             :: ndim,ixyzcachesize
+ real,           intent(in)             :: xpos(ndim)
+ real,           intent(in)             :: xsizei,rcuti
+ integer,        intent(out)            :: listneigh(:)
+ integer,        intent(out)            :: nneigh
+ real,           intent(out)            :: xyzcache(:,:)
+ logical,        intent(in)             :: get_hj
+ logical,        intent(in)             :: get_f
+ integer,        intent(in)             :: leaf_is_active(:) ! stay in the interface because of MPI...
+ real,           intent(out), optional  :: fnode(lenfgrav)
+ logical,        intent(out), optional  :: remote_export(:)
+
+ real,           pointer  :: xyzh_soa(:,:)
+ integer,        pointer  :: inodeparts(:),inoderange(:,:)
+ type(kdnode),   pointer  :: node(:)
+
  integer, parameter :: istacksize = 300
  integer :: maxcache
  integer :: nstack(istacksize)
@@ -1246,6 +1266,11 @@ subroutine getneigh(node,xpos,xsizei,rcuti,ndim,listneigh,nneigh,xyzcache,ixyzca
 #endif
 #ifdef PERIODIC
  real :: hdlx,hdly,hdlz
+
+ xyzh_soa   = tree%xyzh_buffer
+ inodeparts = tree%inodeparts
+ inoderange = tree%inoderange
+ node       = tree%node
 
  hdlx = 0.5*dxbound
  hdly = 0.5*dybound
@@ -1267,6 +1292,8 @@ subroutine getneigh(node,xpos,xsizei,rcuti,ndim,listneigh,nneigh,xyzcache,ixyzca
  else
     global_walk = .false.
  endif
+
+
 
  nneigh = 0
  istack = 1

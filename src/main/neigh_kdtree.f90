@@ -22,7 +22,8 @@ module neighkdtree
 !   kdtree, kernel, mpiutils, part
 !
  use dim,          only:ncellsmax,ncellsmaxglobal
- use dtypekdtree,  only:kdnode,Tkdtree
+ use dtypekdtree,  only:kdnode
+ use kdtree,       only:Tkdtree
  implicit none
 
  integer,               allocatable  :: cellatid(:)
