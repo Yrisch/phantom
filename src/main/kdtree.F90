@@ -17,8 +17,8 @@ module kdtree
 !
 ! :Runtime parameters: None
 !
-! :Dependencies: allocutils, boundary, dim, dtypekdtree, fastmath, io,
-!   kernel, mpibalance, mpidomain, mpitree, mpiutils, part, timing
+! :Dependencies: allocutils, boundary, dim, dtypekdtree, io, kernel,
+!   mpibalance, mpidomain, mpitree, mpiutils, part, timing
 !
  use dim,         only:maxp,ncellsmax,minpart,use_apr,use_sinktree,maxptmass,maxpsph
  use io,          only:nprocs
@@ -1206,9 +1206,6 @@ subroutine getneigh(node,xpos,xsizei,rcuti,ndim,listneigh,nneigh,xyzcache,ixyzca
 #endif
  use io,       only:fatal,id
  use part,     only:gravity
-#ifdef FINVSQRT
- use fastmath, only:finvsqrt
-#endif
  use kernel,   only:radkern
  type(kdnode), intent(in)           :: node(:) !ncellsmax+1)
  integer, intent(in)                :: ndim,ixyzcachesize
@@ -1393,11 +1390,7 @@ subroutine getneigh(node,xpos,xsizei,rcuti,ndim,listneigh,nneigh,xyzcache,ixyzca
 !--long range force on node due to distant node, along node centres
 !  along with derivatives in order to perform series expansion
 !
-#ifdef FINVSQRT
-          dr = finvsqrt(r2)
-#else
           dr = 1./sqrt(r2)
-#endif
           call compute_fnode(dx,dy,dz,dr,totmass_node,quads,fnode)
 
        endif count_gravity
