@@ -383,7 +383,7 @@ subroutine construct_root_node(np,nproot,irootnode,ndim,xmini,xmaxi,leaf_is_acti
                                inodeparts,inoderange,xyzh_soa,iphase_soa,xyzmh_ptmass,nptmass)
  use boundary, only:cross_boundary
  use mpidomain,only:isperiodic
- use part, only:iphase,iactive
+ use part, only:iactive
  use part, only:isdead_or_accreted,ibelong
  use io,   only:fatal,id
  use dim,  only:ind_timesteps,mpi,periodic
