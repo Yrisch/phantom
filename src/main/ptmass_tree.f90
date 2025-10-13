@@ -272,7 +272,6 @@ subroutine get_ptmass_neigh(tree,xpos,rsearch,listneigh,nneigh)
           iend   = tree%nodes(inode)%iend
           do i = istart, iend
              nneigh = nneigh + 1
-             if (nneigh > 1992) print*,inode
              listneigh(nneigh) = tree%iptmassnode(i)
           enddo
        else
