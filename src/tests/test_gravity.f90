@@ -36,11 +36,12 @@ subroutine test_gravity(ntests,npass,string)
  use testapr, only:setup_apr_region_for_test
  integer,          intent(inout) :: ntests,npass
  character(len=*), intent(in)    :: string
- logical :: testdirectsum,test_mom,testtaylorseries,testall
+ logical :: testdirectsum,test_mom,testtaylorseries,test_theta,testall
 
  testdirectsum    = .false.
  testtaylorseries = .false.
  test_mom         = .false.
+ test_theta       = .false.
  testall          = .false.
  select case(string)
  case('taylorseries')
@@ -66,6 +67,10 @@ subroutine test_gravity(ntests,npass,string)
     !--unit tests of FMM momentum conservation
     !
     if (test_mom .or. testall) call test_FMM(ntests,npass)
+    !
+    !--unit tests of FMM precision convergence
+    !
+    if (test_theta .or. testall) call test_accuracy_over_theta(ntests,npass)
 
     if (id==master) write(*,"(/,a)") '<-- SELF-GRAVITY TESTS COMPLETE'
  else
@@ -99,13 +104,15 @@ subroutine test_taylorseries(ntests,npass)
  fexact = -totmass*dr**3*dx   ! exact force between i and j
  phiexact = -totmass*dr       ! exact potential between i and j
 
- call get_dx_dr(x0,xposj,dx,dr)
+ call get_dx_dr(xposj,x0,dx,dr)
  fnode = 0.
  quads = 0.
  call compute_M2L(dx(1),dx(2),dx(3),dr,totmass,quads,fnode)
 
  dx = xposi - x0   ! perform expansion about x0
  call expand_fgrav_in_taylor_series(fnode,dx(1),dx(2),dx(3),f0(1),f0(2),f0(3),phi)
+ f0 = -f0 ! minus sign needed with long range forces
+ phi = -phi
  !print*,'           exact force = ',fexact,' phi = ',phiexact
  !print*,'       force at origin = ',fnode(1:3), ' phi = ',fnode(20)
  !print*,'force w. taylor series = ',f0, ' phi = ',phi
@@ -155,12 +162,14 @@ subroutine test_taylorseries(ntests,npass)
  fexact = fexact*pmassi
  phiexact = phiexact*pmassi
 
- call get_dx_dr(x0,xposj,dx,dr)
+ call get_dx_dr(xposj,x0,dx,dr)
  fnode = 0.
  call compute_M2L(dx(1),dx(2),dx(3),dr,totmass,quads,fnode)
 
  dx = xposi - x0   ! perform expansion about x0
  call expand_fgrav_in_taylor_series(fnode,dx(1),dx(2),dx(3),f0(1),f0(2),f0(3),phi)
+ f0 = -f0 ! minus sign needed with long range forces
+ phi = -phi
  !print*,'           exact force = ',fexact,' phi = ',phiexact
  !print*,'       force at origin = ',fnode(1:3), ' phi = ',fnode(20)
  !print*,'force w. taylor series = ',f0, ' phi = ',phi
@@ -185,13 +194,15 @@ subroutine test_taylorseries(ntests,npass)
  fexact = fexact*pmassi
  phiexact = phiexact*pmassi
 
- dx = x0 - xposj
+ dx = xposj - x0
  dr = 1./sqrt(dot_product(dx,dx))  ! compute approx force between node and j
  fnode = 0.
  call compute_M2L(dx(1),dx(2),dx(3),dr,totmass,quads,fnode)
 
  dx = xposi - x0   ! perform expansion about x0
  call expand_fgrav_in_taylor_series(fnode,dx(1),dx(2),dx(3),f0(1),f0(2),f0(3),phi)
+ f0  = -f0 ! minus sign needed with long range forces
+ phi = -phi
  !print*,'           exact force = ',fexact,' phi = ',phiexact
  !print*,'       force at origin = ',fnode(1:3), ' phi = ',fnode(20)
  !print*,'force w. taylor series = ',f0, ' phi = ',phi
@@ -203,6 +214,87 @@ subroutine test_taylorseries(ntests,npass)
  call update_test_scores(ntests,nfailed,npass)
 
 end subroutine test_taylorseries
+
+
+subroutine test_accuracy_over_theta(ntests,npass)
+ use kdtree,    only:compute_M2L,compute_M2L_dipole,expand_fgrav_in_taylor_series,get_quads,get_dipoles
+ use testutils, only:checkval,update_test_scores
+ integer, intent(inout) :: ntests,npass
+ integer, allocatable :: nfailed(:)
+ integer :: i,nrandom
+ real    :: xcellA(3),xcellB(3),xpartA(3),xpartB(3),quadsB(6),dipsB(3),fnodeA(20),db(3),da(3)
+ real    :: theta,dxyzcell(3),dr1cell,dxyzpart(3),dr1part,fsize,pmass,fdirect(3),ffmm(3)
+ real    :: poten,relE,dum
+ logical :: save_file
+
+ save_file = .True.
+
+ nrandom = 50000
+ pmass   = 1.
+ allocate(nfailed(nrandom))
+ if (id==master) write(*,"(/,3a)") '--> testing SFMM convergence over the order of expansion (p=3)'
+
+ do i=1,nrandom
+    quadsB  = 0.
+    dipsB   = 0.
+    fnodeA  = 0.
+
+    xpartA(1) = (rand()-0.5)*2.
+    xpartA(2) = (rand()-0.5)*2.
+    xpartA(3) = (rand()-0.5)*2.
+
+    xpartB(1) = (rand()-0.5)*2.
+    xpartB(2) = (rand()-0.5)*2.
+    xpartB(3) = (rand()-0.5)*2.
+
+    fsize     = 0.1*real(i)/real(nrandom)
+
+    xcellA(1) = xpartA(1) + fsize*(rand()-0.5)*2.
+    xcellA(2) = xpartA(2) + fsize*(rand()-0.5)*2.
+    xcellA(3) = xpartA(3) + fsize*(rand()-0.5)*2.
+
+    xcellB(1) = xpartB(1) + fsize*(rand()-0.5)*2.
+    xcellB(2) = xpartB(2) + fsize*(rand()-0.5)*2.
+    xcellB(3) = xpartB(3) + fsize*(rand()-0.5)*2.
+
+
+    call get_dx_dr(xcellB,xcellA,dxyzcell,dr1cell)
+    dr1cell = 1./dr1cell
+
+    call get_dx_dr(xpartA,xpartB,dxyzpart,dr1part)
+    dr1cell = 1./dr1cell
+
+    call get_dx_dr(xpartB,xcellB,db,dum)
+
+    call get_dx_dr(xpartA,xcellA,da,dum)
+
+
+    call get_quads(pmass,db(1),db(2),db(3),quadsB)
+    call get_dipoles(pmass,db(1),db(2),db(3),dipsB)
+    call compute_M2L(dxyzcell(1),dxyzcell(2),dxyzcell(3),dr1cell,pmass,quadsB,fnodeA)
+    call compute_M2L_dipole(dxyzcell(1),dxyzcell(2),dxyzcell(3),dr1cell,pmass,dipsB,fnodeA)
+    call expand_fgrav_in_taylor_series(fnodeA,da(1),da(2),da(3),ffmm(1),ffmm(2),ffmm(3),poten)
+    ffmm = -ffmm
+
+    theta = (norm2(db)+norm2(da))*dr1cell
+
+    fdirect(1) = -pmass*dxyzpart(1)*(dr1part**3)
+    fdirect(2) = -pmass*dxyzpart(2)*(dr1part**3)
+    fdirect(3) = -pmass*dxyzpart(3)*(dr1part**3)
+
+    relE = norm2(ffmm-fdirect)/norm2(fdirect)
+
+    call checkval( relE, theta**3, 1.e-1, nfailed(i),'relative error')
+    if (theta < 5 .and. theta>1.e-4) then
+       write(66,*) relE,theta
+    endif
+ enddo
+ call update_test_scores(ntests,nfailed,npass)
+
+
+
+end subroutine test_accuracy_over_theta
+
 
 !-----------------------------------------------------------------------
 !+
@@ -492,10 +584,10 @@ subroutine test_directsum(ntests,npass)
 !
     if (use_sinktree) then
        if (id==master) write(*,"(/,3a)") &
-       '--> testing softened gravity in uniform sphere with half sinks and half gas (SinkInTree)'
+             '--> testing softened gravity in uniform sphere with half sinks and half gas (SinkInTree)'
     else
        if (id==master) write(*,"(/,3a)") &
-       '--> testing softened gravity in uniform sphere with half sinks and half gas (direct)'
+             '--> testing softened gravity in uniform sphere with half sinks and half gas (direct)'
     endif
 
 !--sort the particles by ID so that the first half will have the same order
@@ -549,8 +641,8 @@ subroutine test_directsum(ntests,npass)
        epot_gas_sink = 0.0
        do i=1,npart
           call get_accel_sink_gas(nptmass,xyzh(1,i),xyzh(2,i),xyzh(3,i),xyzh(4,i),&
-                               xyzmh_ptmass,fxyzu(1,i),fxyzu(2,i),fxyzu(3,i),&
-                               phii,pmassi,fxyz_ptmass_gas,dsdt_ptmass,fonrmax,dtsinksink)
+                                  xyzmh_ptmass,fxyzu(1,i),fxyzu(2,i),fxyzu(3,i),&
+                                  phii,pmassi,fxyz_ptmass_gas,dsdt_ptmass,fonrmax,dtsinksink)
           epot_gas_sink = epot_gas_sink + pmassi*phii
           epoti = epoti + poten(i)
        enddo
@@ -619,8 +711,8 @@ end subroutine test_directsum
 subroutine test_FMM(ntests,npass)
  use io,        only:id,master,iverbose
  use part,      only:npart,npartoftype,xyzh,massoftype,hfact,&
-                       init_part,fxyzu,istar,set_particle_type,&
-                       ibelong
+                     init_part,fxyzu,istar,set_particle_type,&
+                     ibelong
  use mpidomain, only:i_belong
  use mpiutils,  only:reduceall_mpi
  use mpibalance,only:balancedomains

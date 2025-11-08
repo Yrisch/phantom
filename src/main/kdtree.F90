@@ -56,7 +56,7 @@ module kdtree
  public :: maketree, revtree, getneigh,getneigh_dual,kdnode,lenfgrav
  public :: maketreeglobal
  public :: empty_tree
- public :: compute_M2L,expand_fgrav_in_taylor_series
+ public :: compute_M2L,compute_M2L_dipole,get_quads,get_dipoles,expand_fgrav_in_taylor_series
 
  integer, public :: maxlevel_indexed, maxlevel
 
@@ -739,12 +739,7 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
           pmassi = massoftype(iamtype(iphase_soa(i)))
        endif
     endif
-    quads(1) = quads(1) + pmassi*(dx*dx)  ! Q_xx
-    quads(2) = quads(2) + pmassi*(dx*dy)        ! Q_xy = Q_yx
-    quads(3) = quads(3) + pmassi*(dx*dz)        ! Q_xz = Q_zx
-    quads(4) = quads(4) + pmassi*(dy*dy)  ! Q_yy
-    quads(5) = quads(5) + pmassi*(dy*dz)        ! Q_yz = Q_zy
-    quads(6) = quads(6) + pmassi*(dz*dz)  ! Q_zz
+    call get_quads(pmassi,dx,dy,dz,quads)
 #endif
  enddo
  !!$omp end parallel do
@@ -907,6 +902,41 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
  endif
 
 end subroutine construct_node
+!----------------------------------------------------------------
+!+
+!  Helper function to compute quadrupole mass moment
+!+
+!----------------------------------------------------------------
+subroutine get_quads(pmassi,dx,dy,dz,quads)
+ real, intent(in)    :: pmassi,dx,dy,dz
+ real, intent(inout) :: quads(6)
+
+ !quads verified agree with shamrock up to float precision
+ quads(1) = quads(1) + pmassi*(dx*dx)  ! Q_xx
+ quads(2) = quads(2) + pmassi*(dx*dy)  ! Q_xy = Q_yx
+ quads(3) = quads(3) + pmassi*(dx*dz)  ! Q_xz = Q_zx
+ quads(4) = quads(4) + pmassi*(dy*dy)  ! Q_yy
+ quads(5) = quads(5) + pmassi*(dy*dz)  ! Q_yz = Q_zy
+ quads(6) = quads(6) + pmassi*(dz*dz)  ! Q_zz
+
+end subroutine get_quads
+
+!----------------------------------------------------------------
+!+
+!  Helper function to compute dipole mass moment (only for tests)
+!+
+!----------------------------------------------------------------
+subroutine get_dipoles(pmassi,dx,dy,dz,dips)
+ real, intent(in)    :: pmassi,dx,dy,dz
+ real, intent(inout) :: dips(3)
+
+ dips(1) = dips(1) + pmassi*dx
+ dips(2) = dips(2) + pmassi*dy
+ dips(3) = dips(3) + pmassi*dz
+
+end subroutine get_dipoles
+
+
 
 !----------------------------------------------------------------
 !+
@@ -1229,7 +1259,7 @@ subroutine getneigh(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzcachesi
  over_stack: do while(istack /= 0)
     n = nstack(istack)
     istack = istack - 1
-    call get_sep(xpos,node(n)%xcen,dx,dy,dz,xoffset,yoffset,zoffset,r2)
+    call get_sep(node(n)%xcen,xpos,dx,dy,dz,xoffset,yoffset,zoffset,r2)
     xsizej  = node(n)%size
     il      = node(n)%leftchild
     ir      = node(n)%rightchild
@@ -1609,7 +1639,7 @@ subroutine node_interaction(node_dst,node_src,tree_acc2,fnode,stackit)
  real    :: xdum,ydum,zdum
  logical :: wellsep
 
- call get_sep(node_dst%xcen,node_src%xcen,dx,dy,dz,xdum,ydum,zdum,r2)
+ call get_sep(node_src%xcen,node_dst%xcen,dx,dy,dz,xdum,ydum,zdum,r2)
  call get_node_size(node_dst,node_src,size_dst,size_src,rcut_dst,rcut_src)
 
  rcut  = max(rcut_dst,rcut_src)
@@ -1643,53 +1673,121 @@ pure subroutine compute_M2L(dx,dy,dz,dr,totmass,quads,fnode)
  real, intent(in)    :: dx,dy,dz,dr,totmass
  real, intent(in)    :: quads(6)
  real, intent(inout) :: fnode(lenfgrav)
- real :: dr2,dr3,dr4,dr5,dr3m,dr4m3,rx,ry,rz,qxx,qxy,qxz,qyy,qyz,qzz
+ real :: dr2,dr3,dr4,dr3m,dr4m3,rx,ry,rz,qxx,qxy,qxz,qyy,qyz,qzz
+ real :: rxx,rxy,rxz,ryy,ryz,rzz
  real :: fqx,fqy,fqz,rijQij,Qii
 
 ! note: dr == 1/sqrt(r2)
  dr2  = dr*dr
  dr3  = dr2*dr
  dr4  = dr2*dr2
- dr5  = dr4*dr
  dr3m  = totmass*dr3
  dr4m3 = 3.*totmass*dr4
  rx  = dx*dr
  ry  = dy*dr
  rz  = dz*dr
+ rxx = rx*rx
+ rxy = rx*ry
+ rxz = rx*rz
+ ryy = ry*ry
+ ryz = ry*rz
+ rzz = rz*rz
+
  qxx = quads(1)
  qxy = quads(2)
  qxz = quads(3)
  qyy = quads(4)
  qyz = quads(5)
  qzz = quads(6)
- rijQij = (rx*rx*qxx + 2.*ry*rx*qxy + 2*ry*rz*qyz + ry*ry*qyy + 2*rx*rz*qxz + rz*rz*qzz)
+ rijQij = (rxx*qxx + 2.*rxy*qxy + 2*ryz*qyz + ryy*qyy + 2*rxz*qxz + rzz*qzz)
  Qii    = (qxx + qyy + qzz)
  fqx    = dr4*(1.5*(rx*(3*qxx+qyy+qzz) + 2.*ry*qxy + 2.*rz*qxz) - 7.5*rx*rijQij)
  fqy    = dr4*(1.5*(ry*(3*qyy+qxx+qzz) + 2.*rx*qxy + 2.*rz*qyz) - 7.5*ry*rijQij)
  fqz    = dr4*(1.5*(rz*(3*qzz+qyy+qxx) + 2.*ry*qyz + 2.*rx*qxz) - 7.5*rz*rijQij)
 
- fnode(1)  = fnode(1)  - dr3m*dx + fqx                          ! C¹_x
- fnode(2)  = fnode(2)  - dr3m*dy + fqy                          ! C¹_y
- fnode(3)  = fnode(3)  - dr3m*dz + fqz                          ! C¹_z
- fnode(4)  = fnode(4)  + dr3m*(3.*rx*rx -   1.)                 ! C²_xx
- fnode(5)  = fnode(5)  + dr3m*(3.*rx*ry       )                 ! C²_xy
- fnode(6)  = fnode(6)  + dr3m*(3.*rx*rz       )                 ! C²_xz
- fnode(7)  = fnode(7)  + dr3m*(3.*ry*ry -   1.)                 ! C²_yy
- fnode(8)  = fnode(8)  + dr3m*(3.*ry*rz       )                 ! C²_yz
- fnode(9)  = fnode(9)  + dr3m*(3.*rz*rz -   1.)                 ! C²_zz
- fnode(10) = fnode(10) - dr4m3*(5.*rx*rx*rx - 3.*rx)            ! C³_xxx
- fnode(11) = fnode(11) - dr4m3*(5.*rx*rx*ry - ry)               ! C³_xxy
- fnode(12) = fnode(12) - dr4m3*(5.*rx*rx*rz - rz)               ! C³_xxz
- fnode(13) = fnode(13) - dr4m3*(5.*rx*ry*ry - rx)               ! C³_xyy
- fnode(14) = fnode(14) - dr4m3*(5.*rx*ry*rz)                    ! C³_xyz
- fnode(15) = fnode(15) - dr4m3*(5.*rx*rz*rz - rx)               ! C³_xzz
- fnode(16) = fnode(16) - dr4m3*(5.*ry*ry*ry - 3.*ry)            ! C³_yyy
- fnode(17) = fnode(17) - dr4m3*(5.*ry*ry*rz - rz)               ! C³_yyz
- fnode(18) = fnode(18) - dr4m3*(5.*ry*rz*rz - ry)               ! C³_yzz
- fnode(19) = fnode(19) - dr4m3*(5.*rz*rz*rz - 3.*rz)            ! C³_zzz
- fnode(20) = fnode(20) - (totmass*dr + 0.5*dr3*(3.*rijQij-Qii)) ! C⁰ (potential)
+ fnode(1)  = fnode(1)  - (dr3m*dx - fqx)                      ! C¹_x
+ fnode(2)  = fnode(2)  - (dr3m*dy - fqy)                      ! C¹_y
+ fnode(3)  = fnode(3)  - (dr3m*dz - fqz)                      ! C¹_z
+ fnode(4)  = fnode(4)  - dr3m*(3.*rxx -   1.)                 ! C²_xx
+ fnode(5)  = fnode(5)  - dr3m*(3.*rxy       )                 ! C²_xy
+ fnode(6)  = fnode(6)  - dr3m*(3.*rxz       )                 ! C²_xz
+ fnode(7)  = fnode(7)  - dr3m*(3.*ryy -   1.)                 ! C²_yy
+ fnode(8)  = fnode(8)  - dr3m*(3.*ryz       )                 ! C²_yz
+ fnode(9)  = fnode(9)  - dr3m*(3.*rzz -   1.)                 ! C²_zz
+ fnode(10) = fnode(10) - dr4m3*(5.*rxx*rx - 3.*rx)            ! C³_xxx
+ fnode(11) = fnode(11) - dr4m3*(5.*rxx*ry - ry)               ! C³_xxy
+ fnode(12) = fnode(12) - dr4m3*(5.*rxx*rz - rz)               ! C³_xxz
+ fnode(13) = fnode(13) - dr4m3*(5.*rxy*ry - rx)               ! C³_xyy
+ fnode(14) = fnode(14) - dr4m3*(5.*rxy*rz)                    ! C³_xyz
+ fnode(15) = fnode(15) - dr4m3*(5.*rxz*rz - rx)               ! C³_xzz
+ fnode(16) = fnode(16) - dr4m3*(5.*ryy*ry - 3.*ry)            ! C³_yyy
+ fnode(17) = fnode(17) - dr4m3*(5.*ryy*rz - rz)               ! C³_yyz
+ fnode(18) = fnode(18) - dr4m3*(5.*ryz*rz - ry)               ! C³_yzz
+ fnode(19) = fnode(19) - dr4m3*(5.*rzz*rz - 3.*rz)            ! C³_zzz
+ fnode(20) = fnode(20) + (totmass*dr + 0.5*dr3*(3.*rijQij-Qii)) ! C⁰ (potential)
 
 end subroutine compute_M2L
+
+!-----------------------------------------------------------
+!+
+!  Compute the Taylor expansion coeffs between the node
+!  centres using the dipole moments (p=3) (only for testing)
+!+
+!-----------------------------------------------------------
+pure subroutine compute_M2L_dipole(dx,dy,dz,dr1,q0,dipoles,fnode)
+ real, intent(in)    :: dx,dy,dz,dr1,q0
+ real, intent(in)    :: dipoles(3)
+ real, intent(inout) :: fnode(lenfgrav)
+ real :: dipx,dipy,dipz,dx2,dx3,dy2,dy3,dz2,dz3
+ real :: dr12,D3(10),D2(6),g0,g1,g2,g3
+
+ dr12 = dr1*dr1
+ dx2  = dx*dx
+ dx3  = dx*dx2
+ dy2  = dy*dy
+ dy3  = dy*dy2
+ dz2  = dz*dz
+ dz3  = dz*dz2
+ g0   = dr1
+ g1   = -1.*dr12*g0
+ g2   = -3.*dr12*g1
+ g3   = -5.*dr12*g2
+
+ !D1, D2, D3 verified and agree with shamrock to float precision
+ D3(1)  = 3. * g2 * dx + g3 * dx3  ! xxx
+ D3(2)  = g2 * dy + g3 * dx2*dy    ! xxy
+ D3(3)  = g2 * dz + g3 * dx2*dz    ! xxz
+ D3(4)  = g2 * dx + g3 * dy2*dx    ! xyy
+ D3(5)  = g3 * dx*dy*dz            ! xyz
+ D3(6)  = g2 * dx + g3 * dz2*dx    ! xzz
+ D3(7)  = 3. * g2 * dy + g3 * dy3  ! yyy
+ D3(8)  = g2 * dz + g3 * dy2*dz    ! yyz
+ D3(9)  = g2 * dy + g3 * dz2*dy    ! yzz
+ D3(10) = 3. * g2 * dz + g3 * dz3  ! zzz
+
+
+ D2(1)  = g1 + g2*dx2 ! xx
+ D2(2)  = g2*dx*dy    ! xy
+ D2(3)  = g2*dx*dz    ! xz
+ D2(4)  = g1 + g2*dy2 ! yy
+ D2(5)  = g2*dy*dz    ! yz
+ D2(6)  = g1 + g2*dz2 ! zz
+
+ dipx  = dipoles(1)
+ dipy  = dipoles(2)
+ dipz  = dipoles(3)
+
+ fnode(1)  = fnode(1)  + (D2(1)*dipx + D2(2)*dipy + D2(3)*dipz)  ! C¹_x
+ fnode(2)  = fnode(2)  + (D2(2)*dipx + D2(4)*dipy + D2(5)*dipz)  ! C¹_y
+ fnode(3)  = fnode(3)  + (D2(3)*dipx + D2(5)*dipy + D2(6)*dipz)  ! C¹_z
+ fnode(4)  = fnode(4)  - (D3(1)*dipx + D3(2)*dipy + D3(3)*dipz ) ! C²_xx
+ fnode(5)  = fnode(5)  - (D3(2)*dipx + D3(4)*dipy + D3(5)*dipz ) ! C²_xy
+ fnode(6)  = fnode(6)  - (D3(3)*dipx + D3(5)*dipy + D3(6)*dipz ) ! C²_xz
+ fnode(7)  = fnode(7)  - (D3(4)*dipx + D3(7)*dipy + D3(8)*dipz ) ! C²_yy
+ fnode(8)  = fnode(8)  - (D3(5)*dipx + D3(8)*dipy + D3(9)*dipz ) ! C²_yz
+ fnode(9)  = fnode(9)  - (D3(6)*dipx + D3(9)*dipy + D3(10)*dipz) ! C²_zz
+
+end subroutine compute_M2L_dipole
 
 !----------------------------------------------------------------
 !+

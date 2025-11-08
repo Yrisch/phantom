@@ -2879,10 +2879,10 @@ subroutine finish_cell_and_store_results(icall,cell,fxyzu,xyzh,vxyzu,poten,dt,dv
        !
        call get_distance_from_centre_of_mass(cell%icell,xi,yi,zi,dx,dy,dz)
        call expand_fgrav_in_taylor_series(cell%fgrav,dx,dy,dz,fxi,fyi,fzi,poti)
-       fsum(ifxi) = fsum(ifxi) + fxi
-       fsum(ifyi) = fsum(ifyi) + fyi
-       fsum(ifzi) = fsum(ifzi) + fzi
-       epoti = epoti + 0.5*pmassi*poti
+       fsum(ifxi) = fsum(ifxi) - fxi
+       fsum(ifyi) = fsum(ifyi) - fyi
+       fsum(ifzi) = fsum(ifzi) - fzi
+       epoti = epoti - 0.5*pmassi*poti
        poten(i) = real(epoti,kind=kind(poten))
        if (use_sinktree) then
           if (iamsinki) then
