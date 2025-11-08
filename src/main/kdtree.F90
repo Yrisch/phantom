@@ -1633,6 +1633,87 @@ subroutine node_interaction(node_dst,node_src,tree_acc2,fnode,stackit)
 
 end subroutine node_interaction
 
+
+pure subroutine compute_M2L_new(dx,dy,dz,dr1,q0,quads,fnode)
+ real, intent(in)    :: dx,dy,dz,dr1,q0
+ real, intent(in)    :: quads(9)
+ real, intent(inout) :: fnode(lenfgrav)
+ real :: qx,qy,qz,qxx,qxy,qxz,qyy,qyz,qzz,dx2,dx3,dy2,dy3,dz2,dz3
+ real :: dr12,D3(10),D2(6),D1(3),g0,g1,g2,g3
+
+ dr12 = dr1*dr1
+ dx2  = dx*dx
+ dx3  = dx*dx2
+ dy2  = dy*dy
+ dy3  = dy*dy2
+ dz2  = dz*dz
+ dz3  = dz*dz2
+ g0   = dr1
+ g1   = -1.*dr12*g0
+ g2   = -3.*dr12*g1
+ g3   = -5.*dr12*g2
+
+ !D1, D2, D3 verified and agree with shamrock to float precision
+ D3(1)  = 3. * g2 * dx + g3 * dx3  ! xxx
+ D3(2)  = g2 * dy + g3 * dx2*dy    ! xxy
+ D3(3)  = g2 * dz + g3 * dx2*dz    ! xxz
+ D3(4)  = g2 * dx + g3 * dy2*dx    ! xyy
+ D3(5)  = g3 * dx*dy*dz            ! xyz
+ D3(6)  = g2 * dx + g3 * dz2*dx    ! xzz
+ D3(7)  = 3. * g2 * dy + g3 * dy3  ! yyy
+ D3(8)  = g2 * dz + g3 * dy2*dz    ! yyz
+ D3(9)  = g2 * dy + g3 * dz2*dy    ! yzz
+ D3(10) = 3. * g2 * dz + g3 * dz3  ! zzz
+
+
+ D2(1)  = g1 + g2*dx2 ! xx
+ D2(2)  = g2*dx*dy    ! xy
+ D2(3)  = g2*dx*dz    ! xz
+ D2(4)  = g1 + g2*dy2 ! yy
+ D2(5)  = g2*dy*dz    ! yz
+ D2(6)  = g1 + g2*dz2 ! zz
+
+ D1(1)  = g1*dx
+ D1(2)  = g1*dy
+ D1(3)  = g1*dz
+
+
+ qxx = quads(1)
+ qxy = quads(2)
+ qxz = quads(3)
+ qyy = quads(4)
+ qyz = quads(5)
+ qzz = quads(6)
+ qx  = quads(7)
+ qy  = quads(8)
+ qz  = quads(9)
+
+ fnode(1)  = fnode(1)  + (D1(1)*q0  + D2(1)*qx  + D2(2)*qy  + D2(3)*qz + &
+                     0.5*(D3(1)*qxx + 2.*(D3(2)*qxy + D3(3)*qxz + D3(5)*qyz) + D3(4)*qyy + D3(6)*qzz ))    ! C¹_x
+ fnode(2)  = fnode(2)  + (D1(2)*q0  + D2(2)*qx  + D2(4)*qy  + D2(5)*qz +&
+                     0.5*(D3(2)*qxx + 2.*(D3(4)*qxy + D3(5)*qxz + D3(8)*qyz) + D3(7)*qyy + D3(9)*qzz ))    ! C¹_y
+ fnode(3)  = fnode(3)  + (D1(3)*q0  + D2(3)*qx  + D2(5)*qy  + D2(6)*qz +&
+                     0.5*(D3(3)*qxx + 2.*(D3(5)*qxy + D3(6)*qxz + D3(9)*qyz) + D3(8)*qyy + D3(10)*qzz))   ! C¹_z
+ fnode(4)  = fnode(4)  - (D2(1)*q0 + D3(1)*qx + D3(2)*qy + D3(3)*qz )    ! C²_xx
+ fnode(5)  = fnode(5)  - (D2(2)*q0 + D3(2)*qx + D3(4)*qy + D3(5)*qz )    ! C²_xy
+ fnode(6)  = fnode(6)  - (D2(3)*q0 + D3(3)*qx + D3(5)*qy + D3(6)*qz )    ! C²_xz
+ fnode(7)  = fnode(7)  - (D2(4)*q0 + D3(4)*qx + D3(7)*qy + D3(8)*qz )    ! C²_yy
+ fnode(8)  = fnode(8)  - (D2(5)*q0 + D3(5)*qx + D3(8)*qy + D3(9)*qz )    ! C²_yz
+ fnode(9)  = fnode(9)  - (D2(6)*q0 + D3(6)*qx + D3(9)*qy + D3(10)*qz)    ! C²_zz
+ fnode(10) = fnode(10) + D3(1) *q0    ! C³_xxx
+ fnode(11) = fnode(11) + D3(2) *q0    ! C³_xxy
+ fnode(12) = fnode(12) + D3(3) *q0    ! C³_xxz
+ fnode(13) = fnode(13) + D3(4) *q0    ! C³_xyy
+ fnode(14) = fnode(14) + D3(5) *q0    ! C³_xyz
+ fnode(15) = fnode(15) + D3(6) *q0    ! C³_xzz
+ fnode(16) = fnode(16) + D3(7) *q0    ! C³_yyy
+ fnode(17) = fnode(17) + D3(8) *q0    ! C³_yyz
+ fnode(18) = fnode(18) + D3(9) *q0    ! C³_yzz
+ fnode(19) = fnode(19) + D3(10)*q0    ! C³_zzz
+ fnode(20) = fnode(20) ! - (totmass*dr + 0.5*dr3*(3.*rijQij-Qii)) ! C⁰ (potential)
+
+end subroutine compute_M2L_new
+
 !-----------------------------------------------------------
 !+
 !  Compute the Taylor expansion coeffs between the node
