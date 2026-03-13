@@ -1454,55 +1454,143 @@ subroutine task_FMM(node,leaf_is_active)
  tree_acc2 = tree_accuracy*tree_accuracy
  fnodecache = 0.
 
- istack = 1
- stack(1,istack) = irootnode
- stack(2,istack) = irootnode
 !
 !-- parallel select algorithm to check every interactions between the tree and the selected branch
+!   implemented using OpenMP tasks and atomic updates on fnodecache
 !
- do while(istack > 0)
-    !-- pop the stack
-    idst       = stack(1,istack) ! dest node id
-    isrc       = stack(2,istack) ! src node id
-    istack     = istack - 1
+!$omp parallel default(shared)
+!$omp single
+ call walk_pair_task(irootnode, irootnode)
+!$omp end single
+!$omp end parallel
 
-    if (idst == isrc) then !-- self interaction ignored (directly push onto stack)
-       stackit = .true.
-       xoffset = 0.
-       yoffset = 0.
-       zoffset = 0.
+!--------------------------------------------------------------------
+! Downward propagation of cached multipoles using OpenMP tasks
+!--------------------------------------------------------------------
+!$omp parallel default(shared)
+!$omp single
+ call propagate_down_task(2, irootnode)
+ call propagate_down_task(3, irootnode)
+!$omp end single
+!$omp end parallel
+
+contains
+
+recursive subroutine walk_pair_task(idst,isrc)
+ integer, intent(in) :: idst,isrc
+ logical :: stackit_local
+ real    :: xoff_local,yoff_local,zoff_local
+ real    :: fnode_local(lenfgrav)
+ integer :: ils,irs,ild,ird
+ integer :: i
+
+ if (idst == isrc) then
+    stackit_local = .true.
+    xoff_local = 0.
+    yoff_local = 0.
+    zoff_local = 0.
+ else
+    fnode_local = 0.
+    call node_interaction(node(idst),node(isrc),tree_acc2,fnode_local, &
+                            stackit_local,xoff_local,yoff_local,zoff_local)
+    if (.not. stackit_local) then
+       do i = 1, lenfgrav
+!$omp atomic
+          fnodecache(i,idst) = fnodecache(i,idst) + fnode_local(i)
+       enddo
+    endif
+ endif
+
+ if (.not. stackit_local) return
+
+ ils = node(isrc)%leftchild
+ irs = node(isrc)%rightchild
+ ild = node(idst)%leftchild
+ ird = node(idst)%rightchild
+
+ if (leaf_is_active(isrc) /= 0) then
+    if (leaf_is_active(idst) == 0) then
+       if (ild /= 0) then
+!$omp task firstprivate(ild,isrc) shared(node,leaf_is_active,fnodecache,tree_acc2)
+          call walk_pair_task(ild,isrc)
+!$omp end task
+       endif
+       if (ird /= 0) then
+!$omp task firstprivate(ird,isrc) shared(node,leaf_is_active,fnodecache,tree_acc2)
+          call walk_pair_task(ird,isrc)
+!$omp end task
+       endif
+    endif
+ else
+    if (leaf_is_active(idst) /= 0) then
+       if (ils /= 0) then
+!$omp task firstprivate(idst,ils) shared(node,leaf_is_active,fnodecache,tree_acc2)
+          call walk_pair_task(idst,ils)
+!$omp end task
+       endif
+       if (irs /= 0) then
+!$omp task firstprivate(idst,irs) shared(node,leaf_is_active,fnodecache,tree_acc2)
+          call walk_pair_task(idst,irs)
+!$omp end task
+       endif
     else
-       call node_interaction(node(idst),node(isrc),tree_acc2,fnodecache(:,idst),stackit,xoffset,yoffset,zoffset)
+       if (ild /= 0 .and. ils /= 0) then
+!$omp task firstprivate(ild,ils) shared(node,leaf_is_active,fnodecache,tree_acc2)
+          call walk_pair_task(ild,ils)
+!$omp end task
+       endif
+       if (ild /= 0 .and. irs /= 0) then
+!$omp task firstprivate(ild,irs) shared(node,leaf_is_active,fnodecache,tree_acc2)
+          call walk_pair_task(ild,irs)
+!$omp end task
+       endif
+       if (ird /= 0 .and. ils /= 0) then
+!$omp task firstprivate(ird,ils) shared(node,leaf_is_active,fnodecache,tree_acc2)
+          call walk_pair_task(ird,ils)
+!$omp end task
+       endif
+       if (ird /= 0 .and. irs /= 0) then
+!$omp task firstprivate(ird,irs) shared(node,leaf_is_active,fnodecache,tree_acc2)
+          call walk_pair_task(ird,irs)
+!$omp end task
+       endif
+    endif
+ endif
+
+end subroutine walk_pair_task
+
+recursive subroutine propagate_down_task(ichild,iparent)
+ integer, intent(in) :: ichild,iparent
+ real :: dx,dy,dz,xoffset,yoffset,zoffset
+ real :: fnode_acc(lenfgrav)
+ integer :: lchild,rchild
+
+ call get_sep(node(ichild)%xcen,node(iparent)%xcen,dx,dy,dz, &
+              xoffset,yoffset,zoffset)
+ call propagate_fnode_to_node(fnode_acc,fnodecache(:,iparent),dx,dy,dz)
+ fnode_acc = fnodecache(:,ichild) + fnode_acc
+ fnodecache(:,ichild) = fnode_acc
+
+ if (leaf_is_active(ichild) == 0) then
+    lchild = node(ichild)%leftchild
+    rchild = node(ichild)%rightchild
+
+    if (lchild /= 0) then
+!$omp task firstprivate(lchild,ichild) shared(node,leaf_is_active,fnodecache)
+       call propagate_down_task(lchild,ichild)
+!$omp end task
     endif
 
-    if (stackit) then
-       call open_nodes(stack,istack,node(isrc),isrc,node(idst),idst,leaf_is_active,&
-                       xoffset,yoffset,zoffset)
+    if (rchild /= 0) then
+!$omp task firstprivate(rchild,ichild) shared(node,leaf_is_active,fnodecache)
+       call propagate_down_task(rchild,ichild)
+!$omp end task
     endif
- enddo
 
- istack = 2
- stack(1,1) = 2
- stack(2,1) = irootnode
- stack(1,2) = 3
- stack(2,2) = irootnode
- do while(istack > 0)
-    ichild  = stack(1,istack)
-    iparent = stack(2,istack)
-    istack = istack - 1
+!$omp taskwait
+ endif
 
-    call get_sep(node(ichild)%xcen,node(iparent)%xcen,dx,dy,dz,xoffset,yoffset,zoffset)
-    call propagate_fnode_to_node(fnode_acc,fnodecache(:,iparent),dx,dy,dz)
-    fnode_acc = fnodecache(:,ichild) + fnode_acc
-    fnodecache(:,ichild) = fnode_acc
-    if (leaf_is_active(ichild)==0) then
-       stack(1,istack+1) = node(ichild)%leftchild
-       stack(2,istack+1) = ichild
-       stack(1,istack+2) = node(ichild)%rightchild
-       stack(2,istack+2) = ichild
-       istack = istack + 2
-    endif
- enddo
+end subroutine propagate_down_task
 
 end subroutine task_FMM
 
