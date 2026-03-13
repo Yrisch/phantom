@@ -39,9 +39,10 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
                   dustevol,ddustevol,filfac,dustfrac,eos_vars,time,dt,dtnew,pxyzu,&
                   dens,metrics,apr_level)
  use dim,            only:mhd,fast_divcurlB,gr,periodic,do_radiation,driving,&
-                          sink_radiation,use_dustgrowth,ind_timesteps,isothermal
+                          sink_radiation,use_dustgrowth,ind_timesteps,isothermal,gravity
  use io,             only:iprint,fatal,error
- use neighkdtree,    only:build_tree
+ use neighkdtree,    only:build_tree,node,leaf_is_active
+ use kdtree,         only:task_FMM
  use densityforce,   only:densityiterate
  use ptmass,         only:ipart_rhomax,ptmass_calc_enclosed_mass,ptmass_boundary_crossing,get_pressure_on_sinks
  use externalforces, only:externalforce
@@ -168,6 +169,14 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
     call forceit(time,npart,xyzh,vxyzu,fxyzu)
     call do_timing('driving',tlast,tcpulast)
  endif
+
+!
+! compute long range forces
+!
+ if (gravity) then
+    call task_FMM(node,leaf_is_active)
+ endif
+
 
  !
  ! compute SPH forces

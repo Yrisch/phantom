@@ -53,7 +53,7 @@ module kdtree
  integer :: irefine
 
  public :: allocate_kdtree, deallocate_kdtree
- public :: maketree, revtree, getneigh,getneigh_dual,kdnode,lenfgrav
+ public :: maketree, revtree, getneigh,task_FMM,kdnode,lenfgrav,fnodecache,getneigh_dual
  public :: maketreeglobal
  public :: empty_tree
  public :: compute_M2L,expand_fgrav_in_taylor_series
@@ -1312,35 +1312,6 @@ subroutine getneigh(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzcachesi
              nstack(istack) = ir
           endif
        endif if_leaf
-#ifdef GRAVITY
-    elseif (get_f) then ! if_open_node
-       ! When searching for neighbours of this node, the tree walk may encounter
-       ! nodes on the global tree that it does not need to open, so it should
-       ! just add the contribution to fnode. However, when walking a different
-       ! part of the tree, it may then become necessary to export this node to
-       ! a remote task. When it arrives at the remote task, it will then walk
-       ! the remote tree.
-       !
-       ! The complication arises when tree refinment is enabled, which puts part
-       ! of the remote tree onto the global tree. fnode will be double counted
-       ! if a contribution is made on the global tree and a separate branch
-       ! causes it to be sent to a remote task, where that contribution is
-       ! counted again.
-       !
-       ! The solution is to not count the parts of the local tree that have been
-       ! added onto the global tree.
-
-       count_gravity: if ( global_walk .or. (n > irefine) ) then
-          !
-          !--long range force on node due to distant node, along node centres
-          !  along with derivatives in order to perform series expansion
-          !
-          dr = 1./sqrt(r2)
-          call compute_M2L(dx,dy,dz,dr,totmass_node,quads,fnode)
-
-       endif count_gravity
-#endif
-
     endif if_open_node
  enddo over_stack
 
@@ -1369,12 +1340,13 @@ subroutine getneigh_dual(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzca
  logical,      intent(in)    :: get_f
  real,         intent(out)   :: fnode(lenfgrav)
  integer,      intent(in)    :: icell
- integer :: istack,i,iparent,idstbranch,idst,isrc,maxcache,tobecached
- integer :: branch(maxdepth),nparents,stack(3,maxdepth)
+ integer :: istack,i,iparent,idstbranch,idst,isrc,maxcache,tobecached,idstnext,ir,il
+ integer :: branch(maxdepth),nparents,stack(3,maxdepth),ibranchnext
  real    :: dx,dy,dz,xoffset,yoffset,zoffset
+ real    :: size_dst,size_src,rcut_dst,rcut_src,r2,rcut,rcut2
  real    :: tree_acc2
  real    :: fnode_acc(lenfgrav)
- logical :: stackit,cached
+ logical :: stackit,isdstleaf,wellsep
 
  tree_acc2 = tree_accuracy*tree_accuracy
 
@@ -1386,8 +1358,7 @@ subroutine getneigh_dual(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzca
 
  call get_list_of_parent_nodes(icell,node,branch,nparents)
 
- fnode_branch = 0.
- fnode_acc    = 0.
+ fnode = 0.
 
  nneigh = 0
  istack = 1
@@ -1411,54 +1382,129 @@ subroutine getneigh_dual(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzca
        yoffset = 0.
        zoffset = 0.
     else
-       call node_interaction(node(idst),node(isrc),tree_acc2,fnode_branch(:,idstbranch),stackit,xoffset,yoffset,zoffset)
+       call get_sep(node(idst)%xcen,node(isrc)%xcen,dx,dy,dz,xoffset,yoffset,zoffset,r2)
+       call get_node_size(node(idst),node(isrc),size_dst,size_src,rcut_dst,rcut_src)
+
+       rcut  = max(rcut_dst,rcut_src)
+       rcut2 = (size_dst+size_src+rcut)**2
+       wellsep = (tree_acc2*r2 > (size_dst+size_src)**2) .and. (r2 > rcut2)
+
+       if (wellsep) then
+          stackit = .false.
+       else
+          stackit = .true.
+       endif
     endif
 
     if (stackit) then
-       call open_nodes(stack,istack,node(isrc),isrc,branch,idstbranch,&
-                       listneigh,xyzcache,ixyzcachesize,nneigh,leaf_is_active,&
-                       maxcache,xoffset,yoffset,zoffset)
-    endif
- enddo
+       il = node(isrc)%leftchild
+       ir = node(isrc)%rightchild
 
- !
- !-- Downward pass to accumulate on each leaf / Cache and fetch fgrav optimisation
- !
- do i=nparents,2,-1 ! parents(1) is equal to icell
-    iparent = branch(i)
-    ! -- Cache node if first thread to reach it or fetch fnode in memory
-#ifdef GRAVITY
-    !$omp atomic capture
-    tobecached = node(iparent)%tobecached
-    node(iparent)%tobecached = min(node(iparent)%tobecached,0)
-    !$omp end atomic
-    if (tobecached==1) then
-       !-- store fnode in the cache array
-       fnodecache(1:lenfgrav,iparent) = fnode_branch(1:lenfgrav,i)
-       !$omp atomic write
-       node(iparent)%cached = .true.
-       !$omp end atomic
-    else
-       !$omp atomic read
-       cached = node(iparent)%cached
-       !$omp end atomic
-       if (cached) then
-          !-- fetch fnode from the cache array
-          fnode_branch(1:lenfgrav,i) = fnodecache(1:lenfgrav,iparent)
+       !-- find the new dst id to push onto the stack
+       if (idstbranch-1>0) then !-- if not leaf
+          ibranchnext = idstbranch-1
+          isdstleaf   = .false.
+       else
+          ibranchnext = idstbranch ! leaf lowering if upper leaf
+          isdstleaf   = .true.
        endif
-    endif
-#else
-    cached = .true.
-    tobecached=1
-#endif
-    call get_sep(node(branch(i-1))%xcen,node(iparent)%xcen,dx,dy,dz,xoffset,yoffset,zoffset)
-    fnode = fnode_acc + fnode_branch(:,i)
-    call propagate_fnode_to_node(fnode_acc,fnode,dx,dy,dz)
- enddo
 
- fnode = fnode_acc + fnode_branch(:,1)
+       idstnext = branch(ibranchnext) ! new dest node id
+
+       is_src_leaf: if (leaf_is_active(isrc) /= 0) then
+          is_P2P: if (isdstleaf) then !-- P2P detected should be cached and tagged as neighbours
+             call cache_neighbours(nneigh,isrc,ixyzcachesize,maxcache,listneigh,xyzcache,xoffset,yoffset,zoffset)
+          else ! then you're a leaf -> leaf lowering
+             istack = istack + 1
+             stack(1,istack) = idstnext
+             stack(2,istack) = isrc
+             stack(3,istack) = ibranchnext
+          endif is_P2P
+       else
+          if (il /= 0) then
+             istack = istack + 1
+             stack(1,istack) = idstnext
+             stack(2,istack) = il
+             stack(3,istack) = ibranchnext
+          endif
+          if (ir /= 0) then
+             istack = istack + 1
+             stack(1,istack) = idstnext
+             stack(2,istack) = ir
+             stack(3,istack) = ibranchnext
+          endif
+       endif is_src_leaf
+    endif
+ enddo
 
 end subroutine getneigh_dual
+
+subroutine task_FMM(node,leaf_is_active)
+ use io,       only:fatal
+ type(kdnode), intent(inout) :: node(:) !ncellsmax+1)
+ integer,      intent(in)    :: leaf_is_active(:)
+ integer, parameter :: istacksize = 512
+ integer :: istack,iparent,ichild,idst,isrc
+ integer :: stack(2,istacksize)
+ real    :: dx,dy,dz,xoffset,yoffset,zoffset
+ real    :: fnode_acc(lenfgrav)
+ real    :: tree_acc2
+ logical :: stackit
+
+ tree_acc2 = tree_accuracy*tree_accuracy
+ fnodecache = 0.
+
+ istack = 1
+ stack(1,istack) = irootnode
+ stack(2,istack) = irootnode
+!
+!-- parallel select algorithm to check every interactions between the tree and the selected branch
+!
+ do while(istack > 0)
+    !-- pop the stack
+    idst       = stack(1,istack) ! dest node id
+    isrc       = stack(2,istack) ! src node id
+    istack     = istack - 1
+
+    if (idst == isrc) then !-- self interaction ignored (directly push onto stack)
+       stackit = .true.
+       xoffset = 0.
+       yoffset = 0.
+       zoffset = 0.
+    else
+       call node_interaction(node(idst),node(isrc),tree_acc2,fnodecache(:,idst),stackit,xoffset,yoffset,zoffset)
+    endif
+
+    if (stackit) then
+       call open_nodes(stack,istack,node(isrc),isrc,node(idst),idst,leaf_is_active,&
+                       xoffset,yoffset,zoffset)
+    endif
+ enddo
+
+ istack = 2
+ stack(1,1) = 2
+ stack(2,1) = irootnode
+ stack(1,2) = 3
+ stack(2,2) = irootnode
+ do while(istack > 0)
+    ichild  = stack(1,istack)
+    iparent = stack(2,istack)
+    istack = istack - 1
+
+    call get_sep(node(ichild)%xcen,node(iparent)%xcen,dx,dy,dz,xoffset,yoffset,zoffset)
+    call propagate_fnode_to_node(fnode_acc,fnodecache(:,iparent),dx,dy,dz)
+    fnode_acc = fnodecache(:,ichild) + fnode_acc
+    fnodecache(:,ichild) = fnode_acc
+    if (leaf_is_active(ichild)==0) then
+       stack(1,istack+1) = node(ichild)%leftchild
+       stack(2,istack+1) = ichild
+       stack(1,istack+2) = node(ichild)%rightchild
+       stack(2,istack+2) = ichild
+       istack = istack + 2
+    endif
+ enddo
+
+end subroutine task_FMM
 
 !-----------------------------------------------------------
 !+
@@ -1524,7 +1570,7 @@ end subroutine get_node_size
 !  to the child node centre
 !+
 !-----------------------------------------------------------
-pure subroutine propagate_fnode_to_node(fnode,fnode_sup,dx,dy,dz)
+subroutine propagate_fnode_to_node(fnode,fnode_sup,dx,dy,dz)
  real, intent(in)  :: fnode_sup(lenfgrav),dx,dy,dz
  real, intent(out) :: fnode(lenfgrav)
 
@@ -1588,58 +1634,61 @@ end subroutine get_list_of_parent_nodes
 !  Compute node node gravity interactions
 !+
 !-----------------------------------------------------------
-subroutine open_nodes(stack,istack,srcnode,isrc,branch,idstbranch,&
-                           listneigh,xyzcache,ixyzcachesize,nneigh,leaf_is_active,&
-                           maxcache,xoffset,yoffset,zoffset)
+subroutine open_nodes(stack,istack,srcnode,isrc,dstnode,idst,leaf_is_active,&
+                      xoffset,yoffset,zoffset)
  type(kdnode), intent(in)    :: srcnode
- integer,      intent(in)    :: isrc,idstbranch
- integer,      intent(in)    :: branch(:)
- integer,      intent(in)    :: ixyzcachesize,maxcache
+ type(kdnode), intent(in)    :: dstnode
+ integer,      intent(in)    :: isrc,idst
  integer,      intent(in)    :: leaf_is_active(:)
- integer,      intent(inout) :: listneigh(:)
- integer,      intent(inout) :: nneigh
  integer,      intent(inout) :: stack(:,:),istack
- real,         intent(inout) :: xyzcache(:,:)
  real,         intent(in)    :: xoffset,yoffset,zoffset
- integer :: ir,il,ibranchnext,idstnext
- logical :: isdstleaf
+ integer :: irs,ils,ird,ild
 
- il = srcnode%leftchild
- ir = srcnode%rightchild
+ ils = srcnode%leftchild
+ irs = srcnode%rightchild
 
- !-- find the new dst id to push onto the stack
- if (idstbranch-1>0) then !-- if not leaf
-    ibranchnext = idstbranch-1
-    isdstleaf   = .false.
- else
-    ibranchnext = idstbranch ! leaf lowering if upper leaf
-    isdstleaf   = .true.
- endif
-
- idstnext = branch(ibranchnext) ! new dest node id
+ ild = dstnode%leftchild
+ ird = dstnode%rightchild
 
  is_src_leaf: if (leaf_is_active(isrc) /= 0) then
-    is_P2P: if (isdstleaf) then !-- P2P detected should be cached and tagged as neighbours
-       call cache_neighbours(nneigh,isrc,ixyzcachesize,maxcache,listneigh,xyzcache,xoffset,yoffset,zoffset)
-    else ! then you're a leaf -> leaf lowering
-       istack = istack + 1
-       stack(1,istack) = idstnext
-       stack(2,istack) = isrc
-       stack(3,istack) = ibranchnext
-    endif is_P2P
+    isnot_P2P: if (leaf_is_active(idst) == 0) then !-- P2P detected should be cached and tagged as neighbours
+       if (istack+2 > 512) then
+          print*,"stack overflow"
+          stop
+       endif
+       stack(1,istack+1) = ild
+       stack(2,istack+1) = isrc
+       stack(1,istack+2) = ird
+       stack(2,istack+2) = isrc
+       istack = istack + 2
+    endif isnot_P2P
  else
-    if (il /= 0) then
-       istack = istack + 1
-       stack(1,istack) = idstnext
-       stack(2,istack) = il
-       stack(3,istack) = ibranchnext
-    endif
-    if (ir /= 0) then
-       istack = istack + 1
-       stack(1,istack) = idstnext
-       stack(2,istack) = ir
-       stack(3,istack) = ibranchnext
-    endif
+    is_dst_leaf: if (leaf_is_active(idst) /=0) then
+       if (istack+2 > 512) then
+          print*,"stack overflow"
+          stop
+       endif
+       stack(1,istack+1) = idst
+       stack(2,istack+1) = ils
+       stack(1,istack+2) = idst
+       stack(2,istack+2) = irs
+       istack = istack + 2
+    else
+       if (istack+4 > 512) then
+          print*,"stack overflow"
+          stop
+       endif
+       stack(1,istack+1) = ild
+       stack(2,istack+1) = ils
+       stack(1,istack+2) = ild
+       stack(2,istack+2) = irs
+       stack(1,istack+3) = ird
+       stack(2,istack+3) = ils
+       stack(1,istack+4) = ird
+       stack(2,istack+4) = irs
+       istack = istack + 4
+    endif is_dst_leaf
+
  endif is_src_leaf
 
 end subroutine open_nodes
@@ -1659,33 +1708,25 @@ subroutine node_interaction(node_dst,node_src,tree_acc2,fnode,stackit,xoffset,yo
  real    :: dx,dy,dz,r2,dr1
  real    :: rcut_dst,rcut_src,rcut,rcut2
  real    :: size_dst,size_src,mass_src,quads_src(6)
- logical :: wellsep,cached
+ logical :: wellsep
 
  call get_sep(node_dst%xcen,node_src%xcen,dx,dy,dz,xoffset,yoffset,zoffset,r2)
  call get_node_size(node_dst,node_src,size_dst,size_src,rcut_dst,rcut_src)
-#ifdef GRAVITY
- !$omp atomic read
- cached = node_dst%cached
- !$omp end atomic
-#else
- cached = .false.
-#endif
+
  rcut  = max(rcut_dst,rcut_src)
  rcut2 = (size_dst+size_src+rcut)**2
  wellsep = (tree_acc2*r2 > (size_dst+size_src)**2) .and. (r2 > rcut2)
 
  if (wellsep) then
-    if (.not.cached) then
-       dr1 = 1./sqrt(r2)
+    dr1 = 1./sqrt(r2)
 #ifdef GRAVITY
-       mass_src=node_src%mass
-       quads_src=node_src%quads
+    mass_src=node_src%mass
+    quads_src=node_src%quads
 #else
-       mass_src=0.
-       quads_src=0.
+    mass_src=0.
+    quads_src=0.
 #endif
-       call compute_M2L(dx,dy,dz,dr1,mass_src,quads_src,fnode)
-    endif
+    call compute_M2L(dx,dy,dz,dr1,mass_src,quads_src,fnode)
     stackit = .false.
  else
     stackit = .true.

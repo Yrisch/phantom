@@ -219,7 +219,7 @@ subroutine get_neighbour_list(inode,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesi
                               getj,f,remote_export,cell_xpos,cell_xsizei,cell_rcuti)
  use io,       only:nprocs,warning
  use dim,      only:mpi
- use kdtree,   only:getneigh,getneigh_dual,lenfgrav
+ use kdtree,   only:getneigh,getneigh_dual,lenfgrav,fnodecache
  use kernel,   only:radkern
  use part,     only:gravity,periodic
  use boundary, only:dxbound,dybound,dzbound
@@ -287,7 +287,7 @@ subroutine get_neighbour_list(inode,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesi
                      leaf_is_active,get_j,get_f,fgrav)
  endif
 
- if (get_f) f = fgrav + fgrav_global
+ if (get_f) f = fgrav + fgrav_global + fnodecache(:,inode)
 
 end subroutine get_neighbour_list
 
