@@ -278,14 +278,9 @@ subroutine get_neighbour_list(inode,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesi
     fgrav_global = 0.0
  endif
 
- ! Find neighbours of this cell on this node
- if (get_f .and. .not.(mpi) .and. use_dualtree) then
-    call getneigh_dual(node,xpos,xsizei,rcuti,mylistneigh,nneigh,xyzcache,ixyzcachesize,&
-                          leaf_is_active,get_j,get_f,fgrav,inode)
- else
-    call getneigh(node,xpos,xsizei,rcuti,mylistneigh,nneigh,xyzcache,ixyzcachesize,&
-                     leaf_is_active,get_j,get_f,fgrav)
- endif
+ call getneigh(node,xpos,xsizei,rcuti,mylistneigh,nneigh,xyzcache,ixyzcachesize,&
+               leaf_is_active,get_j,get_f,fgrav)
+
 
  if (get_f) f = fgrav + fgrav_global + fnodecache(:,inode)
 

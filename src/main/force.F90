@@ -50,7 +50,7 @@ module forces
                maxdusttypes,maxdustsmall,do_radiation,maxpsph
  use mpiforce,    only:cellforce,stackforce
  use neighkdtree, only:leaf_is_active
- use kdtree,      only:inodeparts,inoderange
+ use kdtree,      only:inodeparts,inoderange,use_taskfmm_short_gravity,fgrav_short
  use part,        only:iradxi,ifluxx,ifluxy,ifluxz,ikappa,ien_type,ien_entropy,ien_entropy_s
 
  implicit none
@@ -409,6 +409,7 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
 !$omp shared(maxp) &
 !$omp shared(ncells,leaf_is_active) &
 !$omp shared(xyzh) &
+!$omp shared(fgrav_short) &
 !$omp shared(dustprop) &
 !$omp shared(dragreg) &
 !$omp shared(filfac) &
@@ -1360,6 +1361,10 @@ subroutine compute_forces(i,iamgasi,iamdusti,xpartveci,hi,hi1,hi21,hi41,gradhi,g
        endif
 
        fgrav = 0.5*(pmassj*fgravi + pmassi*fgravj)
+       if (use_taskfmm_short_gravity) then
+          fgrav = 0.
+          phii  = 0.
+       endif
 
        !--get dv : needed for timestep and av term
        vxj = vxyzu(1,j)
@@ -1949,7 +1954,7 @@ subroutine compute_forces(i,iamgasi,iamdusti,xpartveci,hi,hi1,hi21,hi41,gradhi,g
        endif ifgas
 
 #ifdef GRAVITY
-    else !is_sph_neighbour or sinkinpair
+    elseif(.not.use_taskfmm_short_gravity)then!is_sph_neighbour or sinkinpair
        !
        !--if particle is a trial neighbour, but not an SPH neighbour
        !  then compute the 1/r^2 force contribution
@@ -2865,6 +2870,12 @@ subroutine finish_cell_and_store_results(icall,cell,fxyzu,xyzh,vxyzu,poten,dt,dv
     endif
 
     if (gravity) then
+       if (use_taskfmm_short_gravity) then
+          fsum(ifxi) = fsum(ifxi) + fgrav_short(1,i)
+          fsum(ifyi) = fsum(ifyi) + fgrav_short(2,i)
+          fsum(ifzi) = fsum(ifzi) + fgrav_short(3,i)
+          fsum(ipot) = fsum(ipot) + fgrav_short(4,i)
+       endif
        !--add self-contribution
        if (iamsinki) then
           epoti = 0.5*pmassi*fsum(ipot)

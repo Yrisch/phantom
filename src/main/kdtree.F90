@@ -24,7 +24,7 @@ module kdtree
  use io,          only:nprocs
  use dtypekdtree, only:kdnode,lenfgrav
  use part,        only:ll,iphase,treecache,maxphase, &
-                       apr_level,aprmassoftype
+                       apr_level,aprmassoftype,gradh
 
  implicit none
 
@@ -33,6 +33,8 @@ module kdtree
  type(kdnode),     allocatable :: refinementnode(:)
  real,             allocatable :: fnode_branch(:,:)
  real,             allocatable :: fnodecache(:,:)
+ real,    public,  allocatable :: fgrav_short(:,:)  ! (4,maxp) short-range gravity accel
+ logical, public               :: use_taskfmm_short_gravity = .true.
 !$omp threadprivate(fnode_branch)
 !
 !--tree parameters
@@ -80,6 +82,7 @@ subroutine allocate_kdtree
  call allocate_array('inodeparts', inodeparts, maxp)
  if (mpi) call allocate_array('refinementnode', refinementnode, ncellsmax+1)
  call allocate_array('fnodecache', fnodecache, lenfgrav, ncellsmax+1)
+ call allocate_array('fgrav_short', fgrav_short, 4, maxp)
 !$omp parallel
  call allocate_array('fnode_branch', fnode_branch, lenfgrav, maxdepth)
 !$omp end parallel
@@ -92,6 +95,7 @@ subroutine deallocate_kdtree
  if (allocated(inodeparts)) deallocate(inodeparts)
  if (mpi .and. allocated(refinementnode)) deallocate(refinementnode)
  if (allocated(fnodecache)) deallocate(fnodecache)
+ if (allocated(fgrav_short)) deallocate(fgrav_short)
 !$omp parallel
  if (allocated(fnode_branch)) deallocate(fnode_branch)
 !$omp end parallel
@@ -1441,18 +1445,14 @@ end subroutine getneigh_dual
 
 subroutine task_FMM(node,leaf_is_active)
  use io,       only:fatal
+ use kernel,   only:grkern,cnormk,radkern2,kernel_softening
  type(kdnode), intent(inout) :: node(:) !ncellsmax+1)
  integer,      intent(in)    :: leaf_is_active(:)
- integer, parameter :: istacksize = 512
- integer :: istack,iparent,ichild,idst,isrc
- integer :: stack(2,istacksize)
- real    :: dx,dy,dz,xoffset,yoffset,zoffset
- real    :: fnode_acc(lenfgrav)
- real    :: tree_acc2
- logical :: stackit
+ real :: tree_acc2
 
  tree_acc2 = tree_accuracy*tree_accuracy
  fnodecache = 0.
+ fgrav_short = 0.
 
 !
 !-- parallel select algorithm to check every interactions between the tree and the selected branch
@@ -1502,6 +1502,14 @@ recursive subroutine walk_pair_task(idst,isrc)
  endif
 
  if (.not. stackit_local) return
+
+ ! leaf-leaf short-range gravity (P2P) handled here
+ if (use_taskfmm_short_gravity) then
+    if (leaf_is_active(idst) /= 0 .and. leaf_is_active(isrc) /= 0) then
+       call p2p_gravity_leafleaf(idst,isrc,xoff_local,yoff_local,zoff_local)
+       return
+    endif
+ endif
 
  ils = node(isrc)%leftchild
  irs = node(isrc)%rightchild
@@ -1558,6 +1566,116 @@ recursive subroutine walk_pair_task(idst,isrc)
  endif
 
 end subroutine walk_pair_task
+
+subroutine p2p_gravity_leafleaf(idst,isrc,xoff,yoff,zoff)
+ integer, intent(in) :: idst,isrc
+ real,    intent(in) :: xoff,yoff,zoff
+ integer :: ip,jp
+ integer :: ipi,ipj
+ real    :: xi,yi,zi,xj,yj,zj,dx,dy,dz,rij2,rij1,runix,runiy,runiz
+ real    :: hi,hj,hi1,hj1,hi21,hj21,hi41,hj41,qi,qj,q2i,q2j
+ real    :: gradhi,gradhj,gradsofti,gradsoftj,hfacgrkerni
+ real    :: phii,phij,fmi,fmj,fgrav,fgravi,fgravj,grkerni,grkernj,dsofti,dsoftj
+ real    :: pmassi,pmassj
+ logical :: is_neigh
+
+ do ip = inoderange(1,idst), inoderange(2,idst)
+    if (inodeparts(ip) == 0) cycle
+    ipi = abs(inodeparts(ip))
+    hi = treecache(4,ip)
+    if (hi <= 0.) cycle
+    xi = treecache(1,ip)
+    yi = treecache(2,ip)
+    zi = treecache(3,ip)
+    pmassi = treecache(5,ip)
+
+    hi1  = 1./hi
+    hi21 = hi1*hi1
+    hi41 = hi21*hi21
+    gradhi = real(gradh(1,ipi),kind=8)
+    gradsofti = real(gradh(2,ipi),kind=8)
+    hfacgrkerni = real(hi41*cnormk,kind=8)*gradhi
+
+    do jp = inoderange(1,isrc), inoderange(2,isrc)
+       if (inodeparts(jp) == 0) cycle
+       ipj = abs(inodeparts(jp))
+       hj = treecache(4,jp)
+       if (ipj == ipi) cycle
+       if (hj <= 0.) cycle
+       xj = treecache(1,jp) + xoff
+       yj = treecache(2,jp) + yoff
+       zj = treecache(3,jp) + zoff
+       pmassj = treecache(5,jp)
+
+       dx = xi - xj
+       dy = yi - yj
+       dz = zi - zj
+       rij2 = dx*dx + dy*dy + dz*dz
+       if (rij2 > tiny(rij2)) then
+          rij1 = 1./sqrt(rij2)
+          runix = dx*rij1
+          runiy = dy*rij1
+          runiz = dz*rij1
+       else
+          rij1 = 0.
+          runix = 0.
+          runiy = 0.
+          runiz = 0.
+       endif
+
+       hj1  = 1./hj
+       hj21 = hj1*hj1
+       hj41 = hj21*hj21
+
+       q2i = rij2*hi21
+       q2j = rij2*hj21
+       is_neigh = (q2i < radkern2 .or. q2j < radkern2)
+
+       if (is_neigh) then
+          qi = (rij2*rij1)*hi1
+          if (q2i < radkern2) then
+             grkerni = grkern(q2i,qi)*hfacgrkerni
+             call kernel_softening(q2i,qi,phii,fmi)
+             phii = phii*hi1
+             fmi  = fmi*hi21
+             dsofti = gradsofti*grkerni
+             fgravi = fmi + dsofti
+          else
+             phii = -rij1
+             fgravi = rij1*rij1
+          endif
+
+          if (q2j < radkern2) then
+             qj = (rij2*rij1)*hj1
+             gradhj = gradh(1,ipj)
+             gradsoftj = gradh(2,ipj)
+             grkernj = grkern(q2j,qj)*hj41*cnormk*gradhj
+             call kernel_softening(q2j,qj,phij,fmj)
+             fmj = fmj*hj21
+             dsoftj = gradsoftj*grkernj
+             fgravj = fmj + dsoftj
+          else
+             fgravj = rij1*rij1
+          endif
+
+          fgrav = 0.5*(pmassj*fgravi + pmassi*fgravj)
+       else
+          phii = -rij1
+          fgrav = pmassj*rij1*rij1
+       endif
+
+!$omp atomic
+       fgrav_short(1,ipi) = fgrav_short(1,ipi) - fgrav*runix
+!$omp atomic
+       fgrav_short(2,ipi) = fgrav_short(2,ipi) - fgrav*runiy
+!$omp atomic
+       fgrav_short(3,ipi) = fgrav_short(3,ipi) - fgrav*runiz
+!$omp atomic
+       fgrav_short(4,ipi) = fgrav_short(4,ipi) + pmassj*phii
+    enddo
+ enddo
+
+end subroutine p2p_gravity_leafleaf
 
 recursive subroutine propagate_down_task(ichild,iparent)
  integer, intent(in) :: ichild,iparent
