@@ -1446,11 +1446,14 @@ end subroutine getneigh_dual
 subroutine task_FMM(node,leaf_is_active)
  use io,       only:fatal
  use kernel,   only:grkern,cnormk,radkern2,kernel_softening
+ use part,      only:massoftype
  type(kdnode), intent(inout) :: node(:) !ncellsmax+1)
  integer,      intent(in)    :: leaf_is_active(:)
  real :: tree_acc2
+ real :: pmass_threshold
 
  tree_acc2 = tree_accuracy*tree_accuracy
+ pmass_threshold = 20000.*massoftype(1)
  fnodecache = 0.
  fgrav_short = 0.
 
@@ -1479,6 +1482,7 @@ contains
 recursive subroutine walk_pair_task(idst,isrc)
  integer, intent(in) :: idst,isrc
  logical :: stackit_local
+ logical :: spawn_tasks
  real    :: xoff_local,yoff_local,zoff_local
  real    :: fnode_local(lenfgrav)
  integer :: ils,irs,ild,ird
@@ -1511,6 +1515,8 @@ recursive subroutine walk_pair_task(idst,isrc)
     endif
  endif
 
+ spawn_tasks = (node(idst)%mass >= pmass_threshold)
+
  ils = node(isrc)%leftchild
  irs = node(isrc)%rightchild
  ild = node(idst)%leftchild
@@ -1519,48 +1525,80 @@ recursive subroutine walk_pair_task(idst,isrc)
  if (leaf_is_active(isrc) /= 0) then
     if (leaf_is_active(idst) == 0) then
        if (ild /= 0) then
+          if (spawn_tasks) then
 !$omp task firstprivate(ild,isrc) shared(node,leaf_is_active,fnodecache,tree_acc2)
-          call walk_pair_task(ild,isrc)
+             call walk_pair_task(ild,isrc)
 !$omp end task
+          else
+             call walk_pair_task(ild,isrc)
+          endif
        endif
        if (ird /= 0) then
+          if (spawn_tasks) then
 !$omp task firstprivate(ird,isrc) shared(node,leaf_is_active,fnodecache,tree_acc2)
-          call walk_pair_task(ird,isrc)
+             call walk_pair_task(ird,isrc)
 !$omp end task
+          else
+             call walk_pair_task(ird,isrc)
+          endif
        endif
     endif
  else
     if (leaf_is_active(idst) /= 0) then
        if (ils /= 0) then
+          if (spawn_tasks) then
 !$omp task firstprivate(idst,ils) shared(node,leaf_is_active,fnodecache,tree_acc2)
-          call walk_pair_task(idst,ils)
+             call walk_pair_task(idst,ils)
 !$omp end task
+          else
+             call walk_pair_task(idst,ils)
+          endif
        endif
        if (irs /= 0) then
+          if (spawn_tasks) then
 !$omp task firstprivate(idst,irs) shared(node,leaf_is_active,fnodecache,tree_acc2)
-          call walk_pair_task(idst,irs)
+             call walk_pair_task(idst,irs)
 !$omp end task
+          else
+             call walk_pair_task(idst,irs)
+          endif
        endif
     else
        if (ild /= 0 .and. ils /= 0) then
+          if (spawn_tasks) then
 !$omp task firstprivate(ild,ils) shared(node,leaf_is_active,fnodecache,tree_acc2)
-          call walk_pair_task(ild,ils)
+             call walk_pair_task(ild,ils)
 !$omp end task
+          else
+             call walk_pair_task(ild,ils)
+          endif
        endif
        if (ild /= 0 .and. irs /= 0) then
+          if (spawn_tasks) then
 !$omp task firstprivate(ild,irs) shared(node,leaf_is_active,fnodecache,tree_acc2)
-          call walk_pair_task(ild,irs)
+             call walk_pair_task(ild,irs)
 !$omp end task
+          else
+             call walk_pair_task(ild,irs)
+          endif
        endif
        if (ird /= 0 .and. ils /= 0) then
+          if (spawn_tasks) then
 !$omp task firstprivate(ird,ils) shared(node,leaf_is_active,fnodecache,tree_acc2)
-          call walk_pair_task(ird,ils)
+             call walk_pair_task(ird,ils)
 !$omp end task
+          else
+             call walk_pair_task(ird,ils)
+          endif
        endif
        if (ird /= 0 .and. irs /= 0) then
+          if (spawn_tasks) then
 !$omp task firstprivate(ird,irs) shared(node,leaf_is_active,fnodecache,tree_acc2)
-          call walk_pair_task(ird,irs)
+             call walk_pair_task(ird,irs)
 !$omp end task
+          else
+             call walk_pair_task(ird,irs)
+          endif
        endif
     endif
  endif
@@ -1682,6 +1720,7 @@ recursive subroutine propagate_down_task(ichild,iparent)
  real :: dx,dy,dz,xoffset,yoffset,zoffset
  real :: fnode_acc(lenfgrav)
  integer :: lchild,rchild
+ logical :: spawn_tasks
 
  call get_sep(node(ichild)%xcen,node(iparent)%xcen,dx,dy,dz, &
               xoffset,yoffset,zoffset)
@@ -1692,17 +1731,26 @@ recursive subroutine propagate_down_task(ichild,iparent)
  if (leaf_is_active(ichild) == 0) then
     lchild = node(ichild)%leftchild
     rchild = node(ichild)%rightchild
+    spawn_tasks = (node(ichild)%mass >= pmass_threshold)
 
     if (lchild /= 0) then
+       if (spawn_tasks) then
 !$omp task firstprivate(lchild,ichild) shared(node,leaf_is_active,fnodecache)
-       call propagate_down_task(lchild,ichild)
+          call propagate_down_task(lchild,ichild)
 !$omp end task
+       else
+          call propagate_down_task(lchild,ichild)
+       endif
     endif
 
     if (rchild /= 0) then
+       if (spawn_tasks) then
 !$omp task firstprivate(rchild,ichild) shared(node,leaf_is_active,fnodecache)
-       call propagate_down_task(rchild,ichild)
+          call propagate_down_task(rchild,ichild)
 !$omp end task
+       else
+          call propagate_down_task(rchild,ichild)
+       endif
     endif
 
 !$omp taskwait
