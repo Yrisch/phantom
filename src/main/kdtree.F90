@@ -39,7 +39,7 @@ module kdtree
 !
  integer,          parameter, public :: irootnode  = 1
  character(len=1), parameter, public :: labelax(3) = (/'x','y','z'/)
- integer,          parameter         :: maxdepth   = 32
+ integer,          parameter         :: maxdepth   = 64
 !
 !--runtime options for this module
 !
@@ -812,9 +812,9 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
        leaf_is_active(nnode) = 1
     endif
  else ! split this node and add children to stack
-    iaxis  = maxloc(xmaxi - xmini,1) ! split along longest axis
-    xpivot = xyzcofm(iaxis)          ! split on centre of mass
-
+    iaxis  = maxloc(xmaxi - xmini,1)     ! split along longest axis
+    xpivot = (xmaxi(iaxis) + xmini(iaxis))*0.5 ! split middle longest axis
+    if (maxlevel > maxdepth) call fatal('maketree','maximum tree depth reached !!')
     ! create two children nodes and point to them from current node
     ! always use G&R indexing for global tree
     if ((level < maxlevel_indexed) .or. global_build) then
