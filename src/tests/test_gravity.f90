@@ -879,9 +879,9 @@ end subroutine test_sphere
 !-----------------------------------------------------------------------
 subroutine selfgrav_comparison()
  use setplummer, only:iprofile_plummer
- integer :: ntarg(7),i
+ integer :: ntarg(9),i
 
- ntarg = (/1000,3000,10000,30000,100000,300000,1000000/)
+ ntarg = (/1000,3000,10000,30000,100000,300000,1000000,3000000,10000000/)
 
  if (id==master) write(*,*) '--> Plot routine : Plummer sphere tests with different Npart'
  do i=1,size(ntarg)
