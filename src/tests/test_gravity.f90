@@ -37,14 +37,14 @@ subroutine test_gravity(ntests,npass,string)
  integer,          intent(inout) :: ntests,npass
  character(len=*), intent(in)    :: string
  logical :: testdirectsum,test_mom,testtaylorseries,testall,test_plummer
- logical :: plot_plummer
+ logical :: test_compare
 
  testdirectsum    = .false.
  testtaylorseries = .false.
  test_mom         = .false.
  testall          = .false.
  test_plummer     = .false.
- plot_plummer     = .false.
+ test_compare     = .false.
  select case(string)
  case('taylorseries')
     testtaylorseries = .true.
@@ -54,8 +54,8 @@ subroutine test_gravity(ntests,npass,string)
     test_mom = .true.
  case('spheres','plummer','hernquist')
     test_plummer = .true.
- case('plotplummer')
-    plot_plummer = .true.
+ case('selfgrav_comp')
+    test_compare = .true.
  case default
     testall = .true.
  end select
@@ -78,9 +78,9 @@ subroutine test_gravity(ntests,npass,string)
     !
     if (test_plummer .or. testall) call test_spheres(ntests,npass)
     !
-    !--Plot routine of Plummer and Homogeneous sphere (store data to be plotted)
+    !--unit tests to compare self-gravity solver (store data to be plotted)
     !
-    if (plot_plummer) call plot_SFMM()
+    if (test_compare) call selfgrav_comparison()
 
     if (id==master) write(*,"(/,a)") '<-- SELF-GRAVITY TESTS COMPLETE'
  else
@@ -877,7 +877,7 @@ end subroutine test_sphere
 ! in Phantom (see Bernard et al. 2026)
 !+
 !-----------------------------------------------------------------------
-subroutine plot_SFMM()
+subroutine selfgrav_comparison()
  use setplummer, only:iprofile_plummer
  integer :: ntarg(7),i
 
@@ -886,10 +886,11 @@ subroutine plot_SFMM()
  if (id==master) write(*,*) '--> Plot routine : Plummer sphere tests with different Npart'
  do i=1,size(ntarg)
     if (id==master) write(*,*) 'Test with Npart = ',ntarg(i)
-    call get_plummer_prec_perf(ntarg(i),iprofile_plummer)
+    call get_accNperf(ntarg(i),iprofile_plummer)
+    call get_accNperf(ntarg(i),3)
  enddo
 
-end subroutine plot_SFMM
+end subroutine selfgrav_comparison
 
 !-----------------------------------------------------------------------
 !+
@@ -897,48 +898,55 @@ end subroutine plot_SFMM
 ! sphere. It tests precision and perf for different theta max and Npart
 !+
 !-----------------------------------------------------------------------
-subroutine get_plummer_prec_perf(npart_target,iprofile)
+subroutine get_accNperf(npart_target,iprofile)
  use dim,         only:maxp
- use deriv,       only:get_derivs_global
+ use deriv,       only:get_derivs_global,get_density_global
  use eos,         only:gamma,polyk
  use mpiutils,    only:reduceall_mpi
  use options,     only:ieos,alpha,alphau,alphaB,tolh
- use part,        only:init_part,npart,xyzh,fxyzu,hfact,&
+ use part,        only:init_part,npart,xyzh,vxyzu,fxyzu,hfact,&
                        npartoftype,massoftype,istar,maxphase,iphase,isetphase,rhoh
  use setup_params,only:npart_total
  use testutils,   only:checkval,update_test_scores
- use setplummer,  only:get_accel_profile,profile_label,radius_from_mass,density_profile
+ use setplummer,  only:radius_from_mass,density_profile,iprofile_plummer
  use spherical,   only:set_sphere,iseed_mc
  use random,      only:ran2
- use kdtree,      only:tree_accuracy
+ use kdtree,      only:tree_accuracy,maxlevel,maxlevel_indexed
  use kernel,      only:hfact_default
  use table_utils, only:linspace
  use mpidomain,   only:i_belong
  use io,          only:id,master,iverbose
- use neighkdtree, only:use_dualtree
+ use neighkdtree, only:use_dualtree,build_tree
  use timing,      only:get_timings
  use sortutils,   only:indexx
  integer, intent(in) :: iprofile,npart_target
- integer :: i,it,itest
- integer, parameter :: niter=10
- real, allocatable :: fxyz_dir(:,:),err_rel(:)
- integer, allocatable :: erridx(:)
- real :: rsoft,mass_total,cut_fraction,rmin,rmax,psep,theta_crit
  character(len=64) :: label,filename_max,type
- integer, parameter :: ntab = 1000
- real :: rgrid(ntab),rhotab(ntab)
- real :: maxerr(3,niter+1),minerr(3,niter+1),meanerr(3,niter+1)
- integer :: iunit
+ integer :: i,it,itest
+ real,    allocatable :: fxyz_dir(:,:),err_rel(:)
+ integer, allocatable :: erridx(:)
+ integer, parameter   :: niter=10
+ integer, parameter   :: ntab = 1000
+ integer, parameter   :: npercentile=8
+ real :: rsoft,mass_total,cut_fraction,rmin,rmax,psep,theta_crit
  real(kind=4) :: t1,t2,tcpu1,tcpu2,timings(3,niter+1)
+ real :: rgrid(ntab),rhotab(ntab)
+ real :: error_array(2,npercentile+1,niter+1)
+ real :: percentiles(npercentile) ! percentile+rms
+ integer :: iunit,iper
 
- label = profile_label(iprofile)
+ if (iprofile == iprofile_plummer) then
+    label = "plummer"
+ else
+    label = "homo"
+ endif
 
- write(filename_max,'("data_plot_plummer_sphere_",i8.8,".ev")') npart_target
+ percentiles = (/0.01,0.1,0.5,0.9,0.99,0.999,0.9999,1./)
+
+ write(filename_max,'("data_plot_",a,"_",i8.8,".ev")') trim(label),npart_target
  filename_max = adjustl(filename_max)
 
  open(newunit=iunit,file=trim(filename_max),action='write',status='replace')
- write(iunit,"(a)") '# \theta, emax_SFMM, emax_FMM, emin_SFMM, emin_FMM, &
- &tcpu_SFMM, tcpu_FMM, tcpu_direct'
+ write(iunit,"(a)") '# \theta,errors_SFMM_FMM,Wtime_SFMM, Wtime_FMM, Wtime_direct'
 
  call init_part()
  hfact = hfact_default
@@ -949,11 +957,13 @@ subroutine get_plummer_prec_perf(npart_target,iprofile)
  tolh = 1.e-5
  rsoft = 1.0
  mass_total = 1.0
+ iverbose = 1
+ iseed_mc = 1
 
  ! construct tables for radius and density
  cut_fraction = 0.999
  rmin = 0.
- rmax = radius_from_mass(iprofile,cut_fraction,rsoft)
+ rmax = radius_from_mass(iprofile_plummer,cut_fraction,rsoft)
  call linspace(rgrid,0.,rmax)
 
  do i=1,ntab
@@ -961,16 +971,16 @@ subroutine get_plummer_prec_perf(npart_target,iprofile)
  enddo
 
  psep = rmax/real(ntab) ! this is not used for random placement anyway
- iverbose = 1
-
- iseed_mc = 1
  npart = 0
  npart_total = 0
 
- call set_sphere('random',id,master,rmin,rmax,psep,hfact,npart, &
+ if (iprofile == 3) then
+    call set_sphere('random',id,master,rmin,rmax,psep,hfact,npart,xyzh,npart_total,np_requested=npart_target)
+ else
+    call set_sphere('random',id,master,rmin,rmax,psep,hfact,npart, &
                   xyzh,npart_total,rhotab=rhotab,rtab=rgrid,exactN=.true.,&
                   np_requested=npart_target,mask=i_belong,verbose=.false.)
- !call set_sphere('random',id,master,rmin,rmax,psep,hfact,npart,xyzh,npart_total,np_requested=npart_target)
+ endif
 
  massoftype(istar) = mass_total/real(npart_total)
  npartoftype(istar) = npart
@@ -983,7 +993,8 @@ subroutine get_plummer_prec_perf(npart_target,iprofile)
  allocate(err_rel(npart))
  allocate(erridx(npart))
 
- call get_derivs_global(icall=1)
+ call get_density_global(icall=1)
+ print*,"tree parameters (maxlevel,maxlevel_indexed,build_time): ",maxlevel,maxlevel_indexed
 
  tree_acc: do it=0,niter
     theta_crit = 0.1 + it*0.05
@@ -1003,36 +1014,39 @@ subroutine get_plummer_prec_perf(npart_target,iprofile)
        endif
 
        if (itest==3 .and. it>0) cycle
+       call build_tree(npart,npart,xyzh,vxyzu)
        call get_timings(t1,tcpu1)
        call get_derivs_global(icall=2)
        call get_timings(t2,tcpu2)
 
-       if (itest==3) fxyz_dir = fxyzu(0:3,1:npart)
+       if (itest==3) then
+          fxyz_dir = fxyzu(1:3,1:npart)
+          timings(itest,1:niter+1) = tcpu2-tcpu1
+          cycle
+       endif
 
        err_rel = norm2(fxyzu(1:3,1:npart)-fxyz_dir,1)/norm2(fxyz_dir,1)
        call indexx(npart, err_rel, erridx)
 
-       maxerr(itest,it+1)  = maxval(err_rel)
-       minerr(itest,it+1)  = err_rel(erridx(npart/10))
-       meanerr(itest,it+1) = sum(err_rel)/npart
+       do iper=1,npercentile
+          error_array(itest,iper,it+1)  = err_rel(erridx(int(npart*percentiles(iper))))
+       enddo
+       error_array(itest,npercentile+1,it+1)  = sqrt(sum(err_rel**2)/npart)
 
-       if (itest==3) then
-          timings(itest,1:niter+1) = tcpu2-tcpu1
-       else
-          timings(itest,it+1) = tcpu2-tcpu1
-       endif
+       timings(itest,it+1) = tcpu2-tcpu1
+
     enddo
  enddo tree_acc
 
  do it=0,niter
-    write(iunit,*) 0.1 + it*0.05, maxerr(1:2,it+1), minerr(1:2,it+1), meanerr(1:2,it+1), timings(1:3,it+1)
+    write(iunit,*) 0.1 + it*0.05, error_array(1:2,1:npercentile+1,it+1), timings(1:3,it+1)
  enddo
 
  close(iunit)
 
  use_dualtree = .true.
 
-end subroutine get_plummer_prec_perf
+end subroutine get_accNperf
 
 !-----------------------------------------------------------------------
 !+
