@@ -966,7 +966,7 @@ subroutine get_accNperf(npart_target,iprofile)
  rsoft = 1.0
  mass_total = 1.0
  iverbose = 1
- iseed_mc = 111
+ iseed_mc = -111
 
  ! construct tables for radius and density
  cut_fraction = 0.999
