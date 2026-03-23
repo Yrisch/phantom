@@ -567,7 +567,7 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
  integer :: iaxis
  real    :: xpivot
 #ifdef GRAVITY
- real    :: quads(6)
+ real    :: quads(9)
 #endif
  real    :: pmassi
 
@@ -688,7 +688,7 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
  if (totmass_node<=0.) call fatal('mtree','totmass_node==0',val=totmass_node)
 
 !--for gravity, we need the centre of the node to be the centre of mass
- x0(:) = xyzcofm(:)
+ x0(:) = (xmaxi+xmini)*0.5
  r2max = 0.
 #ifdef GRAVITY
  quads(:) = 0.
@@ -704,29 +704,34 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
     !$omp shared(npnode,treecache,x0,i1,maxp) &
     !$omp shared(massoftype,sinktree,maxphase,maxpsph,inodeparts) &
     !$omp shared(xyzmh_ptmass,aprmassoftype) &
-    !$omp private(i,xi,yi,zi,dx,dy,dz,dr2) &
+    !$omp private(i,xi,yi,zi,hi,dx,dy,dz,dr2) &
     !$omp firstprivate(pmassi) &
 #ifdef GRAVITY
     !$omp reduction(+:quads) &
 #endif
-    !$omp reduction(max:r2max)
+    !$omp reduction(max:r2max,hmax)
     do i=i1,i1+npnode-1
        xi = treecache(1,i)
        yi = treecache(2,i)
        zi = treecache(3,i)
+       hi = treecache(4,i)
        dx    = xi - x0(1)
        dy    = yi - x0(2)
        dz    = zi - x0(3)
        dr2   = dx*dx + dy*dy + dz*dz
        r2max = max(r2max,dr2)
+       hmax  = max(hmax,hi)
 #ifdef GRAVITY
        pmassi = treecache(5,i)
-       quads(1) = quads(1) + pmassi*(dx*dx)  ! Q_xx
-       quads(2) = quads(2) + pmassi*(dx*dy)  ! Q_xy = Q_yx
-       quads(3) = quads(3) + pmassi*(dx*dz)  ! Q_xz = Q_zx
-       quads(4) = quads(4) + pmassi*(dy*dy)  ! Q_yy
-       quads(5) = quads(5) + pmassi*(dy*dz)  ! Q_yz = Q_zy
-       quads(6) = quads(6) + pmassi*(dz*dz)  ! Q_zz
+       quads(1) = quads(1) + pmassi*dx  ! Q_x
+       quads(2) = quads(2) + pmassi*dy  ! Q_y
+       quads(3) = quads(3) + pmassi*dz  ! Q_z
+       quads(4) = quads(4) + pmassi*(dx*dx)  ! Q_xx
+       quads(5) = quads(5) + pmassi*(dx*dy)  ! Q_xy = Q_yx
+       quads(6) = quads(6) + pmassi*(dx*dz)  ! Q_xz = Q_zx
+       quads(7) = quads(7) + pmassi*(dy*dy)  ! Q_yy
+       quads(8) = quads(8) + pmassi*(dy*dz)  ! Q_yz = Q_zy
+       quads(9) = quads(9) + pmassi*(dz*dz)  ! Q_zz
 #endif
     enddo
     !$omp end parallel do
@@ -735,19 +740,24 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
        xi = treecache(1,i)
        yi = treecache(2,i)
        zi = treecache(3,i)
+       hi = treecache(4,i)
        dx    = xi - x0(1)
        dy    = yi - x0(2)
        dz    = zi - x0(3)
        dr2   = dx*dx + dy*dy + dz*dz
        r2max = max(r2max,dr2)
+       hmax = max(hmax,hi)
 #ifdef GRAVITY
        pmassi = treecache(5,i)
-       quads(1) = quads(1) + pmassi*(dx*dx)  ! Q_xx
-       quads(2) = quads(2) + pmassi*(dx*dy)  ! Q_xy = Q_yx
-       quads(3) = quads(3) + pmassi*(dx*dz)  ! Q_xz = Q_zx
-       quads(4) = quads(4) + pmassi*(dy*dy)  ! Q_yy
-       quads(5) = quads(5) + pmassi*(dy*dz)  ! Q_yz = Q_zy
-       quads(6) = quads(6) + pmassi*(dz*dz)  ! Q_zz
+       quads(1) = quads(1) + pmassi*dx  ! Q_x
+       quads(2) = quads(2) + pmassi*dy  ! Q_y
+       quads(3) = quads(3) + pmassi*dz  ! Q_z
+       quads(4) = quads(4) + pmassi*(dx*dx)  ! Q_xx
+       quads(5) = quads(5) + pmassi*(dx*dy)  ! Q_xy = Q_yx
+       quads(6) = quads(6) + pmassi*(dx*dz)  ! Q_xz = Q_zx
+       quads(7) = quads(7) + pmassi*(dy*dy)  ! Q_yy
+       quads(8) = quads(8) + pmassi*(dy*dz)  ! Q_yz = Q_zy
+       quads(9) = quads(9) + pmassi*(dz*dz)  ! Q_zz
 #endif
     enddo
  endif
@@ -813,7 +823,7 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
     endif
  else ! split this node and add children to stack
     iaxis  = maxloc(xmaxi - xmini,1)     ! split along longest axis
-    xpivot = (xmaxi(iaxis) + xmini(iaxis))*0.5 ! split middle longest axis
+    xpivot = x0(iaxis)!xyzcofm(iaxis)!  ! split middle longest axis
     if (maxlevel > maxdepth) call fatal('maketree','maximum tree depth reached !!')
     ! create two children nodes and point to them from current node
     ! always use G&R indexing for global tree
@@ -1245,7 +1255,7 @@ subroutine getneigh(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzcachesi
  logical :: open_tree_node
  logical :: global_walk
 #ifdef GRAVITY
- real :: quads(6)
+ real :: quads(9)
  real :: dr,totmass_node
 #endif
  tree_acc2 = tree_accuracy*tree_accuracy
@@ -1451,7 +1461,7 @@ subroutine getneigh_dual(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzca
     cached = .true.
     tobecached=1
 #endif
-    call get_sep(node(branch(i-1))%xcen,node(iparent)%xcen,dx,dy,dz,xoffset,yoffset,zoffset)
+    call get_sep(node(iparent)%xcen,node(branch(i-1))%xcen,dx,dy,dz,xoffset,yoffset,zoffset)
     fnode = fnode_acc + fnode_branch(:,i)
     call propagate_fnode_to_node(fnode_acc,fnode,dx,dy,dz)
  enddo
@@ -1477,9 +1487,9 @@ pure subroutine get_sep(x1,x2,dx,dy,dz,xoffset,yoffset,zoffset,r2)
  yoffset = 0.
  zoffset = 0.
 
- dx = x1(1) - x2(1)
- dy = x1(2) - x2(2)
- dz = x1(3) - x2(3)
+ dx = x2(1) - x1(1)
+ dy = x2(2) - x1(2)
+ dz = x2(3) - x1(3)
 
 #ifdef PERIODIC
  if (abs(dx) > hdlx) then ! mod distances across boundary if periodic BCs
@@ -1553,9 +1563,15 @@ pure subroutine propagate_fnode_to_node(fnode,fnode_sup,dx,dy,dz)
  fnode(17) = fnode_sup(17)
  fnode(18) = fnode_sup(18)
  fnode(19) = fnode_sup(19)
- fnode(20) = fnode_sup(20) + dx*(fnode_sup(1)+0.5*(dx*fnode_sup(4)+dy*fnode_sup(5)+dz*fnode_sup(6)))&
-                           + dy*(fnode_sup(2)+0.5*(dx*fnode_sup(5)+dy*fnode_sup(7)+dz*fnode_sup(8)))&
-                           + dz*(fnode_sup(3)+0.5*(dx*fnode_sup(6)+dy*fnode_sup(8)+dz*fnode_sup(9)))
+ fnode(20) = fnode_sup(20) + dx*(fnode_sup(1)+0.5*(dx*(fnode_sup(4)+(1./3.)*(dx*fnode_sup(10)+dy*fnode_sup(11)+dz*fnode_sup(12)))+&
+                                                   dy*(fnode_sup(5)+(1./3.)*(dx*fnode_sup(11)+dy*fnode_sup(13)+dz*fnode_sup(14)))+&
+                                                   dz*(fnode_sup(6)+(1./3.)*(dx*fnode_sup(12)+dy*fnode_sup(14)+dz*fnode_sup(15)))))&
+                           + dy*(fnode_sup(2)+0.5*(dx*(fnode_sup(5)+(1./3.)*(dx*fnode_sup(11)+dy*fnode_sup(13)+dz*fnode_sup(14)))+&
+                                                   dy*(fnode_sup(7)+(1./3.)*(dx*fnode_sup(13)+dy*fnode_sup(16)+dz*fnode_sup(17)))+&
+                                                   dz*(fnode_sup(8)+(1./3.)*(dx*fnode_sup(14)+dy*fnode_sup(17)+dz*fnode_sup(18)))))&
+                           + dz*(fnode_sup(3)+0.5*(dx*(fnode_sup(6)+(1./3.)*(dx*fnode_sup(12)+dy*fnode_sup(14)+dz*fnode_sup(15)))+&
+                                                   dy*(fnode_sup(8)+(1./3.)*(dx*fnode_sup(14)+dy*fnode_sup(17)+dz*fnode_sup(18)))+&
+                                                   dz*(fnode_sup(9)+(1./3.)*(dx*fnode_sup(15)+dy*fnode_sup(18)+dz*fnode_sup(19)))))
 
 end subroutine propagate_fnode_to_node
 
@@ -1658,7 +1674,7 @@ subroutine node_interaction(node_dst,node_src,tree_acc2,fnode,stackit,xoffset,yo
  logical,      intent(out)   :: stackit
  real    :: dx,dy,dz,r2,dr1
  real    :: rcut_dst,rcut_src,rcut,rcut2
- real    :: size_dst,size_src,mass_src,quads_src(6)
+ real    :: size_dst,size_src,mass_src,quads_src(9)
  logical :: wellsep,cached
 
  call get_sep(node_dst%xcen,node_src%xcen,dx,dy,dz,xoffset,yoffset,zoffset,r2)
@@ -1701,9 +1717,9 @@ end subroutine node_interaction
 !-----------------------------------------------------------
 pure subroutine compute_M2L(dx,dy,dz,dr1,q0,quads,fnode)
  real, intent(in)    :: dx,dy,dz,dr1,q0
- real, intent(in)    :: quads(6)
+ real, intent(in)    :: quads(9)
  real, intent(inout) :: fnode(lenfgrav)
- real :: qxx,qxy,qxz,qyy,qyz,qzz,dx2,dx3,dy2,dy3,dz2,dz3
+ real :: qx,qy,qz,qxx,qxy,qxz,qyy,qyz,qzz,dx2,dx3,dy2,dy3,dz2,dz3
  real :: dr12,D3(10),D2(6),D1(3),g0,g1,g2,g3,g2dx,g2dy,g2dz
 
 ! note: dr == 1/sqrt(r2)
@@ -1716,8 +1732,8 @@ pure subroutine compute_M2L(dx,dy,dz,dr1,q0,quads,fnode)
  dz3  = dz*dz2
  ! be careful with the sign of your Green's function, it can mess up everything.
  ! We switched multiple signs here to match the Phantom sign convention
- g0   = - dr1
- g1   =  1.*dr12*g0
+ g0   =  dr1
+ g1   = -1.*dr12*g0
  g2   = -3.*dr12*g1
  g3   = -5.*dr12*g2
  g2dx = g2 * dx
@@ -1747,25 +1763,28 @@ pure subroutine compute_M2L(dx,dy,dz,dr1,q0,quads,fnode)
  D1(2)  = g1*dy
  D1(3)  = g1*dz
 
- qxx = quads(1)
- qxy = quads(2)
- qxz = quads(3)
- qyy = quads(4)
- qyz = quads(5)
- qzz = quads(6)
+ qx  = quads(1)
+ qy  = quads(2)
+ qz  = quads(3)
+ qxx = quads(4)
+ qxy = quads(5)
+ qxz = quads(6)
+ qyy = quads(7)
+ qyz = quads(8)
+ qzz = quads(9)
 
- fnode(1)  = fnode(1)  + (D1(1)*q0  +&
+ fnode(1)  = fnode(1)  + (D1(1)*q0  + D2(1)*qx + D2(2)*qy + D2(3)*qz +&
                      0.5*(D3(1)*qxx + 2.*(D3(2)*qxy + D3(3)*qxz + D3(5)*qyz) + D3(4)*qyy + D3(6)*qzz ))    ! C¹_x
- fnode(2)  = fnode(2)  + (D1(2)*q0  +&
+ fnode(2)  = fnode(2)  + (D1(2)*q0  + D2(2)*qx + D2(4)*qy + D2(5)*qz +&
                      0.5*(D3(2)*qxx + 2.*(D3(4)*qxy + D3(5)*qxz + D3(8)*qyz) + D3(7)*qyy + D3(9)*qzz ))    ! C¹_y
- fnode(3)  = fnode(3)  + (D1(3)*q0  +&
+ fnode(3)  = fnode(3)  + (D1(3)*q0  + D2(3)*qx + D2(5)*qy + D2(6)*qz +&
                      0.5*(D3(3)*qxx + 2.*(D3(5)*qxy + D3(6)*qxz + D3(9)*qyz) + D3(8)*qyy + D3(10)*qzz))   ! C¹_z
- fnode(4)  = fnode(4)  + D2(1) * q0    ! C²_xx
- fnode(5)  = fnode(5)  + D2(2) * q0    ! C²_xy
- fnode(6)  = fnode(6)  + D2(3) * q0    ! C²_xz
- fnode(7)  = fnode(7)  + D2(4) * q0    ! C²_yy
- fnode(8)  = fnode(8)  + D2(5) * q0    ! C²_yz
- fnode(9)  = fnode(9)  + D2(6) * q0    ! C²_zz
+ fnode(4)  = fnode(4)  - (D2(1) * q0 + D3(1)*qx + D3(2)*qy + D3(3)*qz)  ! C²_xx
+ fnode(5)  = fnode(5)  - (D2(2) * q0 + D3(2)*qx + D3(4)*qy + D3(5)*qz)! C²_xy
+ fnode(6)  = fnode(6)  - (D2(3) * q0 + D3(3)*qx + D3(5)*qy + D3(6)*qz)! C²_xz
+ fnode(7)  = fnode(7)  - (D2(4) * q0 + D3(4)*qx + D3(7)*qy + D3(8)*qz)! C²_yy
+ fnode(8)  = fnode(8)  - (D2(5) * q0 + D3(5)*qx + D3(8)*qy + D3(9)*qz)! C²_yz
+ fnode(9)  = fnode(9)  - (D2(6) * q0 + D3(6)*qx + D3(9)*qy + D3(10)*qz)! C²_zz
  fnode(10) = fnode(10) + D3(1) * q0    ! C³_xxx
  fnode(11) = fnode(11) + D3(2) * q0    ! C³_xxy
  fnode(12) = fnode(12) + D3(3) * q0    ! C³_xxz
@@ -1776,7 +1795,8 @@ pure subroutine compute_M2L(dx,dy,dz,dr1,q0,quads,fnode)
  fnode(17) = fnode(17) + D3(8) * q0    ! C³_yyz
  fnode(18) = fnode(18) + D3(9) * q0    ! C³_yzz
  fnode(19) = fnode(19) + D3(10)* q0    ! C³_zzz
- fnode(20) = fnode(20) + g0*q0 - 0.5*(D2(1)*qxx + D2(4)*qyy + D2(6)*qzz + 2*(D2(2)*qxy + D2(3)*qxz + D2(5)*qyz))! C⁰ (potential)
+ fnode(20) = fnode(20) + g0*q0 + (D1(1)*qx + D1(2)*qy + D1(3)*qz)  + &
+                         0.5*(D2(1)*qxx + D2(4)*qyy + D2(6)*qzz + 2*(D2(2)*qxy + D2(3)*qxz + D2(5)*qyz))! C⁰ (potential)
 
 end subroutine compute_M2L
 
@@ -1824,18 +1844,19 @@ pure subroutine expand_fgrav_in_taylor_series(fnode,dx,dy,dz,fxi,fyi,fzi,poti)
  d2fzzz = fnode(19)
  poti = fnode(20)
 
- fxi = fxi + dx*(dfxx + 0.5*(dx*d2fxxx + dy*d2fxxy + dz*d2fxxz)) &
-           + dy*(dfxy + 0.5*(dx*d2fxxy + dy*d2fxyy + dz*d2fxyz)) &
-           + dz*(dfxz + 0.5*(dx*d2fxxz + dy*d2fxyz + dz*d2fxzz))
- fyi = fyi + dx*(dfxy + 0.5*(dx*d2fxxy + dy*d2fxyy + dz*d2fxyz)) &
-           + dy*(dfyy + 0.5*(dx*d2fxyy + dy*d2fyyy + dz*d2fyyz)) &
-           + dz*(dfyz + 0.5*(dx*d2fxyz + dy*d2fyyz + dz*d2fyzz))
- fzi = fzi + dx*(dfxz + 0.5*(dx*d2fxxz + dy*d2fxyz + dz*d2fxzz)) &
-           + dy*(dfyz + 0.5*(dx*d2fxyz + dy*d2fyyz + dz*d2fyzz)) &
-           + dz*(dfzz + 0.5*(dx*d2fxzz + dy*d2fyzz + dz*d2fzzz))
- poti = poti - (dx*(fxi - 0.5*(dx*dfxx + dy*dfxy + dz*dfxy)) + &
-                dy*(fyi - 0.5*(dx*dfxy + dy*dfyy + dz*dfyz)) + &
-                dz*(fzi - 0.5*(dx*dfxz + dy*dfyz + dz*dfzz)))
+ fxi = fxi   + dx*(dfxx + 0.5*(dx*d2fxxx + dy*d2fxxy + dz*d2fxxz)) &
+             + dy*(dfxy + 0.5*(dx*d2fxxy + dy*d2fxyy + dz*d2fxyz)) &
+             + dz*(dfxz + 0.5*(dx*d2fxxz + dy*d2fxyz + dz*d2fxzz))
+ fyi = fyi   + dx*(dfxy + 0.5*(dx*d2fxxy + dy*d2fxyy + dz*d2fxyz)) &
+             + dy*(dfyy + 0.5*(dx*d2fxyy + dy*d2fyyy + dz*d2fyyz)) &
+             + dz*(dfyz + 0.5*(dx*d2fxyz + dy*d2fyyz + dz*d2fyzz))
+ fzi = fzi   + dx*(dfxz + 0.5*(dx*d2fxxz + dy*d2fxyz + dz*d2fxzz)) &
+             + dy*(dfyz + 0.5*(dx*d2fxyz + dy*d2fyyz + dz*d2fyzz)) &
+             + dz*(dfzz + 0.5*(dx*d2fxzz + dy*d2fyzz + dz*d2fzzz))
+ ! Minus sign here as we are shifted of 1 in the (-1)^k compared to force
+ poti = poti - dx*(fxi - 0.5*(dx*dfxx + dy*dfxy + dz*dfxy)) &
+             - dy*(fyi - 0.5*(dx*dfxy + dy*dfyy + dz*dfyz)) &
+             - dz*(fzi - 0.5*(dx*dfxz + dy*dfyz + dz*dfzz))
 
 end subroutine expand_fgrav_in_taylor_series
 
@@ -1861,7 +1882,7 @@ subroutine revtree(node, xyzh, leaf_is_active, ncells)
  real :: xi, yi, zi, hi
  real :: dx, dy, dz, dr2
 #ifdef GRAVITY
- real :: quads(6)
+ real :: quads(9)
 #endif
  integer :: inode, ipart, ipartidx, i, nptot
  real :: pmassi, totmass

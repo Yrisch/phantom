@@ -30,7 +30,7 @@ module dtypekdtree
                     + 4 &    ! parent
                     + 4 &    ! idum
 #ifdef GRAVITY
-                    + 8*6 &  ! quads(6)
+                    + 8*9 &  ! quads(9)
                     + 4 &    ! tobecached
                     + 4 &    ! cached
 #endif
@@ -63,7 +63,7 @@ module dtypekdtree
 #ifdef GRAVITY
     integer :: tobecached
     logical :: cached
-    real    :: quads(6)
+    real    :: quads(9)
 #endif
  end type kdnode
 

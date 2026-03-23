@@ -101,7 +101,7 @@ subroutine test_taylorseries(ntests,npass)
  integer :: nfailed(18),i,npnode
  real :: xposi(3),xposj(3),x0(3),dx(3),fexact(3),f0(3)
  real :: xposjd(3,3)
- real :: fnode(20),quads(6)
+ real :: fnode(20),quads(9)
  real :: dr,dr2,phi,phiexact,pmassi,totmass
 
  if (id==master) write(*,"(/,a)") '--> testing taylor series expansion about current node'
@@ -114,13 +114,15 @@ subroutine test_taylorseries(ntests,npass)
  fexact = -totmass*dr**3*dx   ! exact force between i and j
  phiexact = -totmass*dr       ! exact potential between i and j
 
- call get_dx_dr(x0,xposj,dx,dr)
+ call get_dx_dr(xposj,x0,dx,dr)
  fnode = 0.
  quads = 0.
  call compute_M2L(dx(1),dx(2),dx(3),dr,totmass,quads,fnode)
 
  dx = xposi - x0   ! perform expansion about x0
  call expand_fgrav_in_taylor_series(fnode,dx(1),dx(2),dx(3),f0(1),f0(2),f0(3),phi)
+ f0 = -f0  ! inverse the sign as g(r) = 1/r
+ phi = -phi
  !print*,'           exact force = ',fexact,' phi = ',phiexact
  !print*,'       force at origin = ',fnode(1:3), ' phi = ',fnode(20)
  !print*,'force w. taylor series = ',f0, ' phi = ',phi
@@ -149,12 +151,15 @@ subroutine test_taylorseries(ntests,npass)
  do i=1,npnode
     dx(:) = xposjd(:,i) - xposj
     dr2   = dot_product(dx,dx)
-    quads(1) = quads(1) + pmassi*(dx(1)*dx(1))
-    quads(2) = quads(2) + pmassi*(dx(1)*dx(2))
-    quads(3) = quads(3) + pmassi*(dx(1)*dx(3))
-    quads(4) = quads(4) + pmassi*(dx(2)*dx(2))
-    quads(5) = quads(5) + pmassi*(dx(2)*dx(3))
-    quads(6) = quads(6) + pmassi*(dx(3)*dx(3))
+    quads(1) = quads(1) + pmassi*dx(1)
+    quads(2) = quads(2) + pmassi*dx(2)
+    quads(3) = quads(3) + pmassi*dx(3)
+    quads(4) = quads(4) + pmassi*(dx(1)*dx(1))
+    quads(5) = quads(5) + pmassi*(dx(1)*dx(2))
+    quads(6) = quads(6) + pmassi*(dx(1)*dx(3))
+    quads(7) = quads(7) + pmassi*(dx(2)*dx(2))
+    quads(8) = quads(8) + pmassi*(dx(2)*dx(3))
+    quads(9) = quads(9) + pmassi*(dx(3)*dx(3))
  enddo
 
  x0 = 0.      ! position of nearest node centre
@@ -170,12 +175,14 @@ subroutine test_taylorseries(ntests,npass)
  fexact = fexact*pmassi
  phiexact = phiexact*pmassi
 
- call get_dx_dr(x0,xposj,dx,dr)
+ call get_dx_dr(xposj,x0,dx,dr)
  fnode = 0.
  call compute_M2L(dx(1),dx(2),dx(3),dr,totmass,quads,fnode)
 
  dx = xposi - x0   ! perform expansion about x0
  call expand_fgrav_in_taylor_series(fnode,dx(1),dx(2),dx(3),f0(1),f0(2),f0(3),phi)
+ f0 = -f0 ! inverse the sign as g(r) = 1/r
+ phi = -phi
  !print*,'           exact force = ',fexact,' phi = ',phiexact
  !print*,'       force at origin = ',fnode(1:3), ' phi = ',fnode(20)
  !print*,'force w. taylor series = ',f0, ' phi = ',phi
@@ -200,13 +207,14 @@ subroutine test_taylorseries(ntests,npass)
  fexact = fexact*pmassi
  phiexact = phiexact*pmassi
 
- dx = x0 - xposj
- dr = 1./sqrt(dot_product(dx,dx))  ! compute approx force between node and j
+ call get_dx_dr(xposj,x0,dx,dr)
  fnode = 0.
  call compute_M2L(dx(1),dx(2),dx(3),dr,totmass,quads,fnode)
 
  dx = xposi - x0   ! perform expansion about x0
  call expand_fgrav_in_taylor_series(fnode,dx(1),dx(2),dx(3),f0(1),f0(2),f0(3),phi)
+ f0 = -f0 ! inverse the sign as g(r) = 1/r
+ phi = -phi
  !print*,'           exact force = ',fexact,' phi = ',phiexact
  !print*,'       force at origin = ',fnode(1:3), ' phi = ',fnode(20)
  !print*,'force w. taylor series = ',f0, ' phi = ',phi
@@ -1021,7 +1029,7 @@ subroutine get_accNperf(npart_target,iprofile)
 
        if (itest==3) then
           fxyz_dir = fxyzu(1:3,1:npart)
-          timings(itest,1:niter+1) = tcpu2-tcpu1
+          timings(itest,1:niter+1) = t2-t1
           cycle
        endif
 
