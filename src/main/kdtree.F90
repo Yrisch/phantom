@@ -43,9 +43,10 @@ module kdtree
 !
 !--runtime options for this module
 !
- real,    public  :: tree_accuracy = 0.5
+ real,    public  :: tree_accuracy    = 0.5
  logical, private :: done_init_kdtree = .false.
- logical, private :: already_warned = .false.
+ logical, private :: already_warned   = .false.
+ logical, private :: use_octree     = .true.
  integer, private :: numthreads
 
 ! Index of the last node in the local tree that has been copied to
@@ -214,11 +215,11 @@ subroutine maketree(node, xyzh, np, leaf_is_active, ncells, apr_tree, refineleve
     if (sinktree) then
        call construct_node(node(nnode), nnode, mymum, level, xmini, xmaxi, npnode, .true., &  ! construct in parallel
                            il, ir, nl, nr, xminl, xmaxl, xminr, xmaxr, ncells, leaf_is_active, &
-                           minlevel, maxlevel, wassplit, .false.,apr_tree,xyzmh_ptmass)
+                           minlevel, maxlevel, wassplit, .false., apr_tree, xyzmh_ptmass)
     else
        call construct_node(node(nnode), nnode, mymum, level, xmini, xmaxi, npnode, .true., &  ! construct in parallel
                            il, ir, nl, nr, xminl, xmaxl, xminr, xmaxr, ncells, leaf_is_active, &
-                           minlevel, maxlevel, wassplit, .false.,apr_tree)
+                           minlevel, maxlevel, wassplit, .false., apr_tree)
     endif
 
     if (wassplit) then ! add children to back of queue
@@ -270,11 +271,11 @@ subroutine maketree(node, xyzh, np, leaf_is_active, ncells, apr_tree, refineleve
           if (sinktree) then
              call construct_node(node(nnode), nnode, mymum, level, xmini, xmaxi, npnode, .false., &  ! don't construct in parallel
                                  il, ir, nl, nr, xminl, xmaxl, xminr, xmaxr, ncells, leaf_is_active, &
-                                 minlevel, maxlevel, wassplit, .false.,apr_tree,xyzmh_ptmass)
+                                 minlevel, maxlevel, wassplit, .false., apr_tree, xyzmh_ptmass)
           else
              call construct_node(node(nnode), nnode, mymum, level, xmini, xmaxi, npnode, .false., &  ! don't construct in parallel
                                  il, ir, nl, nr, xminl, xmaxl, xminr, xmaxr, ncells, leaf_is_active, &
-                                 minlevel, maxlevel, wassplit, .false.,apr_tree)
+                                 minlevel, maxlevel, wassplit, .false., apr_tree)
           endif
 
           if (wassplit) then ! add children to top of stack
@@ -298,6 +299,9 @@ subroutine maketree(node, xyzh, np, leaf_is_active, ncells, apr_tree, refineleve
  if (maxlevel < maxlevel_indexed) then
     ncells = 2**(maxlevel+1) - 1
  endif
+ !-- if octree is used, we need to propagate information from leaf to root (hmax and quads)
+ if (use_octree) call propagate_upward(int(ncells), node)
+
  if (maxlevel > maxlevel_indexed .and. .not.already_warned) then
     write(string,"(i10)") 2**(maxlevel-maxlevel_indexed)
     if (iverbose > 0) call warning('maketree','maxlevel > max_indexed: will run faster if recompiled with '// &
@@ -360,7 +364,7 @@ subroutine construct_root_node(np,nproot,irootnode,xmini,xmaxi,leaf_is_active,xy
  real,    intent(inout), optional :: xyzmh_ptmass(:,:)
  integer, intent(in),    optional :: nptmass
  integer :: i,ncross
- real    :: xminpart,yminpart,zminpart,xmaxpart,ymaxpart,zmaxpart
+ real    :: xminpart,yminpart,zminpart,xmaxpart,ymaxpart,zmaxpart,extent
  real    :: xi, yi, zi
 
  xminpart = xyzh(1,1)
@@ -478,12 +482,23 @@ subroutine construct_root_node(np,nproot,irootnode,xmini,xmaxi,leaf_is_active,xy
     inoderange(:,irootnode) = 0
  endif
 
- xmini(1) = xminpart
- xmini(2) = yminpart
- xmini(3) = zminpart
- xmaxi(1) = xmaxpart
- xmaxi(2) = ymaxpart
- xmaxi(3) = zmaxpart
+ if (use_octree) then
+    extent = max(xmaxpart, abs(xminpart), ymaxpart, abs(yminpart), zmaxpart, abs(zminpart))
+    xmini(1) = -extent
+    xmini(2) = -extent
+    xmini(3) = -extent
+    xmaxi(1) = extent
+    xmaxi(2) = extent
+    xmaxi(3) = extent
+ else
+    xmini(1) = xminpart
+    xmini(2) = yminpart
+    xmini(3) = zminpart
+    xmaxi(1) = xmaxpart
+    xmaxi(2) = ymaxpart
+    xmaxi(3) = zmaxpart
+ endif
+
 
 end subroutine construct_root_node
 
@@ -520,6 +535,227 @@ pure subroutine pop_off_stack(stackentry, istack, nnode, mymum, level, npnode, x
 
 end subroutine pop_off_stack
 
+subroutine compute_nodes_cofm(npnode,nnode,xyzcofm,totmass_node,doparallel)
+ use dim,       only:maxtypes
+ use part,      only:massoftype,igas,npartoftype
+ integer, intent(in)  :: npnode,nnode
+ real,    intent(out) :: xyzcofm(3),totmass_node
+ logical, intent(in)  :: doparallel
+ real    :: pmassi,fac,dfac
+ real    :: xi,yi,zi,xcofm,ycofm,zcofm
+ integer :: i1,i
+!
+! to avoid round off error from repeated multiplication by pmassi (which is small)
+! we compute the centre of mass with a factor relative to gas particles
+! but only if gas particles are present
+!
+ pmassi = massoftype(igas)
+ fac    = 1.
+ totmass_node = 0.
+ if (pmassi > 0.) then
+    dfac = 1./pmassi
+ else
+    pmassi = massoftype(maxloc(npartoftype(2:maxtypes),1)+1)
+    if (pmassi > 0.) then
+       dfac = 1./pmassi
+    else
+       dfac = 1.
+    endif
+ endif
+
+ ! note that dfac can be a constant value across all particles even if APR is used
+ i1=inoderange(1,nnode)
+ xcofm = 0.
+ ycofm = 0.
+ zcofm = 0.
+
+ ! during initial queue build which is serial, we can parallelise this loop
+ if (npnode > 1000 .and. doparallel) then
+    !$omp parallel do schedule(static) default(none) &
+    !$omp shared(npnode,dfac) &
+    !$omp shared(treecache,i1) &
+    !$omp private(i,xi,yi,zi) &
+    !$omp firstprivate(pmassi,fac) &
+    !$omp reduction(+:xcofm,ycofm,zcofm,totmass_node)
+    do i=i1,i1+npnode-1
+       xi = treecache(1,i)
+       yi = treecache(2,i)
+       zi = treecache(3,i)
+       pmassi = treecache(5,i)
+       fac    = pmassi*dfac ! to avoid round-off error
+       totmass_node = totmass_node + pmassi
+       xcofm = xcofm + fac*xi
+       ycofm = ycofm + fac*yi
+       zcofm = zcofm + fac*zi
+    enddo
+    !$omp end parallel do
+ else
+    do i=i1,i1+npnode-1
+       xi = treecache(1,i)
+       yi = treecache(2,i)
+       zi = treecache(3,i)
+       pmassi = treecache(5,i)
+       fac    = pmassi*dfac ! to avoid round-off error
+       totmass_node = totmass_node + pmassi
+       xcofm = xcofm + fac*xi
+       ycofm = ycofm + fac*yi
+       zcofm = zcofm + fac*zi
+    enddo
+ endif
+
+ xyzcofm = (/xcofm,ycofm,zcofm/)
+
+ ! if there are no particles in this node, then the cofm will
+ ! remain at zero
+ if (totmass_node > 0.) then
+    xyzcofm(:)   = xyzcofm(:)/(totmass_node*dfac)
+ endif
+
+end subroutine compute_nodes_cofm
+
+subroutine set_nodes_properties(npnode,nnode,x0,totmass_node,mymum,nodeentry,xmini,xmaxi,&
+                                level,global_build,doparallel,comp_node)
+ use mpitree,   only:reduce_group
+ use dim,       only:mpi
+ type(kdnode),    intent(out)   :: nodeentry
+ integer,         intent(in)    :: npnode,mymum,level,nnode
+ real,            intent(inout) :: xmini(3), xmaxi(3), totmass_node
+ real,            intent(in)    :: x0(3)
+ logical,         intent(in)    :: doparallel,global_build,comp_node
+ real    :: pmassi
+ real    :: dx,dy,dz,dr2,xi,yi,zi,hi
+ real    :: hmax,r2max,totmass
+ integer :: i1,i
+#ifdef GRAVITY
+ real    :: quads(9)
+#endif
+
+ pmassi  = 0.
+ totmass = 0.
+ r2max = 0.
+ hmax  = 0.
+#ifdef GRAVITY
+ quads(:) = 0.
+#endif
+
+ i1=inoderange(1,nnode)
+
+ if (comp_node) then
+    !--compute size of node
+    ! parallelise this loop if node is large enough
+    ! use !$omp parallel do when doparallel=.true. (not in parallel region)
+    ! when doparallel=.false., we're already in a parallel region but can't use nested reductions
+    ! so we'll use thread-local accumulators and combine at the end
+    if (npnode > 1000 .and. doparallel) then
+       !$omp parallel do schedule(static) default(none) &
+       !$omp shared(npnode,treecache,x0,i1,use_octree) &
+       !$omp private(i,xi,yi,zi,hi,dx,dy,dz,dr2) &
+       !$omp firstprivate(pmassi) &
+#ifdef GRAVITY
+       !$omp reduction(+:quads,totmass) &
+#endif
+       !$omp reduction(max:r2max,hmax)
+       do i=i1,i1+npnode-1
+          xi = treecache(1,i)
+          yi = treecache(2,i)
+          zi = treecache(3,i)
+          hi = treecache(4,i)
+          dx    = xi - x0(1)
+          dy    = yi - x0(2)
+          dz    = zi - x0(3)
+          if (.not.use_octree) then
+             dr2   = dx*dx + dy*dy + dz*dz
+             r2max = max(r2max,dr2)
+          endif
+          hmax  = max(hmax,hi)
+#ifdef GRAVITY
+          pmassi = treecache(5,i)
+          totmass  = totmass  + pmassi
+          quads(1) = quads(1) + pmassi*dx  ! Q_x
+          quads(2) = quads(2) + pmassi*dy  ! Q_y
+          quads(3) = quads(3) + pmassi*dz  ! Q_z
+          quads(4) = quads(4) + pmassi*(dx*dx)  ! Q_xx
+          quads(5) = quads(5) + pmassi*(dx*dy)  ! Q_xy = Q_yx
+          quads(6) = quads(6) + pmassi*(dx*dz)  ! Q_xz = Q_zx
+          quads(7) = quads(7) + pmassi*(dy*dy)  ! Q_yy
+          quads(8) = quads(8) + pmassi*(dy*dz)  ! Q_yz = Q_zy
+          quads(9) = quads(9) + pmassi*(dz*dz)  ! Q_zz
+#endif
+       enddo
+       !$omp end parallel do
+    else
+       do i=i1,i1+npnode-1
+          xi = treecache(1,i)
+          yi = treecache(2,i)
+          zi = treecache(3,i)
+          hi = treecache(4,i)
+          dx    = xi - x0(1)
+          dy    = yi - x0(2)
+          dz    = zi - x0(3)
+          if (.not.use_octree) then
+             dr2   = dx*dx + dy*dy + dz*dz
+             r2max = max(r2max,dr2)
+          endif
+          hmax = max(hmax,hi)
+#ifdef GRAVITY
+          pmassi = treecache(5,i)
+          totmass  = totmass  + pmassi
+          quads(1) = quads(1) + pmassi*dx  ! Q_x
+          quads(2) = quads(2) + pmassi*dy  ! Q_y
+          quads(3) = quads(3) + pmassi*dz  ! Q_z
+          quads(4) = quads(4) + pmassi*(dx*dx)  ! Q_xx
+          quads(5) = quads(5) + pmassi*(dx*dy)  ! Q_xy = Q_yx
+          quads(6) = quads(6) + pmassi*(dx*dz)  ! Q_xz = Q_zx
+          quads(7) = quads(7) + pmassi*(dy*dy)  ! Q_yy
+          quads(8) = quads(8) + pmassi*(dy*dz)  ! Q_yz = Q_zy
+          quads(9) = quads(9) + pmassi*(dz*dz)  ! Q_zz
+#endif
+       enddo
+    endif
+ endif
+
+ if (use_octree) then
+    r2max = 3.*(0.5*maxval((xmaxi-xmini),1))**2
+    totmass_node  = totmass
+ endif
+ ! reduce node limits and quads across MPI tasks belonging to this group
+ if (mpi .and. global_build) then
+    r2max     = reduce_group(r2max,'max',level)
+    hmax      = reduce_group(hmax,'max',level)
+
+    xmini(1)  = reduce_group(xmini(1),'min',level)
+    xmini(2)  = reduce_group(xmini(2),'min',level)
+    xmini(3)  = reduce_group(xmini(3),'min',level)
+
+    xmaxi(1)  = reduce_group(xmaxi(1),'max',level)
+    xmaxi(2)  = reduce_group(xmaxi(2),'max',level)
+    xmaxi(3)  = reduce_group(xmaxi(3),'max',level)
+#ifdef GRAVITY
+    totmass_node = reduce_group(totmass_node, "+", level)
+    quads(1)  = reduce_group(quads(1),'+',level)
+    quads(2)  = reduce_group(quads(2),'+',level)
+    quads(3)  = reduce_group(quads(3),'+',level)
+    quads(4)  = reduce_group(quads(4),'+',level)
+    quads(5)  = reduce_group(quads(5),'+',level)
+    quads(6)  = reduce_group(quads(6),'+',level)
+#endif
+ endif
+
+ ! assign properties to node
+ nodeentry%xcen       = x0(:)
+ nodeentry%size       = sqrt(r2max) + epsilon(r2max)
+ nodeentry%hmax       = hmax
+ nodeentry%parent     = mymum
+#ifdef GRAVITY
+ nodeentry%mass       = totmass_node
+ nodeentry%quads      = quads
+ nodeentry%tobecached = 1
+ nodeentry%cached     = .false.
+#endif
+
+end subroutine set_nodes_properties
+
+
 !--------------------------------------------------------------------
 !+
 !  create all the properties for a given node such as centre of mass,
@@ -533,7 +769,6 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
                           minlevel, maxlevel, wassplit, global_build,apr_tree, &
                           xyzmh_ptmass)
  use dim,       only:maxtypes,mpi,ind_timesteps
- use part,      only:massoftype,igas,iamtype,npartoftype,isink,ihsoft
  use io,        only:fatal,error
  use mpitree,   only:get_group_cofm,reduce_group
  type(kdnode),    intent(out)   :: nodeentry
@@ -558,20 +793,12 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
  real    :: totmassg
  integer :: npnodetot
 
- logical :: nodeisactive,sinktree
- integer :: i,npcounter,i1,ipart
- real    :: xi,yi,zi,hi,dx,dy,dz,dr2
- real    :: r2max, hmax
- real    :: xcofm,ycofm,zcofm,fac,dfac
+ logical :: nodeisactive,is_not_cube,comp_node
+ integer :: i,npcounter,ipart
  real    :: x0(3)
  integer :: iaxis
  real    :: xpivot
-#ifdef GRAVITY
- real    :: quads(9)
-#endif
- real    :: pmassi
 
- sinktree = present(xyzmh_ptmass)
  nodeisactive = .false.
  if (inoderange(1,nnode) > 0) then
     checkactive: do i = inoderange(1,nnode),inoderange(2,nnode)
@@ -590,217 +817,53 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
     call fatal('maketree', 'expected number of particles in node differed from actual number')
  endif
 
+ if (mpi .and. global_build) then
+    npnodetot = reduce_group(npnode,'+',level)
+ else
+    npnodetot = npnode
+ endif
+
  ! following lines to avoid compiler warnings on intent(out) variables
  ir = 0
  il = 0
  nl = 0
  nr = 0
- wassplit = .false.
+ is_not_cube = (mod(level, 3) /= 0)
+ wassplit    = (npnodetot > minpart)
  if ((.not. global_build) .and. (npnode  <  1)) return ! node has no particles, just quit
 
- r2max = 0.
- hmax  = 0.
  xyzcofm(:) = 0.
- xcofm = 0.
- ycofm = 0.
- zcofm = 0.
-!
-! to avoid round off error from repeated multiplication by pmassi (which is small)
-! we compute the centre of mass with a factor relative to gas particles
-! but only if gas particles are present
-!
- pmassi = massoftype(igas)
- fac    = 1.
- totmass_node = 0.
- if (pmassi > 0.) then
-    dfac = 1./pmassi
+
+
+ !--for gravity, we need the centre of the node to be the centre of mass if Kdtree
+ !-- else midpoint is fine with octree
+ if (use_octree) then
+    x0 = (xmaxi+xmini)*0.5
+    !wassplit = wassplit .or. is_not_cube
+    comp_node = .not.(wassplit)
  else
-    pmassi = massoftype(maxloc(npartoftype(2:maxtypes),1)+1)
-    if (pmassi > 0.) then
-       dfac = 1./pmassi
-    else
-       dfac = 1.
+    call compute_nodes_cofm(npnode,nnode,xyzcofm,totmass_node,doparallel)
+    ! if this is global node construction, get the cofm and total mass
+    ! of all particles in this node (some on other MPI tasks)
+    if (mpi .and. global_build) then
+       call get_group_cofm(xyzcofm,totmass_node,level,xyzcofmg,totmassg)
+       xyzcofm = xyzcofmg
+       totmass_node = totmassg
     endif
- endif
- ! note that dfac can be a constant value across all particles even if APR is used
-
- i1=inoderange(1,nnode)
- ! during initial queue build which is serial, we can parallelise this loop
- if (npnode > 1000 .and. doparallel) then
-    !$omp parallel do schedule(static) default(none) &
-    !$omp shared(maxp,maxphase,maxpsph,inodeparts) &
-    !$omp shared(npnode,massoftype,dfac,aprmassoftype) &
-    !$omp shared(treecache,i1) &
-    !$omp shared(xyzmh_ptmass,sinktree) &
-    !$omp private(i,xi,yi,zi,hi) &
-    !$omp firstprivate(pmassi,fac) &
-    !$omp reduction(+:xcofm,ycofm,zcofm,totmass_node) &
-    !$omp reduction(max:hmax)
-    do i=i1,i1+npnode-1
-       xi = treecache(1,i)
-       yi = treecache(2,i)
-       zi = treecache(3,i)
-       hi = treecache(4,i)
-       pmassi = treecache(5,i)
-       fac    = pmassi*dfac ! to avoid round-off error
-       hmax  = max(hmax,hi)
-       totmass_node = totmass_node + pmassi
-       xcofm = xcofm + fac*xi
-       ycofm = ycofm + fac*yi
-       zcofm = zcofm + fac*zi
-    enddo
-    !$omp end parallel do
- else
-    do i=i1,i1+npnode-1
-       xi = treecache(1,i)
-       yi = treecache(2,i)
-       zi = treecache(3,i)
-       hi = treecache(4,i)
-       pmassi = treecache(5,i)
-       fac    = pmassi*dfac ! to avoid round-off error
-       hmax  = max(hmax,hi)
-       totmass_node = totmass_node + pmassi
-       xcofm = xcofm + fac*xi
-       ycofm = ycofm + fac*yi
-       zcofm = zcofm + fac*zi
-    enddo
- endif
-
- xyzcofm = (/xcofm,ycofm,zcofm/)
-
- ! if there are no particles in this node, then the cofm will
- ! remain at zero
- if (totmass_node > 0.) then
-    xyzcofm(:)   = xyzcofm(:)/(totmass_node*dfac)
- endif
-
- ! if this is global node construction, get the cofm and total mass
- ! of all particles in this node (some on other MPI tasks)
- if (mpi .and. global_build) then
-    call get_group_cofm(xyzcofm,totmass_node,level,xyzcofmg,totmassg)
-    xyzcofm = xyzcofmg
-    totmass_node = totmassg
- endif
-
- ! checks the reduced mass in the case of global maketree
- if (totmass_node<=0. .and. use_apr) call fatal('mtree + apr', &
+    x0 = xyzcofm
+    comp_node = .true.
+    ! checks the reduced mass in the case of global maketree
+    if (totmass_node<=0. .and. use_apr) call fatal('mtree + apr', &
     'totmass_node==0, something almost certainly wrong with aprmassoftype')
- if (totmass_node<=0.) call fatal('mtree','totmass_node==0',val=totmass_node)
-
-!--for gravity, we need the centre of the node to be the centre of mass
- x0(:) = (xmaxi+xmini)*0.5
- r2max = 0.
-#ifdef GRAVITY
- quads(:) = 0.
-#endif
-
- !--compute size of node
- ! parallelise this loop if node is large enough
- ! use !$omp parallel do when doparallel=.true. (not in parallel region)
- ! when doparallel=.false., we're already in a parallel region but can't use nested reductions
- ! so we'll use thread-local accumulators and combine at the end
- if (npnode > 1000 .and. doparallel) then
-    !$omp parallel do schedule(static) default(none) &
-    !$omp shared(npnode,treecache,x0,i1,maxp) &
-    !$omp shared(massoftype,sinktree,maxphase,maxpsph,inodeparts) &
-    !$omp shared(xyzmh_ptmass,aprmassoftype) &
-    !$omp private(i,xi,yi,zi,hi,dx,dy,dz,dr2) &
-    !$omp firstprivate(pmassi) &
-#ifdef GRAVITY
-    !$omp reduction(+:quads) &
-#endif
-    !$omp reduction(max:r2max,hmax)
-    do i=i1,i1+npnode-1
-       xi = treecache(1,i)
-       yi = treecache(2,i)
-       zi = treecache(3,i)
-       hi = treecache(4,i)
-       dx    = xi - x0(1)
-       dy    = yi - x0(2)
-       dz    = zi - x0(3)
-       dr2   = dx*dx + dy*dy + dz*dz
-       r2max = max(r2max,dr2)
-       hmax  = max(hmax,hi)
-#ifdef GRAVITY
-       pmassi = treecache(5,i)
-       quads(1) = quads(1) + pmassi*dx  ! Q_x
-       quads(2) = quads(2) + pmassi*dy  ! Q_y
-       quads(3) = quads(3) + pmassi*dz  ! Q_z
-       quads(4) = quads(4) + pmassi*(dx*dx)  ! Q_xx
-       quads(5) = quads(5) + pmassi*(dx*dy)  ! Q_xy = Q_yx
-       quads(6) = quads(6) + pmassi*(dx*dz)  ! Q_xz = Q_zx
-       quads(7) = quads(7) + pmassi*(dy*dy)  ! Q_yy
-       quads(8) = quads(8) + pmassi*(dy*dz)  ! Q_yz = Q_zy
-       quads(9) = quads(9) + pmassi*(dz*dz)  ! Q_zz
-#endif
-    enddo
-    !$omp end parallel do
- else
-    do i=i1,i1+npnode-1
-       xi = treecache(1,i)
-       yi = treecache(2,i)
-       zi = treecache(3,i)
-       hi = treecache(4,i)
-       dx    = xi - x0(1)
-       dy    = yi - x0(2)
-       dz    = zi - x0(3)
-       dr2   = dx*dx + dy*dy + dz*dz
-       r2max = max(r2max,dr2)
-       hmax = max(hmax,hi)
-#ifdef GRAVITY
-       pmassi = treecache(5,i)
-       quads(1) = quads(1) + pmassi*dx  ! Q_x
-       quads(2) = quads(2) + pmassi*dy  ! Q_y
-       quads(3) = quads(3) + pmassi*dz  ! Q_z
-       quads(4) = quads(4) + pmassi*(dx*dx)  ! Q_xx
-       quads(5) = quads(5) + pmassi*(dx*dy)  ! Q_xy = Q_yx
-       quads(6) = quads(6) + pmassi*(dx*dz)  ! Q_xz = Q_zx
-       quads(7) = quads(7) + pmassi*(dy*dy)  ! Q_yy
-       quads(8) = quads(8) + pmassi*(dy*dz)  ! Q_yz = Q_zy
-       quads(9) = quads(9) + pmassi*(dz*dz)  ! Q_zz
-#endif
-    enddo
+    if (totmass_node<=0.) call fatal('mtree','totmass_node==0',val=totmass_node)
  endif
 
- ! reduce node limits and quads across MPI tasks belonging to this group
- if (mpi .and. global_build) then
-    npnodetot = reduce_group(npnode,'+',level)
-    r2max     = reduce_group(r2max,'max',level)
-    hmax      = reduce_group(hmax,'max',level)
 
-    xmini(1)  = reduce_group(xmini(1),'min',level)
-    xmini(2)  = reduce_group(xmini(2),'min',level)
-    xmini(3)  = reduce_group(xmini(3),'min',level)
+ call set_nodes_properties(npnode,nnode,x0,totmass_node,mymum,nodeentry,xmini,xmaxi,&
+                           level,global_build,doparallel,comp_node)
 
-    xmaxi(1)  = reduce_group(xmaxi(1),'max',level)
-    xmaxi(2)  = reduce_group(xmaxi(2),'max',level)
-    xmaxi(3)  = reduce_group(xmaxi(3),'max',level)
-#ifdef GRAVITY
-    quads(1)  = reduce_group(quads(1),'+',level)
-    quads(2)  = reduce_group(quads(2),'+',level)
-    quads(3)  = reduce_group(quads(3),'+',level)
-    quads(4)  = reduce_group(quads(4),'+',level)
-    quads(5)  = reduce_group(quads(5),'+',level)
-    quads(6)  = reduce_group(quads(6),'+',level)
-#endif
- else
-    npnodetot = npnode
- endif
 
- ! assign properties to node
- nodeentry%xcen       = x0(:)
- nodeentry%size       = sqrt(r2max) + epsilon(r2max)
- nodeentry%hmax       = hmax
- nodeentry%parent     = mymum
-#ifdef GRAVITY
- nodeentry%mass       = totmass_node
- nodeentry%quads      = quads
- nodeentry%tobecached = 1
- nodeentry%cached     = .false.
-#endif
-
- wassplit = (npnodetot > minpart)
- if (apr_tree) wassplit = (npnode > 2)
+ if (apr_tree)   wassplit = (npnode > 2)
 
  if (.not. wassplit) then
     nodeentry%leftchild  = 0
@@ -822,8 +885,13 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
        leaf_is_active(nnode) = 1
     endif
  else ! split this node and add children to stack
-    iaxis  = maxloc(xmaxi - xmini,1)     ! split along longest axis
-    xpivot = x0(iaxis)!xyzcofm(iaxis)!  ! split middle longest axis
+    if (use_octree) then
+       iaxis  = mod(level,3) + 1        ! split along longest axis
+    else
+       iaxis  = maxloc(xmaxi - xmini,1) ! split along longest axis
+    endif
+    xpivot = x0(iaxis)               ! split middle longest axis
+
     if (maxlevel > maxdepth) call fatal('maketree','maximum tree depth reached !!')
     ! create two children nodes and point to them from current node
     ! always use G&R indexing for global tree
@@ -1176,6 +1244,93 @@ subroutine special_sort_particles_in_cell(iaxis,imin,imax,min_l,max_l,min_r,max_
  nr = max_r - min_r + 1
 
 end subroutine special_sort_particles_in_cell
+
+subroutine propagate_upward(ncells,node)
+ use io, only: fatal
+ integer     , intent(in)    :: ncells
+ type(kdnode), intent(inout) :: node(:)
+ integer :: lvl,i,ir,il,npnode
+ real :: mnode
+
+!
+!-- the first loop guarantees that after maxlevel iterations the quads and hmax are up to the root
+!
+ lvl_loop: do lvl=1,maxlevel+1
+    !
+    !-- the second loop compute quads and hmax with no distinction.
+    !-- This pass should be really fast so it is not important to loose few ops here.
+    !
+    !$omp parallel do default(none) &
+    !$omp shared(node,maxlevel,lvl,inoderange)&
+    !$omp private(i,ir,il,mnode,npnode)
+    node_loop :do i=1,ncells
+
+       il = node(i)%leftchild
+       ir = node(i)%rightchild
+       if ((il /= 0) .and. (ir /= 0)) then
+          call translate_node(node,i,il,ir)
+       endif
+
+       if (lvl == maxlevel) then
+          npnode = inoderange(2,i)-inoderange(1,i) + 1
+          mnode  = node(i)%mass
+          if (npnode > 1 .and. mnode < epsilon(mnode)) then
+             call fatal('mtree','mnode==0',val=mnode)
+          endif
+       endif
+    enddo node_loop
+    !$omp end parallel do
+ enddo lvl_loop
+
+
+end subroutine propagate_upward
+
+subroutine translate_node(node,ip,il,ir)
+ type(kdnode), intent(inout) :: node(:)
+ integer,      intent(in)    :: ip,il,ir
+ real    :: dx(3),massp,massc,quadsp(9),quadsc(9),dips(3),hmaxc,hmaxp
+ integer :: j,ic(2),k
+
+ ic = (/il,ir/)
+ massp  = 0.
+ hmaxp  = 0.
+ quadsp = 0.
+ dips   = 0.
+
+ do j=1,2
+    k = ic(j)
+    !$omp atomic read
+    massc  = node(k)%mass
+    quadsc = node(k)%quads
+    hmaxc  = node(k)%hmax
+
+    dx = node(k)%xcen - node(ip)%xcen
+
+    massp       = massp + massc
+    dips(1)     = quadsc(1) + dx(1)*massc
+    dips(2)     = quadsc(2) + dx(2)*massc
+    dips(3)     = quadsc(3) + dx(3)*massc
+    quadsp(1)   = quadsp(1) + dips(1)
+    quadsp(2)   = quadsp(2) + dips(2)
+    quadsp(3)   = quadsp(3) + dips(3)
+    quadsp(4)   = quadsp(4) + quadsc(4) + dx(1)*dips(1) + quadsc(1)*dx(1)
+    quadsp(5)   = quadsp(5) + quadsc(5) + dx(1)*dips(2) + quadsc(1)*dx(2)
+    quadsp(6)   = quadsp(6) + quadsc(6) + dx(1)*dips(3) + quadsc(1)*dx(3)
+    quadsp(7)   = quadsp(7) + quadsc(7) + dx(2)*dips(2) + quadsc(2)*dx(2)
+    quadsp(8)   = quadsp(8) + quadsc(8) + dx(2)*dips(3) + quadsc(2)*dx(3)
+    quadsp(9)   = quadsp(9) + quadsc(9) + dx(3)*dips(3) + quadsc(3)*dx(3)
+
+    hmaxp = max(hmaxp,hmaxc)
+
+ enddo
+
+ !$omp atomic write
+ node(ip)%mass  = massp
+ node(ip)%quads = quadsp
+ node(ip)%hmax  = hmaxp
+
+end subroutine translate_node
+
 
 !----------------------------------------------------------------
 !+
@@ -1563,13 +1718,13 @@ pure subroutine propagate_fnode_to_node(fnode,fnode_sup,dx,dy,dz)
  fnode(17) = fnode_sup(17)
  fnode(18) = fnode_sup(18)
  fnode(19) = fnode_sup(19)
- fnode(20) = fnode_sup(20) + dx*(fnode_sup(1)+0.5*(dx*(fnode_sup(4)+(1./3.)*(dx*fnode_sup(10)+dy*fnode_sup(11)+dz*fnode_sup(12)))+&
+ fnode(20) = fnode_sup(20) - dx*(fnode_sup(1)+0.5*(dx*(fnode_sup(4)+(1./3.)*(dx*fnode_sup(10)+dy*fnode_sup(11)+dz*fnode_sup(12)))+&
                                                    dy*(fnode_sup(5)+(1./3.)*(dx*fnode_sup(11)+dy*fnode_sup(13)+dz*fnode_sup(14)))+&
                                                    dz*(fnode_sup(6)+(1./3.)*(dx*fnode_sup(12)+dy*fnode_sup(14)+dz*fnode_sup(15)))))&
-                           + dy*(fnode_sup(2)+0.5*(dx*(fnode_sup(5)+(1./3.)*(dx*fnode_sup(11)+dy*fnode_sup(13)+dz*fnode_sup(14)))+&
+                           - dy*(fnode_sup(2)+0.5*(dx*(fnode_sup(5)+(1./3.)*(dx*fnode_sup(11)+dy*fnode_sup(13)+dz*fnode_sup(14)))+&
                                                    dy*(fnode_sup(7)+(1./3.)*(dx*fnode_sup(13)+dy*fnode_sup(16)+dz*fnode_sup(17)))+&
                                                    dz*(fnode_sup(8)+(1./3.)*(dx*fnode_sup(14)+dy*fnode_sup(17)+dz*fnode_sup(18)))))&
-                           + dz*(fnode_sup(3)+0.5*(dx*(fnode_sup(6)+(1./3.)*(dx*fnode_sup(12)+dy*fnode_sup(14)+dz*fnode_sup(15)))+&
+                           - dz*(fnode_sup(3)+0.5*(dx*(fnode_sup(6)+(1./3.)*(dx*fnode_sup(12)+dy*fnode_sup(14)+dz*fnode_sup(15)))+&
                                                    dy*(fnode_sup(8)+(1./3.)*(dx*fnode_sup(14)+dy*fnode_sup(17)+dz*fnode_sup(18)))+&
                                                    dz*(fnode_sup(9)+(1./3.)*(dx*fnode_sup(15)+dy*fnode_sup(18)+dz*fnode_sup(19)))))
 
@@ -1854,7 +2009,7 @@ pure subroutine expand_fgrav_in_taylor_series(fnode,dx,dy,dz,fxi,fyi,fzi,poti)
              + dy*(dfyz + 0.5*(dx*d2fxyz + dy*d2fyyz + dz*d2fyzz)) &
              + dz*(dfzz + 0.5*(dx*d2fxzz + dy*d2fyzz + dz*d2fzzz))
  ! Minus sign here as we are shifted of 1 in the (-1)^k compared to force
- poti = poti - dx*(fxi - 0.5*(dx*dfxx + dy*dfxy + dz*dfxy)) &
+ poti = poti - dx*(fxi - 0.5*(dx*dfxx + dy*dfxy + dz*dfxz)) &
              - dy*(fyi - 0.5*(dx*dfxy + dy*dfyy + dz*dfyz)) &
              - dz*(fzi - 0.5*(dx*dfxz + dy*dfyz + dz*dfzz))
 
