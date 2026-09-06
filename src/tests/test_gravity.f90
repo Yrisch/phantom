@@ -905,7 +905,7 @@ subroutine selfgrav_comparison()
  !--single control loop over tree type, particle number and density profile
  do itree=1,ntrees
     if (id==master) write(*,*) '--> Comparing tree type = ',trim(treelabel(itree))
-    do i=1,3!size(ntarg)
+    do i=1,size(ntarg)
        if (id==master) write(*,*) 'Test with Npart = ',ntarg(i)
        do iprofile=1,nprofiles
           call prec_bench(ntarg(i),profile_id(iprofile),trim(treelabel(itree)))  ! accuracy vs exact direct sum
