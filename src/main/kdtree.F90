@@ -44,9 +44,9 @@ module kdtree
 !--runtime options for this module
 !
  real,    public  :: tree_accuracy    = 0.5
+ logical, public  :: use_octree       = .false.
  logical, private :: done_init_kdtree = .false.
  logical, private :: already_warned   = .false.
- logical, private :: use_octree     = .true.
  integer, private :: numthreads
 
 ! Index of the last node in the local tree that has been copied to
