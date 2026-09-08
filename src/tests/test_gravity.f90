@@ -947,6 +947,7 @@ subroutine prec_bench(npart_target,iprofile,treetype)
  real :: theta_crit,tbuild,tforce
  real :: error_array(2,npercentile+1,niter+1)
  real :: percentiles(npercentile)
+ real :: timings(3,niter+1)
 
  if (iprofile == iprofile_plummer) then
     label = "Plum"
@@ -968,7 +969,8 @@ subroutine prec_bench(npart_target,iprofile,treetype)
  write(iunit,"(a)") '# SFMM = dual-tree walk (use_dualtree = T) ; FMM = single-tree walk (use_dualtree = F)'
  write(iunit,"(a)") '# error metric : per-particle relative force error |F_tree-F_direct|/|F_direct|'
  write(iunit,"(a)") '# error columns per scheme (SFMM then FMM): p01,p10,p50,p90,p99,p99.9,p99.99,p100,rms'
- write(iunit,"(a)") '# columns: theta, SFMM(9 errors), FMM(9 errors)'
+ write(iunit,"(a)") '# timings for the 3 methods (1 SFMM, 2 FMM, 3 direct)'
+ write(iunit,"(a)") '# columns: theta, SFMM(9 errors), FMM(9 errors),timings(3 methods)'
 
  !--generic particle distribution for this profile
  call setup_distribution(iprofile,npart_target,-111)
@@ -983,7 +985,8 @@ subroutine prec_bench(npart_target,iprofile,treetype)
 
  !--exact reference acceleration (theta=0, single tree)
  call tree_gravity(trim(treetype),0.,.false.,tbuild,tforce)
- fxyz_dir = fxyzu(1:3,1:npart)
+ fxyz_dir  = fxyzu(1:3,1:npart)
+ timings(3,:) = tforce
 
  tree_acc: do it=0,niter
     theta_crit = 0.1 + it*0.05
@@ -993,6 +996,8 @@ subroutine prec_bench(npart_target,iprofile,treetype)
        else
           call tree_gravity(trim(treetype),theta_crit,.false.,tbuild,tforce)  ! FMM: single-tree walk
        endif
+
+       timings(itest,it+1) = tforce
 
        err_rel = norm2(fxyzu(1:3,1:npart)-fxyz_dir,1)/norm2(fxyz_dir,1)
        call indexx(npart, err_rel, erridx)
@@ -1005,7 +1010,8 @@ subroutine prec_bench(npart_target,iprofile,treetype)
  enddo tree_acc
 
  do it=0,niter
-    write(iunit,"(f9.4,18(es13.5))") 0.1 + it*0.05, error_array(1:2,1:npercentile+1,it+1)
+    write(iunit,"(f9.4,9(es13.5),9(es13.5),3(es13.5))") 0.1 + it*0.05,&
+    error_array(1,1:npercentile+1,it+1),error_array(2,1:npercentile+1,it+1),timings(1:3,it+1)
  enddo
 
  close(iunit)

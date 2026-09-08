@@ -177,7 +177,7 @@ subroutine maketree(node, xyzh, np, leaf_is_active, ncells, apr_tree, refineleve
  ! default number of cells is the size of the `indexed' part of the tree
  ! this can be *increased* by building tree beyond indexed levels
  ! and is decreased afterwards according to the maximum depth actually reached
- ncells = 2**(maxlevel_indexed+1) - 1
+ if (.not. use_octree) ncells = 2**(maxlevel_indexed+1) - 1
 
  ! need to number of particles in node during build
  ! this is counted above to remove dead/accreted particles
@@ -296,7 +296,7 @@ subroutine maketree(node, xyzh, np, leaf_is_active, ncells, apr_tree, refineleve
  endif done
 
  ! decrease number of cells if tree is entirely within 2^k indexing limit
- if (maxlevel < maxlevel_indexed) then
+ if ((maxlevel < maxlevel_indexed) .and. (.not. use_octree)) then
     ncells = 2**(maxlevel+1) - 1
  endif
  !-- if octree is used, we need to propagate information from leaf to root (hmax and quads)
@@ -895,7 +895,7 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
     if (maxlevel > maxdepth) call fatal('maketree','maximum tree depth reached !!')
     ! create two children nodes and point to them from current node
     ! always use G&R indexing for global tree
-    if ((level < maxlevel_indexed) .or. global_build) then
+    if (((level < maxlevel_indexed) .or. global_build) .and. (.not. use_octree)) then
        il = 2*nnode   ! indexing as per Gafton & Rosswog (2011)
        ir = il + 1
     else
@@ -931,7 +931,7 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
        endif
 
        ! see if all the particles ended up in one node, if so, arbitrarily build 2 cells
-       if ( (.not. global_build) .and. ((nl==npnode) .or. (nr==npnode)) ) then
+       if ( (.not. global_build) .and. ((nl==npnode) .or. (nr==npnode)) .and. (.not. use_octree)) then
           ! no need to move particles because if they all ended up in one node,
           ! then they are still in the original order
           nl = npnode / 2
@@ -1249,31 +1249,42 @@ subroutine propagate_upward(ncells,node)
  use io, only: fatal
  integer     , intent(in)    :: ncells
  type(kdnode), intent(inout) :: node(:)
- integer :: lvl,i,ir,il,npnode
- real :: mnode
+ type(kdnode), allocatable :: nodemap(:)
+ integer :: lvl,i,ir,il,npnode,iswitch,nlvl
+ real    :: mnode,xcen(3)
+
+ nlvl  = maxlevel + mod(maxlevel,2) !-- we need to finish on an even number to copy the information in the node array
+
+ allocate(nodemap(ncells))
+ nodemap(1:ncells) = node(1:ncells)
 
 !
 !-- the first loop guarantees that after maxlevel iterations the quads and hmax are up to the root
 !
- lvl_loop: do lvl=1,maxlevel+1
+ lvl_loop: do lvl=1,nlvl
+
+    iswitch = mod(lvl,2)
     !
     !-- the second loop compute quads and hmax with no distinction.
     !-- This pass should be really fast so it is not important to loose few ops here.
     !
     !$omp parallel do default(none) &
-    !$omp shared(node,maxlevel,lvl,inoderange)&
-    !$omp private(i,ir,il,mnode,npnode)
+    !$omp shared(iswitch,node,nodemap,nlvl,lvl,inoderange)&
+    !$omp private(i,ir,il,mnode,npnode,xcen)
     node_loop :do i=1,ncells
 
        il = node(i)%leftchild
        ir = node(i)%rightchild
+       xcen = node(i)%xcen
        if ((il /= 0) .and. (ir /= 0)) then
-          call translate_node(node,i,il,ir)
+          call translate_node(node,nodemap,iswitch,i,il,ir,xcen)
        endif
 
-       if (lvl == maxlevel) then
+       if (lvl == nlvl) then
           npnode = inoderange(2,i)-inoderange(1,i) + 1
+          !$omp atomic read
           mnode  = node(i)%mass
+          !$omp end atomic
           if (npnode > 1 .and. mnode < epsilon(mnode)) then
              call fatal('mtree','mnode==0',val=mnode)
           endif
@@ -1282,13 +1293,17 @@ subroutine propagate_upward(ncells,node)
     !$omp end parallel do
  enddo lvl_loop
 
+ deallocate(nodemap)
+
 
 end subroutine propagate_upward
 
-subroutine translate_node(node,ip,il,ir)
- type(kdnode), intent(inout) :: node(:)
- integer,      intent(in)    :: ip,il,ir
+subroutine translate_node(node,nodemap,iswitch,ip,il,ir,xcenp)
+ type(kdnode), intent(inout) :: node(:),nodemap(:)
+ integer,      intent(in)    :: ip,il,ir,iswitch
+ real,         intent(in)    :: xcenp(3)
  real    :: dx(3),massp,massc,quadsp(9),quadsc(9),dips(3),hmaxc,hmaxp
+ real    :: xcenc(3)
  integer :: j,ic(2),k
 
  ic = (/il,ir/)
@@ -1299,12 +1314,19 @@ subroutine translate_node(node,ip,il,ir)
 
  do j=1,2
     k = ic(j)
-    !$omp atomic read
-    massc  = node(k)%mass
-    quadsc = node(k)%quads
-    hmaxc  = node(k)%hmax
+    if (iswitch==1) then
+       massc  = node(k)%mass
+       quadsc = node(k)%quads
+       hmaxc  = node(k)%hmax
+       xcenc  = node(k)%xcen
+    else
+       massc  = nodemap(k)%mass
+       quadsc = nodemap(k)%quads
+       hmaxc  = nodemap(k)%hmax
+       xcenc  = node(k)%xcen
+    endif
 
-    dx = node(k)%xcen - node(ip)%xcen
+    dx = xcenc - xcenp
 
     massp       = massp + massc
     dips(1)     = quadsc(1) + dx(1)*massc
@@ -1324,10 +1346,15 @@ subroutine translate_node(node,ip,il,ir)
 
  enddo
 
- !$omp atomic write
- node(ip)%mass  = massp
- node(ip)%quads = quadsp
- node(ip)%hmax  = hmaxp
+ if(iswitch==1) then
+    nodemap(ip)%mass  = massp
+    nodemap(ip)%quads = quadsp
+    nodemap(ip)%hmax  = hmaxp
+ else
+    node(ip)%mass  = massp
+    node(ip)%quads = quadsp
+    node(ip)%hmax  = hmaxp
+ endif
 
 end subroutine translate_node
 
