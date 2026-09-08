@@ -890,17 +890,16 @@ subroutine selfgrav_comparison()
  use kdtree,     only:use_octree
  integer :: ntarg(9),i,itree,iprofile
  integer :: ntrees,nprofiles
- integer :: profile_id(2)
+ integer :: profile_id(3)
  character(len=8) :: treelabel(2)
 
  ntarg = (/1000,3000,10000,30000,100000,300000,1000000,3000000,10000000/)
  treelabel    = (/'KDtree  ','Octree  '/)
- profile_id   = (/iprofile_plummer,3/)
+ profile_id   = (/iprofile_plummer,3,4/)
  ntrees    = size(treelabel)
  nprofiles = size(profile_id)
 
  if (id==master) write(*,*) '--> Plot routine : Plummer sphere tests with different Npart'
- if (id==master) write(*,"(/,a)") '--> Benchmarking octree vs k-d tree (build + force time)'
 
  !--single control loop over tree type, particle number and density profile
  do itree=1,ntrees
@@ -951,8 +950,10 @@ subroutine prec_bench(npart_target,iprofile,treetype)
 
  if (iprofile == iprofile_plummer) then
     label = "Plum"
- else
+ elseif (iprofile == 3) then
     label = "Homo"
+ elseif (iprofile == 4) then
+    label = "Disc"
  endif
 
  percentiles = (/0.01,0.1,0.5,0.9,0.99,0.999,0.9999,1./)
@@ -1048,6 +1049,8 @@ subroutine perf_bench(npart_target,iprofile,treetype)
 
  theta_crit = 0.5
 
+ if (id==master) write(*,"(/,a)") '--> Benchmarking octree vs k-d tree (build + force time)'
+
  !--generic particle distribution for this profile
  call setup_distribution(iprofile,npart_target,-111)
  call get_density_global(icall=1)
@@ -1058,9 +1061,11 @@ subroutine perf_bench(npart_target,iprofile,treetype)
  ncells_used = nleaf + count(node(1:int(ncells))%leftchild /= 0)
  if (id==master) then
     if (iprofile == iprofile_plummer) then
-       label = 'Plum'
-    else
-       label = 'Homo'
+       label = "Plum"
+    elseif (iprofile == 3) then
+       label = "Homo"
+    elseif (iprofile == 4) then
+       label = "Disc"
     endif
     filename_max = 'tree_bench_'//trim(label)//'.ev'
     inquire(file=trim(filename_max),exist=exists)
@@ -1093,15 +1098,18 @@ subroutine setup_distribution(iprofile,npart_target,iseed)
  use dim,         only:maxp
  use eos,         only:gamma,polyk
  use options,     only:ieos,alpha,alphau,alphaB,tolh
- use part,        only:init_part,npart,xyzh,hfact,&
+ use part,        only:init_part,npart,xyzh,vxyzu,hfact,&
                        npartoftype,massoftype,istar,maxphase,iphase,isetphase
  use setup_params,only:npart_total
  use setplummer,  only:radius_from_mass,density_profile,iprofile_plummer
  use spherical,   only:set_sphere,iseed_mc
+ use setdisc,     only:set_disc
  use kernel,      only:hfact_default
  use table_utils, only:linspace
  use mpidomain,   only:i_belong
  use io,          only:id,master
+ use units,       only:set_units
+ use physcon,     only:au,solarm
  integer,         intent(in) :: iprofile,npart_target,iseed
  integer :: i
  integer, parameter :: ntab = 1000
@@ -1109,6 +1117,7 @@ subroutine setup_distribution(iprofile,npart_target,iseed)
  real :: rgrid(ntab),rhotab(ntab)
 
  call init_part()
+ call set_units(1.,1.,1.)
  hfact      = hfact_default
  gamma      = 5./3.
  polyk      = 0.
@@ -1135,10 +1144,19 @@ subroutine setup_distribution(iprofile,npart_target,iseed)
     call set_sphere('random',id,master,rmin,rmax,psep,hfact,npart,xyzh,npart_total,&
                     rhotab=rhotab,rtab=rgrid,exactN=.true.,&
                     np_requested=npart_target,mask=i_belong,verbose=.false.)
- else
+ elseif (iprofile == 3) then
     call set_sphere('random',id,master,rmin,rmax,psep,hfact,npart,xyzh,npart_total,&
                     np_requested=npart_target,verbose=.false.)
+ elseif(iprofile == 4) then
+    call set_units(dist=au,mass=solarm,G=1.0)
+    mass_total = 0.1
+    call set_disc(id,master,nparttot=npart_target,npart=npart,rmin=1.,rmax=5.,p_index=1.0,q_index=0.75,&
+                     HoverR=0.1,disc_mass=0.01,star_mass=1.,gamma=gamma,&
+                     particle_mass=massoftype(istar),hfact=hfact,xyzh=xyzh,vxyzu=vxyzu,&
+                     polyk=polyk,verbose=.false.)
+    npart_total = npart
  endif
+
  massoftype(istar) = mass_total/real(npart_total)
  npartoftype(istar) = npart
  if (maxphase==maxp) then
