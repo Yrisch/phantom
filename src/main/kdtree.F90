@@ -45,6 +45,7 @@ module kdtree
 !
  real,    public  :: tree_accuracy    = 0.5
  logical, public  :: use_octree       = .false.
+ logical, public  :: use_cache        = .true.
  logical, private :: done_init_kdtree = .false.
  logical, private :: already_warned   = .false.
  integer, private :: numthreads
@@ -1620,23 +1621,25 @@ subroutine getneigh_dual(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzca
     iparent = branch(i)
     ! -- Cache node if first thread to reach it or fetch fnode in memory
 #ifdef GRAVITY
-    !$omp atomic capture
-    tobecached = node(iparent)%tobecached
-    node(iparent)%tobecached = min(node(iparent)%tobecached,0)
-    !$omp end atomic
-    if (tobecached==1) then
-       !-- store fnode in the cache array
-       fnodecache(1:lenfgrav,iparent) = fnode_branch(1:lenfgrav,i)
-       !$omp atomic write
-       node(iparent)%cached = .true.
+    if (use_cache) then
+       !$omp atomic capture
+       tobecached = node(iparent)%tobecached
+       node(iparent)%tobecached = min(node(iparent)%tobecached,0)
        !$omp end atomic
-    else
-       !$omp atomic read
-       cached = node(iparent)%cached
-       !$omp end atomic
-       if (cached) then
-          !-- fetch fnode from the cache array
-          fnode_branch(1:lenfgrav,i) = fnodecache(1:lenfgrav,iparent)
+       if (tobecached==1) then
+          !-- store fnode in the cache array
+          fnodecache(1:lenfgrav,iparent) = fnode_branch(1:lenfgrav,i)
+          !$omp atomic write
+          node(iparent)%cached = .true.
+          !$omp end atomic
+       else
+          !$omp atomic read
+          cached = node(iparent)%cached
+          !$omp end atomic
+          if (cached) then
+             !-- fetch fnode from the cache array
+             fnode_branch(1:lenfgrav,i) = fnodecache(1:lenfgrav,iparent)
+          endif
        endif
     endif
 #else
@@ -1862,9 +1865,13 @@ subroutine node_interaction(node_dst,node_src,tree_acc2,fnode,stackit,xoffset,yo
  call get_sep(node_dst%xcen,node_src%xcen,dx,dy,dz,xoffset,yoffset,zoffset,r2)
  call get_node_size(node_dst,node_src,size_dst,size_src,rcut_dst,rcut_src)
 #ifdef GRAVITY
- !$omp atomic read
- cached = node_dst%cached
- !$omp end atomic
+ if (use_cache) then
+    !$omp atomic read
+    cached = node_dst%cached
+    !$omp end atomic
+ else
+    cached = .false.
+ endif
 #else
  cached = .false.
 #endif
