@@ -32,14 +32,19 @@ module kdtree
  integer, public,  allocatable :: inodeparts(:)
  type(kdnode),     allocatable :: refinementnode(:)
  real,             allocatable :: fnode_branch(:,:)
+ integer,          allocatable :: neighnodecount_branch(:)
+ integer,          allocatable :: neighnode_branch(:,:)
+ integer,          allocatable :: neighnodecount(:)
+ integer,          allocatable :: neighnodecache(:,:)
  real,             allocatable :: fnodecache(:,:)
-!$omp threadprivate(fnode_branch)
+!$omp threadprivate(fnode_branch,neighnode_branch,neighnodecount_branch)
 !
 !--tree parameters
 !
- integer,          parameter, public :: irootnode  = 1
- character(len=1), parameter, public :: labelax(3) = (/'x','y','z'/)
- integer,          parameter         :: maxdepth   = 64
+ integer,          parameter, public :: irootnode    = 1
+ character(len=1), parameter, public :: labelax(3)   = (/'x','y','z'/)
+ integer,          parameter         :: maxdepth     = 64
+ integer,          parameter         :: maxnodecache = 100
 !
 !--runtime options for this module
 !
@@ -82,7 +87,11 @@ subroutine allocate_kdtree
  call allocate_array('inodeparts', inodeparts, maxp)
  if (mpi) call allocate_array('refinementnode', refinementnode, ncellsmax+1)
  call allocate_array('fnodecache', fnodecache, lenfgrav, ncellsmax+1)
+ call allocate_array('neighnodecache',neighnodecache,maxnodecache,ncellsmax+1)
+ call allocate_array('nneighnodecount',neighnodecount,ncellsmax+1)
 !$omp parallel
+ call allocate_array('neighnodecount_branch',neighnodecount_branch,maxdepth)
+ call allocate_array('neighnode_branch',neighnode_branch,maxnodecache,maxdepth)
  call allocate_array('fnode_branch', fnode_branch, lenfgrav, maxdepth)
 !$omp end parallel
 
@@ -94,7 +103,11 @@ subroutine deallocate_kdtree
  if (allocated(inodeparts)) deallocate(inodeparts)
  if (mpi .and. allocated(refinementnode)) deallocate(refinementnode)
  if (allocated(fnodecache)) deallocate(fnodecache)
+ if (allocated(neighnodecache)) deallocate(neighnodecache)
+ if (allocated(neighnodecount)) deallocate(neighnodecount)
 !$omp parallel
+ if (allocated(neighnode_branch)) deallocate(neighnode_branch)
+ if (allocated(neighnodecount_branch)) deallocate(neighnodecount_branch)
  if (allocated(fnode_branch)) deallocate(fnode_branch)
 !$omp end parallel
 
@@ -751,7 +764,8 @@ subroutine set_nodes_properties(npnode,nnode,x0,totmass_node,mymum,nodeentry,xmi
  nodeentry%mass       = totmass_node
  nodeentry%quads      = quads
  nodeentry%tobecached = 1
- nodeentry%cached     = .false.
+ nodeentry%fcached    = .false.
+ nodeentry%ncached    = .false.
 #endif
 
 end subroutine set_nodes_properties
@@ -1563,11 +1577,11 @@ subroutine getneigh_dual(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzca
  real,         intent(out)   :: fnode(lenfgrav)
  integer,      intent(in)    :: icell
  integer :: istack,i,iparent,idstbranch,idst,isrc,maxcache,tobecached
- integer :: branch(maxdepth),nparents,stack(3,maxdepth)
+ integer :: branch(maxdepth),nparents,stack(3,2000),startwith(2)
  real    :: dx,dy,dz,xoffset,yoffset,zoffset
  real    :: tree_acc2
  real    :: fnode_acc(lenfgrav)
- logical :: stackit,cached
+ logical :: stackit,fcached
 
  tree_acc2 = tree_accuracy*tree_accuracy
 
@@ -1577,17 +1591,32 @@ subroutine getneigh_dual(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzca
     maxcache = 0
  endif
 
- call get_list_of_parent_nodes(icell,node,branch,nparents)
+ call get_list_of_parent_nodes(icell,node,branch,nparents,startwith)
 
+ neighnodecount_branch = 0
+ neighnode_branch = 0.
  fnode_branch = 0.
  fnode_acc    = 0.
-
  nneigh = 0
- istack = 1
- stack(1,istack) = irootnode
- stack(2,istack) = irootnode
- stack(3,istack) = nparents ! root id in the branch
+ istack = 0
+ xoffset = 0.
+ yoffset = 0.
+ zoffset = 0.
 
+ if (startwith(2) > 0) then
+    if(startwith(2) == 2 ) print*,real(nparents-startwith(2)+1)/nparents,neighnodecount(startwith(1))
+    do i=1,neighnodecount(startwith(1))
+       isrc = neighnodecache(i,startwith(1))
+       call open_nodes(stack,istack,node(isrc),isrc,branch,startwith(2),&
+                    listneigh,xyzcache,ixyzcachesize,nneigh,leaf_is_active,&
+                    maxcache,xoffset,yoffset,zoffset)
+    enddo
+ else
+    istack = istack + 1
+    stack(1,istack) = irootnode
+    stack(2,istack) = irootnode
+    stack(3,istack) = nparents
+ endif
 !
 !-- parallel select algorithm to check every interactions between the tree and the selected branch
 !
@@ -1608,6 +1637,13 @@ subroutine getneigh_dual(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzca
     endif
 
     if (stackit) then
+       neighnodecount_branch(idstbranch) = neighnodecount_branch(idstbranch) + 1
+       !-- if count overflow, we will not cache it during the downward pass
+       if (neighnodecount_branch(idstbranch) <= maxnodecache) then
+          neighnode_branch(neighnodecount_branch(idstbranch),idstbranch) = isrc
+       endif
+
+
        call open_nodes(stack,istack,node(isrc),isrc,branch,idstbranch,&
                        listneigh,xyzcache,ixyzcachesize,nneigh,leaf_is_active,&
                        maxcache,xoffset,yoffset,zoffset)
@@ -1627,23 +1663,31 @@ subroutine getneigh_dual(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzca
        node(iparent)%tobecached = min(node(iparent)%tobecached,0)
        !$omp end atomic
        if (tobecached==1) then
-          !-- store fnode in the cache array
+          !-- store interaction list in the cache array if it fits
+          if (neighnodecount_branch(i)< maxnodecache) then
+             neighnodecount(iparent) = neighnodecount_branch(i)
+             neighnodecache(1:neighnodecount(iparent),iparent) = neighnode_branch(1:neighnodecount(iparent),i)
+             !$omp atomic write
+             node(iparent)%ncached = .true.
+             !$omp end atomic
+          endif
+          !always cached fnode
           fnodecache(1:lenfgrav,iparent) = fnode_branch(1:lenfgrav,i)
           !$omp atomic write
-          node(iparent)%cached = .true.
+          node(iparent)%fcached = .true.
           !$omp end atomic
        else
           !$omp atomic read
-          cached = node(iparent)%cached
+          fcached = node(iparent)%fcached
           !$omp end atomic
-          if (cached) then
+          if (fcached) then
              !-- fetch fnode from the cache array
              fnode_branch(1:lenfgrav,i) = fnodecache(1:lenfgrav,iparent)
           endif
        endif
     endif
 #else
-    cached = .true.
+    fcached = .true.
     tobecached=1
 #endif
     call get_sep(node(iparent)%xcen,node(branch(i-1))%xcen,dx,dy,dz,xoffset,yoffset,zoffset)
@@ -1765,20 +1809,29 @@ end subroutine propagate_fnode_to_node
 !  return list of parents of current node
 !+
 !-----------------------------------------------------------
-pure subroutine get_list_of_parent_nodes(inode,node,parents,nparents)
+pure subroutine get_list_of_parent_nodes(inode,node,parents,nparents,startwith)
  integer,      intent(in)  :: inode
  type(kdnode), intent(in)  :: node(:)
  integer,      intent(out) :: parents(:)
  integer,      intent(out) :: nparents
+ integer,      intent(out) :: startwith(2)
  integer :: j
+ logical :: notfound
 
  j = inode
- nparents = 1
- parents  = 0
+ notfound  = .true.
+ nparents  = 1
+ parents   = 0
+ startwith = 0
  parents(nparents) = j ! set first elem to inode to use parents for propagation
  do while (node(j)%parent  /=  0)
     j = node(j)%parent
     nparents = nparents + 1
+    if (node(j)%ncached .and. notfound ) then
+       startwith(1) = j
+       startwith(2) = nparents
+       notfound = .false.
+    endif
     parents(nparents) = j
  enddo
 
@@ -1860,37 +1913,25 @@ subroutine node_interaction(node_dst,node_src,tree_acc2,fnode,stackit,xoffset,yo
  real    :: dx,dy,dz,r2,dr1
  real    :: rcut_dst,rcut_src,rcut,rcut2
  real    :: size_dst,size_src,mass_src,quads_src(9)
- logical :: wellsep,cached
+ logical :: wellsep
 
  call get_sep(node_dst%xcen,node_src%xcen,dx,dy,dz,xoffset,yoffset,zoffset,r2)
  call get_node_size(node_dst,node_src,size_dst,size_src,rcut_dst,rcut_src)
-#ifdef GRAVITY
- if (use_cache) then
-    !$omp atomic read
-    cached = node_dst%cached
-    !$omp end atomic
- else
-    cached = .false.
- endif
-#else
- cached = .false.
-#endif
  rcut  = max(rcut_dst,rcut_src)
  rcut2 = (size_dst+size_src+rcut)**2
  wellsep = (tree_acc2*r2 > (size_dst+size_src)**2) .and. (r2 > rcut2)
 
  if (wellsep) then
-    if (.not.cached) then
-       dr1 = 1./sqrt(r2)
+    dr1 = 1./sqrt(r2)
 #ifdef GRAVITY
-       mass_src=node_src%mass
-       quads_src=node_src%quads
+    mass_src=node_src%mass
+    quads_src=node_src%quads
 #else
-       mass_src=0.
-       quads_src=0.
+    mass_src=0.
+    quads_src=0.
 #endif
-       call compute_M2L(dx,dy,dz,dr1,mass_src,quads_src,fnode)
-    endif
+    call compute_M2L(dx,dy,dz,dr1,mass_src,quads_src,fnode)
+
     stackit = .false.
  else
     stackit = .true.
@@ -2225,7 +2266,8 @@ subroutine revtree(node, xyzh, leaf_is_active, ncells)
     node(inode)%mass = totmass
     node(inode)%quads = quads
     node(inode)%tobecached = 1
-    node(inode)%cached = .false.
+    node(inode)%fcached = .false.
+    node(inode)%ncached = .false.
 #endif
 
     ! set leaf_is_active flag for leaf nodes (matching maketree behavior)

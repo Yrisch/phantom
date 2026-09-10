@@ -30,9 +30,10 @@ module dtypekdtree
                     + 4 &    ! parent
                     + 4 &    ! idum
 #ifdef GRAVITY
-                    + 8*9 &  ! quads(9)
                     + 4 &    ! tobecached
-                    + 4 &    ! cached
+                    + 4 &    ! ncached
+                    + 4 &    ! fcached
+                    + 8*9 &  ! quads(9)
 #endif
                     + 0
 
@@ -62,7 +63,8 @@ module dtypekdtree
     integer :: idum ! avoid ifort warning: align on 4-byte boundary
 #ifdef GRAVITY
     integer :: tobecached
-    logical :: cached
+    logical :: ncached
+    logical :: fcached
     real    :: quads(9)
 #endif
  end type kdnode
