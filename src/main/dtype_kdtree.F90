@@ -169,7 +169,13 @@ subroutine get_mpitype_of_kdnode(dtype)
  nblock = nblock + 1
  blens(nblock) = 1
  mpitypes(nblock) = MPI_LOGICAL
- call MPI_GET_ADDRESS(node%cached,addr,mpierr)
+ call MPI_GET_ADDRESS(node%ncached,addr,mpierr)
+ disp(nblock) = addr - start
+
+ nblock = nblock + 1
+ blens(nblock) = 1
+ mpitypes(nblock) = MPI_LOGICAL
+ call MPI_GET_ADDRESS(node%fcached,addr,mpierr)
  disp(nblock) = addr - start
 #endif
 

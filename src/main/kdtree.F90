@@ -34,8 +34,9 @@ module kdtree
  real,             allocatable :: fnode_branch(:,:)
  integer,          allocatable :: neighnodecount_branch(:)
  integer,          allocatable :: neighnode_branch(:,:)
- integer,          allocatable :: neighnodecount(:)
- integer,          allocatable :: neighnodecache(:,:)
+ integer,          allocatable :: neighnodecache(:)
+ integer,          allocatable :: neighnodecache_start(:)
+ integer,          allocatable :: neighnodecache_count(:)
  real,             allocatable :: fnodecache(:,:)
 !$omp threadprivate(fnode_branch,neighnode_branch,neighnodecount_branch)
 !
@@ -44,7 +45,8 @@ module kdtree
  integer,          parameter, public :: irootnode    = 1
  character(len=1), parameter, public :: labelax(3)   = (/'x','y','z'/)
  integer,          parameter         :: maxdepth     = 64
- integer,          parameter         :: maxnodecache = 100
+ integer,          parameter         :: maxnodecache_local = 0
+ integer,          parameter         :: maxneigh_per_node  = 16
 !
 !--runtime options for this module
 !
@@ -58,6 +60,7 @@ module kdtree
 ! Index of the last node in the local tree that has been copied to
 ! the global tree
  integer :: irefine
+ integer :: itail_neigh = 0
 
  public :: allocate_kdtree, deallocate_kdtree
  public :: maketree, revtree, getneigh,getneigh_dual,kdnode,lenfgrav
@@ -87,13 +90,15 @@ subroutine allocate_kdtree
  call allocate_array('inodeparts', inodeparts, maxp)
  if (mpi) call allocate_array('refinementnode', refinementnode, ncellsmax+1)
  call allocate_array('fnodecache', fnodecache, lenfgrav, ncellsmax+1)
- call allocate_array('neighnodecache',neighnodecache,maxnodecache,ncellsmax+1)
- call allocate_array('nneighnodecount',neighnodecount,ncellsmax+1)
+ call allocate_array('neighnodecache',neighnodecache,ncellsmax*maxneigh_per_node)
+ call allocate_array('neighnodecache_start',neighnodecache_start,ncellsmax+1)
+ call allocate_array('neighnodecache_count',neighnodecache_count,ncellsmax+1)
 !$omp parallel
  call allocate_array('neighnodecount_branch',neighnodecount_branch,maxdepth)
- call allocate_array('neighnode_branch',neighnode_branch,maxnodecache,maxdepth)
+ call allocate_array('neighnode_branch',neighnode_branch,maxnodecache_local,maxdepth)
  call allocate_array('fnode_branch', fnode_branch, lenfgrav, maxdepth)
 !$omp end parallel
+ itail_neigh = 0
 
 end subroutine allocate_kdtree
 
@@ -104,7 +109,8 @@ subroutine deallocate_kdtree
  if (mpi .and. allocated(refinementnode)) deallocate(refinementnode)
  if (allocated(fnodecache)) deallocate(fnodecache)
  if (allocated(neighnodecache)) deallocate(neighnodecache)
- if (allocated(neighnodecount)) deallocate(neighnodecount)
+ if (allocated(neighnodecache_start)) deallocate(neighnodecache_start)
+ if (allocated(neighnodecache_count)) deallocate(neighnodecache_count)
 !$omp parallel
  if (allocated(neighnode_branch)) deallocate(neighnode_branch)
  if (allocated(neighnodecount_branch)) deallocate(neighnodecount_branch)
@@ -158,6 +164,7 @@ subroutine maketree(node, xyzh, np, leaf_is_active, ncells, apr_tree, refineleve
     sinktree = .true.
  endif
 
+ itail_neigh = 0
  leaf_is_active = 0
 
  ir = 0
@@ -1563,7 +1570,6 @@ end subroutine getneigh
 !----------------------------------------------------------------
 subroutine getneigh_dual(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzcachesize,leaf_is_active,&
                               get_hj,get_f,fnode,icell)
- use io,       only:fatal
  type(kdnode), intent(inout) :: node(:) !ncellsmax+1)
  integer,      intent(in)    :: ixyzcachesize
  real,         intent(in)    :: xpos(3)
@@ -1576,8 +1582,8 @@ subroutine getneigh_dual(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzca
  logical,      intent(in)    :: get_f
  real,         intent(out)   :: fnode(lenfgrav)
  integer,      intent(in)    :: icell
- integer :: istack,i,iparent,idstbranch,idst,isrc,maxcache,tobecached
- integer :: branch(maxdepth),nparents,stack(3,2000),startwith(2)
+ integer :: istack,i,iparent,idstbranch,idst,isrc,maxcache,tobecached,ibase
+ integer :: branch(maxdepth),nparents,stack(3,2048),startwith(2)
  real    :: dx,dy,dz,xoffset,yoffset,zoffset
  real    :: tree_acc2
  real    :: fnode_acc(lenfgrav)
@@ -1594,7 +1600,7 @@ subroutine getneigh_dual(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzca
  call get_list_of_parent_nodes(icell,node,branch,nparents,startwith)
 
  neighnodecount_branch = 0
- neighnode_branch = 0.
+ neighnode_branch = 0
  fnode_branch = 0.
  fnode_acc    = 0.
  nneigh = 0
@@ -1603,13 +1609,13 @@ subroutine getneigh_dual(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzca
  yoffset = 0.
  zoffset = 0.
 
- if (startwith(2) > 0) then
-    if(startwith(2) == 2 ) print*,real(nparents-startwith(2)+1)/nparents,neighnodecount(startwith(1))
-    do i=1,neighnodecount(startwith(1))
-       isrc = neighnodecache(i,startwith(1))
+ if (use_cache .and. startwith(2) > 0) then
+    ! print*, real(nparents-startwith(2)+1)/nparents,nparents,neighnodecache_count(startwith(1))*2
+    do i=1,neighnodecache_count(startwith(1))
+       isrc = neighnodecache(neighnodecache_start(startwith(1)) + i)
        call open_nodes(stack,istack,node(isrc),isrc,branch,startwith(2),&
-                    listneigh,xyzcache,ixyzcachesize,nneigh,leaf_is_active,&
-                    maxcache,xoffset,yoffset,zoffset)
+                       listneigh,xyzcache,ixyzcachesize,nneigh,leaf_is_active,&
+                       maxcache,xoffset,yoffset,zoffset)
     enddo
  else
     istack = istack + 1
@@ -1639,7 +1645,7 @@ subroutine getneigh_dual(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzca
     if (stackit) then
        neighnodecount_branch(idstbranch) = neighnodecount_branch(idstbranch) + 1
        !-- if count overflow, we will not cache it during the downward pass
-       if (neighnodecount_branch(idstbranch) <= maxnodecache) then
+       if (neighnodecount_branch(idstbranch) <= maxnodecache_local) then
           neighnode_branch(neighnodecount_branch(idstbranch),idstbranch) = isrc
        endif
 
@@ -1663,19 +1669,31 @@ subroutine getneigh_dual(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzca
        node(iparent)%tobecached = min(node(iparent)%tobecached,0)
        !$omp end atomic
        if (tobecached==1) then
-          !-- store interaction list in the cache array if it fits
-          if (neighnodecount_branch(i)< maxnodecache) then
-             neighnodecount(iparent) = neighnodecount_branch(i)
-             neighnodecache(1:neighnodecount(iparent),iparent) = neighnode_branch(1:neighnodecount(iparent),i)
-             !$omp atomic write
-             node(iparent)%ncached = .true.
-             !$omp end atomic
-          endif
-          !always cached fnode
+          !always cached fnode (fnode always first cuz ncached is use as the main barrier)
           fnodecache(1:lenfgrav,iparent) = fnode_branch(1:lenfgrav,i)
           !$omp atomic write
           node(iparent)%fcached = .true.
           !$omp end atomic
+
+          !-- store interaction list in the cache array if it fits
+          if (neighnodecount_branch(i)> 0 .and. neighnodecount_branch(i) <= maxnodecache_local) then
+             !$omp atomic capture
+             ibase = itail_neigh
+             itail_neigh = itail_neigh + neighnodecount_branch(i)
+             !$omp end atomic
+             if (ibase+neighnodecount_branch(i) <= size(neighnodecache)) then
+                neighnodecache(ibase+1:ibase+neighnodecount_branch(i)) = neighnode_branch(1:neighnodecount_branch(i),i)
+                neighnodecache_start(iparent) = ibase
+                neighnodecache_count(iparent) = neighnodecount_branch(i)
+                !$omp atomic write
+                node(iparent)%ncached = .true.
+                !$omp end atomic
+                ! else
+                !    print*,"overflow global !!! "
+             endif
+             ! else
+             !    print*,"overflow local !!!",neighnodecount_branch(i),i
+          endif
        else
           !$omp atomic read
           fcached = node(iparent)%fcached
@@ -1913,25 +1931,37 @@ subroutine node_interaction(node_dst,node_src,tree_acc2,fnode,stackit,xoffset,yo
  real    :: dx,dy,dz,r2,dr1
  real    :: rcut_dst,rcut_src,rcut,rcut2
  real    :: size_dst,size_src,mass_src,quads_src(9)
- logical :: wellsep
+ logical :: wellsep,fcached
 
  call get_sep(node_dst%xcen,node_src%xcen,dx,dy,dz,xoffset,yoffset,zoffset,r2)
  call get_node_size(node_dst,node_src,size_dst,size_src,rcut_dst,rcut_src)
+#ifdef GRAVITY
+ if (use_cache) then
+    !$omp atomic read
+    fcached = node_dst%fcached
+    !$omp end atomic
+ else
+    fcached = .false.
+ endif
+#else
+ fcached = .false.
+#endif
  rcut  = max(rcut_dst,rcut_src)
  rcut2 = (size_dst+size_src+rcut)**2
  wellsep = (tree_acc2*r2 > (size_dst+size_src)**2) .and. (r2 > rcut2)
 
  if (wellsep) then
-    dr1 = 1./sqrt(r2)
+    if (.not.fcached) then
+       dr1 = 1./sqrt(r2)
 #ifdef GRAVITY
-    mass_src=node_src%mass
-    quads_src=node_src%quads
+       mass_src=node_src%mass
+       quads_src=node_src%quads
 #else
-    mass_src=0.
-    quads_src=0.
+       mass_src=0.
+       quads_src=0.
 #endif
-    call compute_M2L(dx,dy,dz,dr1,mass_src,quads_src,fnode)
-
+       call compute_M2L(dx,dy,dz,dr1,mass_src,quads_src,fnode)
+    endif
     stackit = .false.
  else
     stackit = .true.
@@ -2119,6 +2149,7 @@ subroutine revtree(node, xyzh, leaf_is_active, ncells)
  real :: x0(3)
  real :: xcofm, ycofm, zcofm, fac, dfac
  logical :: nodeisactive
+ itail_neigh = 0
  pmassi = massoftype(igas)
 
  ! find maximum index in inodeparts that we need to update in treecache
