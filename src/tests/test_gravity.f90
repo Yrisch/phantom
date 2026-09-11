@@ -887,7 +887,7 @@ end subroutine test_sphere
 !-----------------------------------------------------------------------
 subroutine selfgrav_comparison()
  use setplummer, only:iprofile_plummer
- use kdtree,     only:use_geotree
+ use kdtree,     only:use_geosplit
  integer :: ntarg(9),i,itree,iprofile
  integer :: ntrees,nprofiles
  integer :: profile_id(3)
@@ -914,7 +914,7 @@ subroutine selfgrav_comparison()
  enddo
 
  !--leave the module in its default state
- use_geotree = .false.
+ use_geosplit = .false.
 
 end subroutine selfgrav_comparison
 
@@ -931,7 +931,7 @@ subroutine prec_bench(npart_target,iprofile,treetype)
  use deriv,       only:get_density_global
  use part,        only:npart,fxyzu
  use setplummer,  only:iprofile_plummer
- use kdtree,      only:maxlevel,maxlevel_indexed,use_geotree
+ use kdtree,      only:maxlevel,maxlevel_indexed,use_geosplit
  use neighkdtree, only:ncells,use_dualtree
  use io,          only:id,master
  use sortutils,   only:indexx
@@ -975,7 +975,7 @@ subroutine prec_bench(npart_target,iprofile,treetype)
 
  !--generic particle distribution for this profile
  call setup_distribution(iprofile,npart_target,-111)
- use_geotree = (index(trim(treetype),'Oct') > 0)
+ use_geosplit = (index(trim(treetype),'Oct') > 0)
  call get_density_global(icall=1)
  if (id==master) print*,"[",trim(treetype),"] npart=",npart," ncells=",ncells,&
         " (maxlevel,maxlevel_indexed)= ",maxlevel,maxlevel_indexed
@@ -1177,7 +1177,7 @@ end subroutine setup_distribution
 subroutine tree_gravity(treetype,theta_crit,dualtree,tbuild,tforce)
  use part,        only:npart,xyzh,vxyzu
  use deriv,       only:get_derivs_global
- use kdtree,      only:tree_accuracy,use_geotree
+ use kdtree,      only:tree_accuracy,use_geosplit
  use neighkdtree, only:use_dualtree,build_tree
  character(len=*), intent(in) :: treetype
  real,             intent(in) :: theta_crit
@@ -1185,7 +1185,7 @@ subroutine tree_gravity(treetype,theta_crit,dualtree,tbuild,tforce)
  real(kind=8),     intent(out) :: tbuild,tforce
  integer(kind=8) :: ic1, ic2, icrate
 
- use_geotree   = (index(trim(treetype),'Oct') > 0)
+ use_geosplit   = (index(trim(treetype),'Oct') > 0)
  use_dualtree = dualtree
  tree_accuracy = theta_crit
 
