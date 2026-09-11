@@ -51,7 +51,7 @@ module kdtree
 !--runtime options for this module
 !
  real,    public  :: tree_accuracy    = 0.5
- logical, public  :: use_octree       = .false.
+ logical, public  :: use_geosplit     = .false.
  logical, public  :: use_cache        = .true.
  logical, private :: done_init_kdtree = .false.
  logical, private :: already_warned   = .false.
@@ -198,7 +198,7 @@ subroutine maketree(node, xyzh, np, leaf_is_active, ncells, apr_tree, refineleve
  ! default number of cells is the size of the `indexed' part of the tree
  ! this can be *increased* by building tree beyond indexed levels
  ! and is decreased afterwards according to the maximum depth actually reached
- if (.not. use_octree) ncells = 2**(maxlevel_indexed+1) - 1
+ if (.not. use_geosplit) ncells = 2**(maxlevel_indexed+1) - 1
 
  ! need to number of particles in node during build
  ! this is counted above to remove dead/accreted particles
@@ -317,11 +317,11 @@ subroutine maketree(node, xyzh, np, leaf_is_active, ncells, apr_tree, refineleve
  endif done
 
  ! decrease number of cells if tree is entirely within 2^k indexing limit
- if ((maxlevel < maxlevel_indexed) .and. (.not. use_octree)) then
+ if ((maxlevel < maxlevel_indexed) .and. (.not. use_geosplit)) then
     ncells = 2**(maxlevel+1) - 1
  endif
  !-- if octree is used, we need to propagate information from leaf to root (hmax and quads)
- if (use_octree) call propagate_upward(int(ncells), node)
+ if (use_geosplit) call propagate_upward(int(ncells), node)
 
  if (maxlevel > maxlevel_indexed .and. .not.already_warned) then
     write(string,"(i10)") 2**(maxlevel-maxlevel_indexed)
@@ -385,7 +385,7 @@ subroutine construct_root_node(np,nproot,irootnode,xmini,xmaxi,leaf_is_active,xy
  real,    intent(inout), optional :: xyzmh_ptmass(:,:)
  integer, intent(in),    optional :: nptmass
  integer :: i,ncross
- real    :: xminpart,yminpart,zminpart,xmaxpart,ymaxpart,zmaxpart,extent
+ real    :: xminpart,yminpart,zminpart,xmaxpart,ymaxpart,zmaxpart
  real    :: xi, yi, zi
 
  xminpart = xyzh(1,1)
@@ -503,22 +503,12 @@ subroutine construct_root_node(np,nproot,irootnode,xmini,xmaxi,leaf_is_active,xy
     inoderange(:,irootnode) = 0
  endif
 
- if (use_octree) then
-    extent = max(xmaxpart, abs(xminpart), ymaxpart, abs(yminpart), zmaxpart, abs(zminpart))
-    xmini(1) = -extent
-    xmini(2) = -extent
-    xmini(3) = -extent
-    xmaxi(1) = extent
-    xmaxi(2) = extent
-    xmaxi(3) = extent
- else
-    xmini(1) = xminpart
-    xmini(2) = yminpart
-    xmini(3) = zminpart
-    xmaxi(1) = xmaxpart
-    xmaxi(2) = ymaxpart
-    xmaxi(3) = zmaxpart
- endif
+ xmini(1) = xminpart
+ xmini(2) = yminpart
+ xmini(3) = zminpart
+ xmaxi(1) = xmaxpart
+ xmaxi(2) = ymaxpart
+ xmaxi(3) = zmaxpart
 
 
 end subroutine construct_root_node
@@ -669,7 +659,7 @@ subroutine set_nodes_properties(npnode,nnode,x0,totmass_node,mymum,nodeentry,xmi
     ! so we'll use thread-local accumulators and combine at the end
     if (npnode > 1000 .and. doparallel) then
        !$omp parallel do schedule(static) default(none) &
-       !$omp shared(npnode,treecache,x0,i1,use_octree) &
+       !$omp shared(npnode,treecache,x0,i1,use_geosplit) &
        !$omp private(i,xi,yi,zi,hi,dx,dy,dz,dr2) &
        !$omp firstprivate(pmassi) &
 #ifdef GRAVITY
@@ -684,7 +674,7 @@ subroutine set_nodes_properties(npnode,nnode,x0,totmass_node,mymum,nodeentry,xmi
           dx    = xi - x0(1)
           dy    = yi - x0(2)
           dz    = zi - x0(3)
-          if (.not.use_octree) then
+          if (.not.use_geosplit) then
              dr2   = dx*dx + dy*dy + dz*dz
              r2max = max(r2max,dr2)
           endif
@@ -713,7 +703,7 @@ subroutine set_nodes_properties(npnode,nnode,x0,totmass_node,mymum,nodeentry,xmi
           dx    = xi - x0(1)
           dy    = yi - x0(2)
           dz    = zi - x0(3)
-          if (.not.use_octree) then
+          if (.not.use_geosplit) then
              dr2   = dx*dx + dy*dy + dz*dz
              r2max = max(r2max,dr2)
           endif
@@ -735,8 +725,8 @@ subroutine set_nodes_properties(npnode,nnode,x0,totmass_node,mymum,nodeentry,xmi
     endif
  endif
 
- if (use_octree) then
-    r2max = 3.*(0.5*maxval((xmaxi-xmini),1))**2
+ if (use_geosplit) then
+    r2max = 0.25*sum((xmaxi-xmini)**2)
     totmass_node  = totmass
  endif
  ! reduce node limits and quads across MPI tasks belonging to this group
@@ -814,8 +804,7 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
  real    :: xyzcofmg(3)
  real    :: totmassg
  integer :: npnodetot
-
- logical :: nodeisactive,is_not_cube,comp_node
+ logical :: nodeisactive,comp_node
  integer :: i,npcounter,ipart
  real    :: x0(3)
  integer :: iaxis
@@ -850,20 +839,15 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
  il = 0
  nl = 0
  nr = 0
- is_not_cube = (mod(level, 3) /= 0)
  wassplit    = (npnodetot > minpart)
  if ((.not. global_build) .and. (npnode  <  1)) return ! node has no particles, just quit
 
  xyzcofm(:) = 0.
 
-
- !--for gravity, we need the centre of the node to be the centre of mass if Kdtree
- !-- else midpoint is fine with octree
- if (use_octree) then
-    x0 = (xmaxi+xmini)*0.5
-    !wassplit = wassplit .or. is_not_cube
-    comp_node = .not.(wassplit)
- else
+ if (use_geosplit) then !--for geotree we use the middle point to split the node and propagate properties after
+    x0        = (xmaxi+xmini)*0.5       ! middle point of the node
+    comp_node = .not.wassplit
+ else  !--for gravity and default KDtree, we need the centre of the node to be the centre of mass
     call compute_nodes_cofm(npnode,nnode,xyzcofm,totmass_node,doparallel)
     ! if this is global node construction, get the cofm and total mass
     ! of all particles in this node (some on other MPI tasks)
@@ -907,17 +891,13 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
        leaf_is_active(nnode) = 1
     endif
  else ! split this node and add children to stack
-    if (use_octree) then
-       iaxis  = mod(level,3) + 1        ! split along longest axis
-    else
-       iaxis  = maxloc(xmaxi - xmini,1) ! split along longest axis
-    endif
+    iaxis  = maxloc(xmaxi - xmini,1) ! split along longest axis
     xpivot = x0(iaxis)               ! split middle longest axis
 
     if (maxlevel > maxdepth) call fatal('maketree','maximum tree depth reached !!')
     ! create two children nodes and point to them from current node
     ! always use G&R indexing for global tree
-    if (((level < maxlevel_indexed) .or. global_build) .and. (.not. use_octree)) then
+    if (((level < maxlevel_indexed) .or. global_build) .and. (.not. use_geosplit)) then
        il = 2*nnode   ! indexing as per Gafton & Rosswog (2011)
        ir = il + 1
     else
@@ -952,8 +932,8 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
           call error('maketree','number of left + right != parent while splitting (likely cause: NaNs in position arrays)')
        endif
 
-       ! see if all the particles ended up in one node, if so, arbitrarily build 2 cells
-       if ( (.not. global_build) .and. ((nl==npnode) .or. (nr==npnode)) .and. (.not. use_octree)) then
+       ! see if all the particles ended up in one node, if so, arbitrarily build 2 cells. This should never happen
+       if ( (.not. global_build) .and. ((nl==npnode) .or. (nr==npnode)) ) then
           ! no need to move particles because if they all ended up in one node,
           ! then they are still in the original order
           nl = npnode / 2
