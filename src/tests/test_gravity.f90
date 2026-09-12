@@ -937,8 +937,9 @@ subroutine prec_bench(npart_target,iprofile,treetype)
  use sortutils,   only:indexx
  integer,          intent(in) :: iprofile,npart_target
  character(len=*), intent(in) :: treetype
- character(len=64) :: label,filename_max
- integer :: it,itest,iunit,iper
+ character(len=64) :: label,filename_max,fn_fcache
+ integer :: it,itest,iunit,iunitcache,iper
+ logical :: exists
  real,    allocatable :: fxyz_dir(:,:),err_rel(:)
  integer, allocatable :: erridx(:)
  integer, parameter   :: niter=10
@@ -984,9 +985,27 @@ subroutine prec_bench(npart_target,iprofile,treetype)
  allocate(err_rel(npart))
  allocate(erridx(npart))
 
- !--exact reference acceleration (theta=0, single tree)
- call tree_gravity(trim(treetype),0.,tbuild,tforce)
- fxyz_dir  = fxyzu(1:3,1:npart)
+ !- dump the direct force to avoid multiple computation
+ write(fn_fcache,'(a,"_",a,"_",i0)') "fcache", trim(label), npart_target
+ inquire(file=trim(fn_fcache),exist=exists)
+
+ if (exists) then
+    print*,"--> read direct force from dump"
+    open(newunit=iunitcache,file=trim(fn_fcache),form="unformatted",status="old",action="read")
+    read(iunitcache) fxyz_dir
+    read(iunitcache) tforce
+    close(iunitcache)
+ else
+    !--exact reference acceleration (theta=0, single tree)
+    call tree_gravity(trim(treetype),0.,tbuild,tforce)
+    fxyz_dir  = fxyzu(1:3,1:npart)
+    print*,"--> dump direct force for later use"
+    open(newunit=iunitcache,file=trim(fn_fcache),form="unformatted",status="replace",action="write")
+    write(iunitcache) fxyz_dir
+    write(iunitcache) tforce
+    close(iunitcache)
+ endif
+
  timings(3,:) = tforce
 
  tree_acc: do it=0,niter
@@ -1176,9 +1195,10 @@ end subroutine setup_distribution
 !-----------------------------------------------------------------------
 subroutine tree_gravity(treetype,theta_crit,tbuild,tforce)
  use part,        only:npart,xyzh,vxyzu
- use deriv,       only:get_derivs_global
+ use deriv,       only:get_derivs_global,get_density_global
  use kdtree,      only:tree_accuracy,use_geosplit
  use neighkdtree, only:use_dualtree,build_tree
+ use directsum,   only:directsum_parallel
  character(len=*), intent(in) :: treetype
  real,             intent(in) :: theta_crit
  real(kind=8),     intent(out) :: tbuild,tforce
@@ -1196,10 +1216,18 @@ subroutine tree_gravity(treetype,theta_crit,tbuild,tforce)
  call system_clock(count=ic2)
  tbuild = real(ic2-ic1,kind=8)/real(icrate,kind=8)
 
- call system_clock(count=ic1)
- call get_derivs_global(icall=2)
- call system_clock(count=ic2)
- tforce = real(ic2-ic1,kind=8)/real(icrate,kind=8)
+ if (tree_accuracy > epsilon(tree_accuracy)) then
+    call system_clock(count=ic1)
+    call get_derivs_global(icall=2)
+    call system_clock(count=ic2)
+    tforce = real(ic2-ic1,kind=8)/real(icrate,kind=8)
+ else
+    call system_clock(count=ic1)
+    call get_density_global(icall=1)
+    call directsum_parallel()
+    call system_clock(count=ic2)
+    tforce = real(ic2-ic1,kind=8)/real(icrate,kind=8)
+ endif
 
 end subroutine tree_gravity
 
