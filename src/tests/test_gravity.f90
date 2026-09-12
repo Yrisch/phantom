@@ -894,7 +894,7 @@ subroutine selfgrav_comparison()
  character(len=8) :: treelabel(3)
 
  ntarg = (/1000,3000,10000,30000,100000,300000,1000000,3000000,10000000/)
- treelabel    = (/'KDtree  ','Octree  ','Single  '/)
+ treelabel    = (/'KDtree  ','Octree  ','STTrav  '/)
  profile_id   = (/iprofile_plummer,3,4/)
  ntrees    = size(treelabel)
  nprofiles = size(profile_id)
@@ -907,7 +907,7 @@ subroutine selfgrav_comparison()
     do i=1,size(ntarg)
        if (id==master) write(*,*) 'Test with Npart = ',ntarg(i)
        do iprofile=1,nprofiles
-          if (iprofile <3) call prec_bench(ntarg(i),profile_id(iprofile),trim(treelabel(itree)))  ! accuracy vs exact direct sum
+          if (itree <3) call prec_bench(ntarg(i),profile_id(iprofile),trim(treelabel(itree)))  ! accuracy vs exact direct sum
           call perf_bench(ntarg(i),profile_id(iprofile),trim(treelabel(itree)))  ! wall-clock build + force time
        enddo
     enddo
@@ -1014,7 +1014,7 @@ subroutine prec_bench(npart_target,iprofile,treetype)
        if (itest==1) then
           call tree_gravity(trim(treetype),theta_crit,tbuild,tforce)  ! SFMM: dual-tree walk
        else
-          call tree_gravity(trim(treetype),theta_crit,tbuild,tforce)  ! FMM: single-tree walk
+          call tree_gravity('STTrav',theta_crit,tbuild,tforce)  ! FMM: single-tree walk
        endif
 
        timings(itest,it+1) = tforce
