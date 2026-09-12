@@ -891,10 +891,10 @@ subroutine selfgrav_comparison()
  integer :: ntarg(9),i,itree,iprofile
  integer :: ntrees,nprofiles
  integer :: profile_id(3)
- character(len=8) :: treelabel(2)
+ character(len=8) :: treelabel(3)
 
  ntarg = (/1000,3000,10000,30000,100000,300000,1000000,3000000,10000000/)
- treelabel    = (/'KDtree  ','Octree  '/)
+ treelabel    = (/'KDtree  ','Octree  ','Single  '/)
  profile_id   = (/iprofile_plummer,3,4/)
  ntrees    = size(treelabel)
  nprofiles = size(profile_id)
@@ -985,7 +985,7 @@ subroutine prec_bench(npart_target,iprofile,treetype)
  allocate(erridx(npart))
 
  !--exact reference acceleration (theta=0, single tree)
- call tree_gravity(trim(treetype),0.,.false.,tbuild,tforce)
+ call tree_gravity(trim(treetype),0.,tbuild,tforce)
  fxyz_dir  = fxyzu(1:3,1:npart)
  timings(3,:) = tforce
 
@@ -993,9 +993,9 @@ subroutine prec_bench(npart_target,iprofile,treetype)
     theta_crit = 0.1 + it*0.05
     do itest=1,2
        if (itest==1) then
-          call tree_gravity(trim(treetype),theta_crit,.true.,tbuild,tforce)   ! SFMM: dual-tree walk
+          call tree_gravity(trim(treetype),theta_crit,tbuild,tforce)  ! SFMM: dual-tree walk
        else
-          call tree_gravity(trim(treetype),theta_crit,.false.,tbuild,tforce)  ! FMM: single-tree walk
+          call tree_gravity(trim(treetype),theta_crit,tbuild,tforce)  ! FMM: single-tree walk
        endif
 
        timings(itest,it+1) = tforce
@@ -1055,7 +1055,7 @@ subroutine perf_bench(npart_target,iprofile,treetype)
  call setup_distribution(iprofile,npart_target,-111)
  call get_density_global(icall=1)
  !--timed tree build + force evaluation
- call tree_gravity(trim(treetype),theta_crit,.false.,tbuild,tforce)
+ call tree_gravity(trim(treetype),theta_crit,tbuild,tforce)
 
  nleaf = count(leaf_is_active(1:int(ncells)) /= 0)
  ncells_used = nleaf + count(node(1:int(ncells))%leftchild /= 0)
@@ -1174,19 +1174,18 @@ end subroutine setup_distribution
 !  accelerations are left in the global fxyzu array.
 !+
 !-----------------------------------------------------------------------
-subroutine tree_gravity(treetype,theta_crit,dualtree,tbuild,tforce)
+subroutine tree_gravity(treetype,theta_crit,tbuild,tforce)
  use part,        only:npart,xyzh,vxyzu
  use deriv,       only:get_derivs_global
  use kdtree,      only:tree_accuracy,use_geosplit
  use neighkdtree, only:use_dualtree,build_tree
  character(len=*), intent(in) :: treetype
  real,             intent(in) :: theta_crit
- logical,          intent(in) :: dualtree
  real(kind=8),     intent(out) :: tbuild,tforce
  integer(kind=8) :: ic1, ic2, icrate
 
- use_geosplit   = (index(trim(treetype),'Oct') > 0)
- use_dualtree = dualtree
+ use_geosplit  = (index(trim(treetype),'Oct') > 0)
+ use_dualtree  = (index(trim(treetype),'tree') > 0)
  tree_accuracy = theta_crit
 
  call system_clock(count_rate=icrate)
