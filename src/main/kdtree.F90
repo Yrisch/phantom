@@ -45,7 +45,7 @@ module kdtree
  integer,          parameter, public :: irootnode    = 1
  character(len=1), parameter, public :: labelax(3)   = (/'x','y','z'/)
  integer,          parameter         :: maxdepth     = 64
- integer,          parameter         :: maxnodecache_local = 0
+ integer,          parameter         :: maxnodecache_local = 512
  integer,          parameter         :: maxneigh_per_node  = 16
 !
 !--runtime options for this module
@@ -355,6 +355,7 @@ subroutine empty_tree(node)
     node(i)%leftchild = 0
     node(i)%rightchild = 0
     node(i)%parent = 0
+    node(i)%level  = 0
 #ifdef GRAVITY
     node(i)%mass  = 0.
     node(i)%quads = 0.
@@ -757,6 +758,7 @@ subroutine set_nodes_properties(npnode,nnode,x0,totmass_node,mymum,nodeentry,xmi
  nodeentry%size       = sqrt(r2max) + epsilon(r2max)
  nodeentry%hmax       = hmax
  nodeentry%parent     = mymum
+ nodeentry%level      = level
 #ifdef GRAVITY
  nodeentry%mass       = totmass_node
  nodeentry%quads      = quads
@@ -1249,63 +1251,114 @@ end subroutine special_sort_particles_in_cell
 
 subroutine propagate_upward(ncells,node)
  use io, only: fatal
- integer     , intent(in)    :: ncells
+!$ use omp_lib, only: omp_get_max_threads, omp_get_thread_num
+ integer,      intent(in)    :: ncells
  type(kdnode), intent(inout) :: node(:)
- type(kdnode), allocatable :: nodemap(:)
- integer :: lvl,i,ir,il,npnode,iswitch,nlvl
- real    :: mnode,xcen(3)
+ integer, allocatable :: levcount(:), levstart(:), nodelist(:)
+ integer, allocatable :: levcount_t(:,:)
+ integer :: i,lvl,id,istart,iend,il,ir,npnode,nthreads,it,tid
+ integer :: rcnt(0:maxlevel)
+ real    :: mnode
 
- nlvl  = maxlevel + mod(maxlevel,2) !-- we need to finish on an even number to copy the information in the node array
+ !--
+ !  sort internal nodes (both children present) by tree level using a
+ !  parallel counting sort. The count pass keeps a histogram per thread
+ !  (levcount_t); prefix sums give the start of each level in nodelist;
+ !  for the scatter each thread uses a private running offset (rcnt),
+ !  initialised from the cumulative histogram of the threads that precede
+ !  it, so that each thread writes a disjoint slice of nodelist, race-free.
+ !  Count and scatter use the same schedule(static), which guarantees that
+ !  thread tid counts exactly the nodes it later scatters.
+ !--
+ nthreads = 1
+!$ nthreads = omp_get_max_threads()
+ allocate(levcount(0:maxlevel), levstart(0:maxlevel+1), nodelist(ncells))
+ allocate(levcount_t(0:maxlevel,1:nthreads))
+ levcount_t = 0
+ levcount = 0
 
- allocate(nodemap(ncells))
- nodemap(1:ncells) = node(1:ncells)
+ !$omp parallel default(none) &
+ !$omp shared(node,ncells,maxlevel,nthreads,nodelist,levcount,levstart,levcount_t,inoderange) &
+ !$omp private(i,lvl,id,istart,iend,il,ir,mnode,npnode) &
+ !$omp private(it,tid,rcnt)
+ tid = omp_get_thread_num()
 
-!
-!-- the first loop guarantees that after maxlevel iterations the quads and hmax are up to the root
-!
- lvl_loop: do lvl=1,nlvl
+ !$omp do schedule(static)
+ do i = 1, ncells
+    if (node(i)%leftchild > 0) then
+       lvl = node(i)%level
+       if (lvl < 0 .or. lvl > maxlevel) cycle
+       levcount_t(lvl,tid+1) = levcount_t(lvl,tid+1) + 1
+    endif
+ enddo
+ !$omp end do
 
-    iswitch = mod(lvl,2)
-    !
-    !-- the second loop compute quads and hmax with no distinction.
-    !-- This pass should be really fast so it is not important to loose few ops here.
-    !
-    !$omp parallel do default(none) &
-    !$omp shared(iswitch,node,nodemap,nlvl,lvl,inoderange)&
-    !$omp private(i,ir,il,mnode,npnode,xcen)
-    node_loop :do i=1,ncells
+ !--combine the per-thread histograms and build the per-level starts
+ !$omp single
+ do it=1,nthreads
+    levcount(:) = levcount(:) + levcount_t(:,it)
+ enddo
+ levstart(0) = 1
+ do lvl = 1, maxlevel+1
+    levstart(lvl) = levstart(lvl-1) + levcount(lvl-1)
+ enddo
+ !$omp end single
 
+ !--scatter: start each thread's offsets after the counts of the preceding
+ !  threads, then fill nodelist within each thread's own level slices
+ rcnt(:) = levstart(0:maxlevel)
+ do it=1,tid
+    rcnt(:) = rcnt(:) + levcount_t(:,it)
+ enddo
+ !$omp do schedule(static)
+ do i = 1, ncells
+    if (node(i)%leftchild > 0) then
+       lvl = node(i)%level
+       if (lvl < 0 .or. lvl > maxlevel) cycle
+       nodelist(rcnt(lvl)) = i
+       rcnt(lvl) = rcnt(lvl) + 1
+    endif
+ enddo
+ !$omp end do
+
+ !--
+ !  propagate properties upward, one level at a time (deepest first).
+ !  nodes in the same level are not ancestor/descendant of each other, so
+ !  each level can be processed in parallel, in place: a node only reads
+ !  its children (already final from the previous level) and writes itself.
+ !--
+ do lvl = maxlevel, 0, -1
+
+    istart = levstart(lvl)
+    iend = levstart(lvl) + levcount(lvl) - 1
+    if (iend < istart) cycle
+
+    !$omp do schedule(runtime)
+    do id = istart, iend
+       i  = nodelist(id)
        il = node(i)%leftchild
        ir = node(i)%rightchild
-       xcen = node(i)%xcen
-       if ((il /= 0) .and. (ir /= 0)) then
-          call translate_node(node,nodemap,iswitch,i,il,ir,xcen)
+       call translate_node(node,i,il,ir)
+
+       npnode = inoderange(2,i) - inoderange(1,i) + 1
+       mnode  = node(i)%mass
+       if (npnode > 1 .and. mnode < epsilon(mnode)) then
+          call fatal('mtree','mnode==0',val=mnode)
        endif
+    enddo
+    !$omp end do
 
-       if (lvl == nlvl) then
-          npnode = inoderange(2,i)-inoderange(1,i) + 1
-          !$omp atomic read
-          mnode  = node(i)%mass
-          !$omp end atomic
-          if (npnode > 1 .and. mnode < epsilon(mnode)) then
-             call fatal('mtree','mnode==0',val=mnode)
-          endif
-       endif
-    enddo node_loop
-    !$omp end parallel do
- enddo lvl_loop
+ enddo
+ !$omp end parallel
 
- deallocate(nodemap)
-
+ deallocate(levcount,levstart,nodelist,levcount_t)
 
 end subroutine propagate_upward
 
-subroutine translate_node(node,nodemap,iswitch,ip,il,ir,xcenp)
- type(kdnode), intent(inout) :: node(:),nodemap(:)
- integer,      intent(in)    :: ip,il,ir,iswitch
- real,         intent(in)    :: xcenp(3)
+subroutine translate_node(node,ip,il,ir)
+ type(kdnode), intent(inout) :: node(:)
+ integer,      intent(in)    :: ip,il,ir
  real    :: dx(3),massp,massc,quadsp(9),quadsc(9),dips(3),hmaxc,hmaxp
- real    :: xcenc(3)
  integer :: j,ic(2),k
 
  ic = (/il,ir/)
@@ -1316,19 +1369,10 @@ subroutine translate_node(node,nodemap,iswitch,ip,il,ir,xcenp)
 
  do j=1,2
     k = ic(j)
-    if (iswitch==1) then
-       massc  = node(k)%mass
-       quadsc = node(k)%quads
-       hmaxc  = node(k)%hmax
-       xcenc  = node(k)%xcen
-    else
-       massc  = nodemap(k)%mass
-       quadsc = nodemap(k)%quads
-       hmaxc  = nodemap(k)%hmax
-       xcenc  = node(k)%xcen
-    endif
-
-    dx = xcenc - xcenp
+    massc  = node(k)%mass
+    quadsc = node(k)%quads
+    hmaxc  = node(k)%hmax
+    dx     = node(k)%xcen - node(ip)%xcen
 
     massp       = massp + massc
     dips(1)     = quadsc(1) + dx(1)*massc
@@ -1348,15 +1392,9 @@ subroutine translate_node(node,nodemap,iswitch,ip,il,ir,xcenp)
 
  enddo
 
- if(iswitch==1) then
-    nodemap(ip)%mass  = massp
-    nodemap(ip)%quads = quadsp
-    nodemap(ip)%hmax  = hmaxp
- else
-    node(ip)%mass  = massp
-    node(ip)%quads = quadsp
-    node(ip)%hmax  = hmaxp
- endif
+ node(ip)%mass  = massp
+ node(ip)%quads = quadsp
+ node(ip)%hmax  = hmaxp
 
 end subroutine translate_node
 

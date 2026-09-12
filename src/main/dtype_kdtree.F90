@@ -28,7 +28,7 @@ module dtypekdtree
                     + 4 &    ! leftchild
                     + 4 &    ! rightchild
                     + 4 &    ! parent
-                    + 4 &    ! idum
+                    + 4 &    ! level
 #ifdef GRAVITY
                     + 4 &    ! tobecached
                     + 4 &    ! ncached
@@ -60,7 +60,7 @@ module dtypekdtree
     integer :: leftchild
     integer :: rightchild
     integer :: parent
-    integer :: idum ! avoid ifort warning: align on 4-byte boundary
+    integer :: level ! avoid ifort warning: align on 4-byte boundary
 #ifdef GRAVITY
     integer :: tobecached
     logical :: ncached
