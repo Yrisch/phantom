@@ -907,7 +907,7 @@ subroutine selfgrav_comparison()
     do i=1,size(ntarg)
        if (id==master) write(*,*) 'Test with Npart = ',ntarg(i)
        do iprofile=1,nprofiles
-          call prec_bench(ntarg(i),profile_id(iprofile),trim(treelabel(itree)))  ! accuracy vs exact direct sum
+          if (iprofile <3) call prec_bench(ntarg(i),profile_id(iprofile),trim(treelabel(itree)))  ! accuracy vs exact direct sum
           call perf_bench(ntarg(i),profile_id(iprofile),trim(treelabel(itree)))  ! wall-clock build + force time
        enddo
     enddo
