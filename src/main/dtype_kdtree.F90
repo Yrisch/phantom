@@ -33,7 +33,8 @@ module dtypekdtree
                     + 4 &    ! tobecached
                     + 4 &    ! ncached
                     + 4 &    ! fcached
-                    + 8*9 &  ! quads(9)
+                    + 8*9 &  ! quads(9) (dips+quads)
+                    + 8*10 & ! octs(10)
 #endif
                     + 0
 
@@ -66,6 +67,7 @@ module dtypekdtree
     logical :: ncached
     logical :: fcached
     real    :: quads(9)
+    real    :: octs(10)  ! xxx,xxy,xxz,xyy,xyz,xzz,yyy,yyz,yzz,zzz
 #endif
  end type kdnode
 
@@ -80,7 +82,7 @@ module dtypekdtree
  end type ptmassnode
 
  type ptmasstree
-    type(ptmassnode), allocatable :: nodes(:)
+    type(ptmassnode),  allocatable :: nodes(:)
     integer,           allocatable :: iptmassnode(:)     ! permutation of point indices (1..N)
     integer                        :: nnodes
  end type ptmasstree
@@ -158,6 +160,12 @@ subroutine get_mpitype_of_kdnode(dtype)
  blens(nblock) = size(node%quads)
  mpitypes(nblock) = MPI_REAL8
  call MPI_GET_ADDRESS(node%quads,addr,mpierr)
+ disp(nblock) = addr - start
+
+ nblock = nblock + 1
+ blens(nblock) = size(node%octs)
+ mpitypes(nblock) = MPI_REAL8
+ call MPI_GET_ADDRESS(node%octs,addr,mpierr)
  disp(nblock) = addr - start
 
  nblock = nblock + 1

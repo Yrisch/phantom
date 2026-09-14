@@ -12,6 +12,8 @@ module kdtree
 ! :References:
 !    Gafton & Rosswog (2011), MNRAS 418, 770-781
 !    Benz, Bowers, Cameron & Press (1990), ApJ 348, 647-667
+!    Dehnen (2000), ApJL 536, L39; Dehnen (2002), JCoPh 179, 27
+!    Marcello (2017), AJ 154, 92 (angular momentum conservation)
 !
 ! :Owner: Daniel Price
 !
@@ -68,6 +70,9 @@ module kdtree
  public :: empty_tree
  public :: compute_M2L,expand_fgrav_in_taylor_series
  integer, public :: maxlevel_indexed, maxlevel
+
+ ! neighbour cache indices (xyzcache); imported with only: from dens/force
+ integer, parameter, public :: ix=1, iy=2, iz=3, ih1=4, im=5, irho=6, izetaomega=7, isoftomega=8
 
  type kdbuildstack
     integer :: node
@@ -359,6 +364,7 @@ subroutine empty_tree(node)
 #ifdef GRAVITY
     node(i)%mass  = 0.
     node(i)%quads = 0.
+    node(i)%octs  = 0.
 #endif
  enddo
 !$omp end parallel do
@@ -640,6 +646,7 @@ subroutine set_nodes_properties(npnode,nnode,x0,totmass_node,mymum,nodeentry,xmi
  integer :: i1,i
 #ifdef GRAVITY
  real    :: quads(9)
+ real    :: octs(10)
 #endif
 
  pmassi  = 0.
@@ -648,6 +655,7 @@ subroutine set_nodes_properties(npnode,nnode,x0,totmass_node,mymum,nodeentry,xmi
  hmax  = 0.
 #ifdef GRAVITY
  quads(:) = 0.
+ octs(:) = 0.
 #endif
 
  i1=inoderange(1,nnode)
@@ -664,7 +672,7 @@ subroutine set_nodes_properties(npnode,nnode,x0,totmass_node,mymum,nodeentry,xmi
        !$omp private(i,xi,yi,zi,hi,dx,dy,dz,dr2) &
        !$omp firstprivate(pmassi) &
 #ifdef GRAVITY
-       !$omp reduction(+:quads,totmass) &
+       !$omp reduction(+:totmass,quads,octs) &
 #endif
        !$omp reduction(max:r2max,hmax)
        do i=i1,i1+npnode-1
@@ -683,15 +691,7 @@ subroutine set_nodes_properties(npnode,nnode,x0,totmass_node,mymum,nodeentry,xmi
 #ifdef GRAVITY
           pmassi = treecache(5,i)
           totmass  = totmass  + pmassi
-          quads(1) = quads(1) + pmassi*dx  ! Q_x
-          quads(2) = quads(2) + pmassi*dy  ! Q_y
-          quads(3) = quads(3) + pmassi*dz  ! Q_z
-          quads(4) = quads(4) + pmassi*(dx*dx)  ! Q_xx
-          quads(5) = quads(5) + pmassi*(dx*dy)  ! Q_xy = Q_yx
-          quads(6) = quads(6) + pmassi*(dx*dz)  ! Q_xz = Q_zx
-          quads(7) = quads(7) + pmassi*(dy*dy)  ! Q_yy
-          quads(8) = quads(8) + pmassi*(dy*dz)  ! Q_yz = Q_zy
-          quads(9) = quads(9) + pmassi*(dz*dz)  ! Q_zz
+          call add_node_moments(pmassi,dx,dy,dz,quads,octs)
 #endif
        enddo
        !$omp end parallel do
@@ -712,15 +712,7 @@ subroutine set_nodes_properties(npnode,nnode,x0,totmass_node,mymum,nodeentry,xmi
 #ifdef GRAVITY
           pmassi = treecache(5,i)
           totmass  = totmass  + pmassi
-          quads(1) = quads(1) + pmassi*dx  ! Q_x
-          quads(2) = quads(2) + pmassi*dy  ! Q_y
-          quads(3) = quads(3) + pmassi*dz  ! Q_z
-          quads(4) = quads(4) + pmassi*(dx*dx)  ! Q_xx
-          quads(5) = quads(5) + pmassi*(dx*dy)  ! Q_xy = Q_yx
-          quads(6) = quads(6) + pmassi*(dx*dz)  ! Q_xz = Q_zx
-          quads(7) = quads(7) + pmassi*(dy*dy)  ! Q_yy
-          quads(8) = quads(8) + pmassi*(dy*dz)  ! Q_yz = Q_zy
-          quads(9) = quads(9) + pmassi*(dz*dz)  ! Q_zz
+          call add_node_moments(pmassi,dx,dy,dz,quads,octs)
 #endif
        enddo
     endif
@@ -750,6 +742,19 @@ subroutine set_nodes_properties(npnode,nnode,x0,totmass_node,mymum,nodeentry,xmi
     quads(4)  = reduce_group(quads(4),'+',level)
     quads(5)  = reduce_group(quads(5),'+',level)
     quads(6)  = reduce_group(quads(6),'+',level)
+    quads(7)  = reduce_group(quads(7),'+',level)
+    quads(8)  = reduce_group(quads(8),'+',level)
+    quads(9)  = reduce_group(quads(9),'+',level)
+    octs(1)   = reduce_group(octs(1),'+',level)
+    octs(2)   = reduce_group(octs(2),'+',level)
+    octs(3)   = reduce_group(octs(3),'+',level)
+    octs(4)   = reduce_group(octs(4),'+',level)
+    octs(5)   = reduce_group(octs(5),'+',level)
+    octs(6)   = reduce_group(octs(6),'+',level)
+    octs(7)   = reduce_group(octs(7),'+',level)
+    octs(8)   = reduce_group(octs(8),'+',level)
+    octs(9)   = reduce_group(octs(9),'+',level)
+    octs(10)  = reduce_group(octs(10),'+',level)
 #endif
  endif
 
@@ -762,6 +767,7 @@ subroutine set_nodes_properties(npnode,nnode,x0,totmass_node,mymum,nodeentry,xmi
 #ifdef GRAVITY
  nodeentry%mass       = totmass_node
  nodeentry%quads      = quads
+ nodeentry%octs       = octs
  nodeentry%tobecached = 1
  nodeentry%fcached    = .false.
  nodeentry%ncached    = .false.
@@ -869,7 +875,6 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
 
  call set_nodes_properties(npnode,nnode,x0,totmass_node,mymum,nodeentry,xmini,xmaxi,&
                            level,global_build,doparallel,comp_node)
-
 
  if (apr_tree)   wassplit = (npnode > 2)
 
@@ -1405,12 +1410,17 @@ end subroutine translate_node
 !+
 !----------------------------------------------------------------
 subroutine cache_neighbours(nneigh,isrc,ixyzcachesize,maxcache,listneigh,xyzcache,xoffset,yoffset,zoffset)
+ use part, only:rho,gradh
+ use dim,  only:igradomega,igradzeta
+#ifdef GRAVITY
+ use dim,  only:igradsoft
+#endif
  integer, intent(in)    :: isrc,ixyzcachesize,maxcache
  real,    intent(in)    :: xoffset,yoffset,zoffset
  integer, intent(inout) :: nneigh
  integer, intent(out)   :: listneigh(:)
  real,    intent(out)   :: xyzcache(:,:)
- integer :: npnode,ipart,num_to_cache
+ integer :: npnode,ipart,num_to_cache,ip,inode
 
  npnode = inoderange(2,isrc) - inoderange(1,isrc) + 1
 
@@ -1424,13 +1434,36 @@ subroutine cache_neighbours(nneigh,isrc,ixyzcachesize,maxcache,listneigh,xyzcach
 
  if (num_to_cache > 0) then
     do ipart=1,num_to_cache
-       listneigh(nneigh+ipart)  = abs(inodeparts(inoderange(1,isrc)+ipart-1))
-       xyzcache(1,nneigh+ipart) = treecache(1,inoderange(1,isrc)+ipart-1) + xoffset
-       xyzcache(2,nneigh+ipart) = treecache(2,inoderange(1,isrc)+ipart-1) + yoffset
-       xyzcache(3,nneigh+ipart) = treecache(3,inoderange(1,isrc)+ipart-1) + zoffset
+       inode = inoderange(1,isrc)+ipart-1
+       ip = abs(inodeparts(inode))
+       listneigh(nneigh+ipart)  = ip
+       xyzcache(1,nneigh+ipart) = treecache(1,inode) + xoffset
+       xyzcache(2,nneigh+ipart) = treecache(2,inode) + yoffset
+       xyzcache(3,nneigh+ipart) = treecache(3,inode) + zoffset
        if (maxcache >= 4) then
-          xyzcache(4,nneigh+ipart) = 1./treecache(4,inoderange(1,isrc)+ipart-1)
+          xyzcache(ih1,nneigh+ipart) = 1./treecache(4,inode)
        endif
+       if (maxcache >= 5) then
+          xyzcache(im,nneigh+ipart) = treecache(5,inode)
+       endif
+       if (maxcache >= 7) then
+          if (ip <= maxpsph) then
+             xyzcache(irho,nneigh+ipart)        = rho(ip)
+             xyzcache(izetaomega,nneigh+ipart) = real(gradh(igradzeta,ip))*real(gradh(igradomega,ip))
+          else
+             xyzcache(irho,nneigh+ipart)        = 0.
+             xyzcache(izetaomega,nneigh+ipart) = 0.
+          endif
+       endif
+#ifdef GRAVITY
+       if (maxcache >= 8) then
+          if (ip <= maxpsph) then
+             xyzcache(isoftomega,nneigh+ipart) = real(gradh(igradsoft,ip))*real(gradh(igradomega,ip))
+          else
+             xyzcache(isoftomega,nneigh+ipart) = 0.
+          endif
+       endif
+#endif
     enddo
  endif
 
@@ -1946,10 +1979,13 @@ subroutine node_interaction(node_dst,node_src,tree_acc2,fnode,stackit,xoffset,yo
  real,         intent(inout) :: fnode(lenfgrav)
  real,         intent(out)   :: xoffset,yoffset,zoffset
  logical,      intent(out)   :: stackit
- real    :: dx,dy,dz,r2,dr1
+ real    :: dx,dy,dz,r2
  real    :: rcut_dst,rcut_src,rcut,rcut2
- real    :: size_dst,size_src,mass_src,quads_src(9)
+ real    :: size_dst,size_src
  logical :: wellsep,fcached
+#ifdef GRAVITY
+ real    :: dr1
+#endif
 
  call get_sep(node_dst%xcen,node_src%xcen,dx,dy,dz,xoffset,yoffset,zoffset,r2)
  call get_node_size(node_dst,node_src,size_dst,size_src,rcut_dst,rcut_src)
@@ -1969,17 +2005,14 @@ subroutine node_interaction(node_dst,node_src,tree_acc2,fnode,stackit,xoffset,yo
  wellsep = (tree_acc2*r2 > (size_dst+size_src)**2) .and. (r2 > rcut2)
 
  if (wellsep) then
+#ifdef GRAVITY
     if (.not.fcached) then
        dr1 = 1./sqrt(r2)
-#ifdef GRAVITY
-       mass_src=node_src%mass
-       quads_src=node_src%quads
-#else
-       mass_src=0.
-       quads_src=0.
-#endif
-       call compute_M2L(dx,dy,dz,dr1,mass_src,quads_src,fnode)
+       call compute_M2L(dx,dy,dz,dr1,node_src%mass,node_src%quads,fnode)
+       call add_torque_correction(dx,dy,dz,dr1,node_dst%mass,node_src%mass, &
+                                  node_dst%octs,node_src%octs,fnode)
     endif
+#endif
     stackit = .false.
  else
     stackit = .true.
@@ -2078,6 +2111,88 @@ pure subroutine compute_M2L(dx,dy,dz,dr1,q0,quads,fnode)
 
 end subroutine compute_M2L
 
+#ifdef GRAVITY
+!----------------------------------------------------------------
+!+
+!  Accumulate quadrupole and octupole moments of a particle
+!  about the node centre of mass (extensive Cartesian form).
+!+
+!----------------------------------------------------------------
+pure subroutine add_node_moments(pmassi,dx,dy,dz,quads,octs)
+ real, intent(in)    :: pmassi,dx,dy,dz
+ real, intent(inout) :: quads(9),octs(10)
+ real :: dx2,dy2,dz2
+
+ dx2 = dx*dx
+ dy2 = dy*dy
+ dz2 = dz*dz
+ quads(1) = quads(1) + pmassi*dx  ! Q_x
+ quads(2) = quads(2) + pmassi*dy  ! Q_y
+ quads(3) = quads(3) + pmassi*dz  ! Q_z
+ quads(4) = quads(4) + pmassi*dx2          ! Q_xx
+ quads(5) = quads(5) + pmassi*dx*dy        ! Q_xy
+ quads(6) = quads(6) + pmassi*dx*dz        ! Q_xz
+ quads(7) = quads(7) + pmassi*dy2          ! Q_yy
+ quads(8) = quads(8) + pmassi*dy*dz        ! Q_yz
+ quads(9) = quads(9) + pmassi*dz2          ! Q_zz
+ octs(1)  = octs(1)  + pmassi*dx2*dx       ! xxx
+ octs(2)  = octs(2)  + pmassi*dx2*dy       ! xxy
+ octs(3)  = octs(3)  + pmassi*dx2*dz       ! xxz
+ octs(4)  = octs(4)  + pmassi*dx*dy2       ! xyy
+ octs(5)  = octs(5)  + pmassi*dx*dy*dz     ! xyz
+ octs(6)  = octs(6)  + pmassi*dx*dz2       ! xzz
+ octs(7)  = octs(7)  + pmassi*dy2*dy       ! yyy
+ octs(8)  = octs(8)  + pmassi*dy2*dz       ! yyz
+ octs(9)  = octs(9)  + pmassi*dy*dz2       ! yzz
+ octs(10) = octs(10) + pmassi*dz2*dz       ! zzz
+
+end subroutine add_node_moments
+
+!----------------------------------------------------------------
+!+
+!  Marcello (2017) TCO torque correction: add a constant
+!  acceleration Fc/M_dst to the destination cell so the net
+!  cell-cell torque vanishes, while keeping equal-and-opposite
+!  forces. Uses the pruned D'_ijkl contraction (his Eq. 19).
+!+
+!----------------------------------------------------------------
+pure subroutine add_torque_correction(dx,dy,dz,dr1,mass_dst,mass_src,octs_dst,octs_src,fnode)
+ real, intent(in)    :: dx,dy,dz,dr1,mass_dst,mass_src
+ real, intent(in)    :: octs_dst(10),octs_src(10)
+ real, intent(inout) :: fnode(lenfgrav)
+ real :: s(10)
+ real :: sxkk,sykk,szkk,sxrr,syrr,szrr
+ real :: r5i,r7i,fac
+
+ if (mass_dst <= 0. .or. mass_src <= 0.) return
+
+ ! S_jkl = M_dst,jkl * M_src - M_dst * M_src,jkl
+ s(:) = octs_dst*mass_src - mass_dst*octs_src
+
+ ! traces S_i,kk
+ sxkk = s(1) + s(4) + s(6)
+ sykk = s(2) + s(7) + s(9)
+ szkk = s(3) + s(8) + s(10)
+
+ ! S_iab R_a R_b  (R is the node separation; even in R so dest-src is fine)
+ sxrr = s(1)*dx*dx + s(4)*dy*dy + s(6)*dz*dz + 2.*(s(2)*dx*dy + s(3)*dx*dz + s(5)*dy*dz)
+ syrr = s(2)*dx*dx + s(7)*dy*dy + s(9)*dz*dz + 2.*(s(4)*dx*dy + s(5)*dx*dz + s(8)*dy*dz)
+ szrr = s(3)*dx*dx + s(8)*dy*dy + s(10)*dz*dz + 2.*(s(5)*dx*dy + s(6)*dx*dz + s(9)*dy*dz)
+
+ r5i = dr1**5
+ r7i = r5i*dr1*dr1
+ ! Appendix Eq. 38 at P=3 uses 1/(n!(P-n)!) = 1/3!, not the 1/2 of Eq. 15.
+ ! Combined with the D' contraction this is 3/2 rather than 9/2.
+ fac = 1.5
+
+ ! Fc_i = (3/2) (S_ikk/R^5 - 5 S_iab R_a R_b / R^7); add Fc/M_dst
+ fnode(1) = fnode(1) - fac*(sxkk*r5i - 5.*sxrr*r7i)/mass_dst
+ fnode(2) = fnode(2) - fac*(sykk*r5i - 5.*syrr*r7i)/mass_dst
+ fnode(3) = fnode(3) - fac*(szkk*r5i - 5.*szrr*r7i)/mass_dst
+
+end subroutine add_torque_correction
+#endif
+
 !----------------------------------------------------------------
 !+
 !  Internal subroutine to compute the Taylor-series expansion
@@ -2161,6 +2276,7 @@ subroutine revtree(node, xyzh, leaf_is_active, ncells)
  real :: dx, dy, dz, dr2
 #ifdef GRAVITY
  real :: quads(9)
+ real :: octs(10)
 #endif
  integer :: inode, ipart, ipartidx, i, nptot
  real :: pmassi, totmass
@@ -2215,7 +2331,7 @@ subroutine revtree(node, xyzh, leaf_is_active, ncells)
 !$omp private(dx,dy,dz,dr2,inode,ipart,x0) &
 !$omp private(xcofm,ycofm,zcofm,fac,dfac,nodeisactive) &
 #ifdef GRAVITY
-!$omp private(quads) &
+!$omp private(quads,octs) &
 #endif
 !$omp firstprivate(pmassi) &
 !$omp private(totmass)
@@ -2229,6 +2345,7 @@ subroutine revtree(node, xyzh, leaf_is_active, ncells)
 #ifdef GRAVITY
     node(inode)%mass    = 0.
     node(inode)%quads(:)= 0.
+    node(inode)%octs(:) = 0.
 #endif
     ! initialize leaf_is_active (will be set for leaf nodes below)
     leaf_is_active(inode) = 0
@@ -2281,6 +2398,7 @@ subroutine revtree(node, xyzh, leaf_is_active, ncells)
     r2max = 0.
 #ifdef GRAVITY
     quads = 0.
+    octs  = 0.
 #endif
     do ipart = inoderange(1,inode), inoderange(2,inode)
        ! load all treecache values sequentially (1,2,3,4,5) for cache efficiency
@@ -2297,12 +2415,7 @@ subroutine revtree(node, xyzh, leaf_is_active, ncells)
        dr2 = dx*dx + dy*dy + dz*dz
        r2max = max(dr2, r2max)
 #ifdef GRAVITY
-       quads(1) = quads(1) + pmassi*(dx*dx)  ! Q_xx
-       quads(2) = quads(2) + pmassi*(dx*dy)  ! Q_xy = Q_yx
-       quads(3) = quads(3) + pmassi*(dx*dz)  ! Q_xz = Q_zx
-       quads(4) = quads(4) + pmassi*(dy*dy)  ! Q_yy
-       quads(5) = quads(5) + pmassi*(dy*dz)  ! Q_yz = Q_zy
-       quads(6) = quads(6) + pmassi*(dz*dz)  ! Q_zz
+       call add_node_moments(pmassi,dx,dy,dz,quads,octs)
 #endif
     enddo
 
@@ -2314,6 +2427,7 @@ subroutine revtree(node, xyzh, leaf_is_active, ncells)
 #ifdef GRAVITY
     node(inode)%mass = totmass
     node(inode)%quads = quads
+    node(inode)%octs  = octs
     node(inode)%tobecached = 1
     node(inode)%fcached = .false.
     node(inode)%ncached = .false.

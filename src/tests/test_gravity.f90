@@ -70,7 +70,7 @@ subroutine test_gravity(ntests,npass,string)
     !
     if (testdirectsum .or. testall) call test_directsum(ntests,npass)
     !
-    !--unit tests of FMM momentum conservation
+    !--unit tests of FMM linear and angular momentum conservation
     !
     if (test_mom .or. testall) call test_FMM(ntests,npass)
     !
@@ -235,11 +235,11 @@ end subroutine test_taylorseries
 !-----------------------------------------------------------------------
 subroutine test_directsum(ntests,npass)
  use io,              only:id,master,nprocs
- use dim,             only:maxp,maxptmass,mpi,use_apr,use_sinktree,maxpsph
+ use dim,             only:maxp,maxptmass,mpi,use_apr,use_sinktree,maxpsph,igradsoft
  use part,            only:init_part,npart,npartoftype,massoftype,xyzh,hfact,vxyzu,fxyzu, &
                            gradh,poten,iphase,isetphase,maxphase,labeltype,&
                            nptmass,xyzmh_ptmass,fxyz_ptmass,dsdt_ptmass,ibelong,&
-                           fxyz_ptmass_tree,istar,shortsinktree
+                           fxyz_ptmass_tree,istar,shortsinktree,init_rho_from_h
  use eos,             only:polyk,gamma
  use options,         only:ieos,alpha,alphau,alphaB,tolh
  use spherical,       only:set_sphere
@@ -483,7 +483,7 @@ subroutine test_directsum(ntests,npass)
     do i=1,npart
        xyzh(4,i)  = h_soft_sinksink
        gradh(1,i) = 1.
-       gradh(2,i) = 0.
+       gradh(igradsoft,i) = 0.
        vxyzu(:,i) = 0.
     enddo
     allocate(fgrav(maxvxyzu,npart))
@@ -541,6 +541,7 @@ subroutine test_directsum(ntests,npass)
     endif
 
     print*,' Using ',npart,' SPH particles and ',nptmass,' point masses'
+    call init_rho_from_h()
     call get_derivs_global(icall=0) ! icall = 0 refresh tree cache used for h1j in the force routine
 
     epoti = 0.0
@@ -636,7 +637,7 @@ end subroutine test_directsum
 
 !-----------------------------------------------------------------------
 !+
-!   test that we conserve linear momentum with the symmetrical FMM
+!   test that we conserve linear and angular momentum with the symmetrical FMM
 !+
 !-----------------------------------------------------------------------
 subroutine test_FMM(ntests,npass)
@@ -660,12 +661,12 @@ subroutine test_FMM(ntests,npass)
  use dim, only:maxp,maxphase,mpi
 
  integer, intent(inout) :: ntests,npass
- real :: x0(3),rmin,rmax,nx,psep,totvol,time,fsum(3)
+ real :: x0(3),rmin,rmax,nx,psep,totvol,time,fsum(3),tsum(3)
  integer(kind=8) :: npart_total
  integer :: np
- integer :: nfail(3),i
+ integer :: nfail(6),i
 
- if (id==master) write(*,"(/,a)") '--> testing linear momentum conservation with symmetric fmm'
+ if (id==master) write(*,"(/,a)") '--> testing linear and angular momentum conservation with symmetric fmm'
  if (mpi) then
     if (id==master) write(*,"(/,a)") '--> skipped... No sym FMM with MPI'
     return
@@ -730,15 +731,23 @@ subroutine test_FMM(ntests,npass)
  endif
  call sort_part_id
 
+ tsum = 0.
  do i=1,npart
     fsum(1) = fsum(1) + fxyzu(1,i)
     fsum(2) = fsum(2) + fxyzu(2,i)
     fsum(3) = fsum(3) + fxyzu(3,i)
+    tsum(1) = tsum(1) + xyzh(2,i)*fxyzu(3,i) - xyzh(3,i)*fxyzu(2,i)
+    tsum(2) = tsum(2) + xyzh(3,i)*fxyzu(1,i) - xyzh(1,i)*fxyzu(3,i)
+    tsum(3) = tsum(3) + xyzh(1,i)*fxyzu(2,i) - xyzh(2,i)*fxyzu(1,i)
  enddo
  fsum = fsum*massoftype(istar)
+ tsum = tsum*massoftype(istar)
  call checkval(fsum(1),0.,2.e-16,nfail(1),"momentum conservation x")
  call checkval(fsum(2),0.,2.e-16,nfail(2),"momentum conservation y")
  call checkval(fsum(3),0.,2.e-16,nfail(3),"momentum conservation z")
+ call checkval(tsum(1),0.,2.e-15,nfail(4),"angular momentum conservation x")
+ call checkval(tsum(2),0.,2.e-15,nfail(5),"angular momentum conservation y")
+ call checkval(tsum(3),0.,2.e-15,nfail(6),"angular momentum conservation z")
  call update_test_scores(ntests,nfail,npass)
 
 end subroutine test_FMM
@@ -1118,7 +1127,8 @@ subroutine setup_distribution(iprofile,npart_target,iseed)
  use eos,         only:gamma,polyk
  use options,     only:ieos,alpha,alphau,alphaB,tolh
  use part,        only:init_part,npart,xyzh,vxyzu,hfact,&
-                       npartoftype,massoftype,istar,maxphase,iphase,isetphase
+                       npartoftype,massoftype,istar,maxphase,iphase,isetphase,&
+                       init_rho_from_h
  use setup_params,only:npart_total
  use setplummer,  only:radius_from_mass,density_profile,iprofile_plummer
  use spherical,   only:set_sphere,iseed_mc
@@ -1181,6 +1191,8 @@ subroutine setup_distribution(iprofile,npart_target,iseed)
  if (maxphase==maxp) then
     iphase(1:npart) = isetphase(istar,iactive=.true.)
  endif
+
+ call init_rho_from_h()
 
 end subroutine setup_distribution
 
