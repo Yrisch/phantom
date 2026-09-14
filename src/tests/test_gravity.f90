@@ -959,7 +959,7 @@ subroutine prec_bench(npart_target,iprofile,treetype)
 
  percentiles = (/0.01,0.1,0.5,0.9,0.99,0.999,0.9999,1./)
 
- write(filename_max,'(a,"_",a,"_N",i0,".ev")') trim(treetype),trim(label),npart_target
+ write(filename_max,'(a,"_",a,"_N",i8.8,".ev")') trim(treetype),trim(label),npart_target
  filename_max = adjustl(filename_max)
 
  open(newunit=iunit,file=trim(filename_max),action='write',status='replace')
