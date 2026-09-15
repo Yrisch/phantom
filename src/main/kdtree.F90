@@ -53,7 +53,7 @@ module kdtree
 !--runtime options for this module
 !
  real,    public  :: tree_accuracy    = 0.5
- logical, public  :: use_geosplit     = .false.
+ logical, public  :: use_geosplit     = .true.
  logical, public  :: use_cache        = .true.
  logical, private :: done_init_kdtree = .false.
  logical, private :: already_warned   = .false.
