@@ -2009,8 +2009,8 @@ subroutine node_interaction(node_dst,node_src,tree_acc2,fnode,stackit,xoffset,yo
     if (.not.fcached) then
        dr1 = 1./sqrt(r2)
        call compute_M2L(dx,dy,dz,dr1,node_src%mass,node_src%quads,fnode)
-       call add_torque_correction(dx,dy,dz,dr1,node_dst%mass,node_src%mass, &
-                                  node_dst%octs,node_src%octs,fnode)
+       ! call add_torque_correction(dx,dy,dz,dr1,node_dst%mass,node_src%mass, &
+       !                            node_dst%octs,node_src%octs,fnode)
     endif
 #endif
     stackit = .false.
@@ -2032,6 +2032,7 @@ pure subroutine compute_M2L(dx,dy,dz,dr1,q0,quads,fnode)
  real, intent(inout) :: fnode(lenfgrav)
  real :: qx,qy,qz,qxx,qxy,qxz,qyy,qyz,qzz,dx2,dx3,dy2,dy3,dz2,dz3
  real :: dr12,D3(10),D2(6),D1(3),g0,g1,g2,g3,g2dx,g2dy,g2dz
+ real :: cx,cy,cz,g0dx,g0dy,g0dz
 
 ! note: dr == 1/sqrt(r2)
  dr12 = dr1*dr1
@@ -2050,6 +2051,9 @@ pure subroutine compute_M2L(dx,dy,dz,dr1,q0,quads,fnode)
  g2dx = g2 * dx
  g2dy = g2 * dy
  g2dz = g2 * dz
+ g0dx = g0 * dx
+ g0dy = g0 * dy
+ g0dz = g0 * dz
 
  !D1, D2, D3 verified and agree with shamrock to float precision
  D3(1)  = 3. * g2dx + g3 * dx3    ! xxx
@@ -2084,18 +2088,23 @@ pure subroutine compute_M2L(dx,dy,dz,dr1,q0,quads,fnode)
  qyz = quads(8)
  qzz = quads(9)
 
+ cx  = g1*((1.0 - g0dx**2)*qx - g0dx*g0dy*qy - g0dx*g0dz*qz)
+ cy  = g1*(-g0dy*g0dx*qx + (1.0 - g0dy**2)*qy - g0dy*g0dz*qz)
+ cz  = g1*(-g0dz*g0dx*qx - g0dz*g0dy*qy + (1.0 - g0dz**2)*qz)
+
+
  fnode(1)  = fnode(1)  + (D1(1)*q0  + D2(1)*qx + D2(2)*qy + D2(3)*qz +&
-                     0.5*(D3(1)*qxx + 2.*(D3(2)*qxy + D3(3)*qxz + D3(5)*qyz) + D3(4)*qyy + D3(6)*qzz ))    ! C¹_x
+                     0.5*(D3(1)*qxx + 2.*(D3(2)*qxy + D3(3)*qxz + D3(5)*qyz) + D3(4)*qyy + D3(6)*qzz )) + cx  ! C¹_x
  fnode(2)  = fnode(2)  + (D1(2)*q0  + D2(2)*qx + D2(4)*qy + D2(5)*qz +&
-                     0.5*(D3(2)*qxx + 2.*(D3(4)*qxy + D3(5)*qxz + D3(8)*qyz) + D3(7)*qyy + D3(9)*qzz ))    ! C¹_y
+                     0.5*(D3(2)*qxx + 2.*(D3(4)*qxy + D3(5)*qxz + D3(8)*qyz) + D3(7)*qyy + D3(9)*qzz )) + cy  ! C¹_y
  fnode(3)  = fnode(3)  + (D1(3)*q0  + D2(3)*qx + D2(5)*qy + D2(6)*qz +&
-                     0.5*(D3(3)*qxx + 2.*(D3(5)*qxy + D3(6)*qxz + D3(9)*qyz) + D3(8)*qyy + D3(10)*qzz))   ! C¹_z
- fnode(4)  = fnode(4)  - (D2(1) * q0 + D3(1)*qx + D3(2)*qy + D3(3)*qz)  ! C²_xx
- fnode(5)  = fnode(5)  - (D2(2) * q0 + D3(2)*qx + D3(4)*qy + D3(5)*qz)! C²_xy
- fnode(6)  = fnode(6)  - (D2(3) * q0 + D3(3)*qx + D3(5)*qy + D3(6)*qz)! C²_xz
- fnode(7)  = fnode(7)  - (D2(4) * q0 + D3(4)*qx + D3(7)*qy + D3(8)*qz)! C²_yy
- fnode(8)  = fnode(8)  - (D2(5) * q0 + D3(5)*qx + D3(8)*qy + D3(9)*qz)! C²_yz
- fnode(9)  = fnode(9)  - (D2(6) * q0 + D3(6)*qx + D3(9)*qy + D3(10)*qz)! C²_zz
+                     0.5*(D3(3)*qxx + 2.*(D3(5)*qxy + D3(6)*qxz + D3(9)*qyz) + D3(8)*qyy + D3(10)*qzz)) + cz  ! C¹_z
+ fnode(4)  = fnode(4)  - (D2(1) * q0 + D3(1)*qx + D3(2)*qy + D3(3)*qz)  + g1*q0*(1.0 - g0dx**2)! C²_xx
+ fnode(5)  = fnode(5)  - (D2(2) * q0 + D3(2)*qx + D3(4)*qy + D3(5)*qz)  - g1*q0*g0dx*g0dy! C²_xy
+ fnode(6)  = fnode(6)  - (D2(3) * q0 + D3(3)*qx + D3(5)*qy + D3(6)*qz)  - g1*q0*g0dx*g0dz! C²_xz
+ fnode(7)  = fnode(7)  - (D2(4) * q0 + D3(4)*qx + D3(7)*qy + D3(8)*qz)  + g1*q0*(1.0 - g0dy**2)! C²_yy
+ fnode(8)  = fnode(8)  - (D2(5) * q0 + D3(5)*qx + D3(8)*qy + D3(9)*qz)  - g1*q0*g0dy*g0dz! C²_yz
+ fnode(9)  = fnode(9)  - (D2(6) * q0 + D3(6)*qx + D3(9)*qy + D3(10)*qz) + g1*q0*(1.0 - g0dz**2)! C²_zz
  fnode(10) = fnode(10) + D3(1) * q0    ! C³_xxx
  fnode(11) = fnode(11) + D3(2) * q0    ! C³_xxy
  fnode(12) = fnode(12) + D3(3) * q0    ! C³_xxz
