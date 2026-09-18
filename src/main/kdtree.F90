@@ -69,7 +69,7 @@ module kdtree
  public :: maketreeglobal
  public :: empty_tree
  public :: compute_M2L,compute_M2L_new,expand_fgrav_in_taylor_series
- public :: propagate_fnode_to_node_new
+ public :: propagate_fnode_to_node_new,realignment_m2l_kernel
  integer, public :: maxlevel_indexed, maxlevel
 
  ! neighbour cache indices (xyzcache); imported with only: from dens/force
@@ -2456,7 +2456,7 @@ subroutine node_interaction(node_dst,node_src,tree_acc2,fnode,stackit,xoffset,yo
     if (.not.fcached) then
        dr1 = 1./sqrt(r2)
        call compute_M2L_new(dx,dy,dz,dr1,node_src%mass,node_src%quads,fnode)
-       call realignment_m2l_kernel(fnode,node_src%mass,node_src%quads(1:3),node_src%quads,node_src%octs,dx,dy,dz,dr1)
+       ! call realignment_m2l_kernel(fnode,node_src%mass,node_src%quads(1:3),node_src%quads(4:9),node_src%octs,dx,dy,dz,dr1)
        ! call add_torque_correction(dx,dy,dz,dr1,node_dst%mass,node_src%mass, &
        !                            node_dst%octs,node_src%octs,fnode)
     endif
@@ -2835,7 +2835,6 @@ subroutine realignment_m2l_kernel(fnode, M, q1p, q2p, q3p, rx, ry, rz, dr1)
  real :: n(3)
  real :: delta(3,3)
 
- real :: B(3,3,3)
  real :: C(3,3,3,3)
 
  real :: F0(3)
@@ -2882,23 +2881,25 @@ subroutine realignment_m2l_kernel(fnode, M, q1p, q2p, q3p, rx, ry, rz, dr1)
  q3(1,3,3) = q3p(6)
 
 
- q3(2,2,2) = q3p(7)
- q3(2,1,2) = q3p(2)
+ q3(2,1,1) = q3p(2)
  q3(2,1,2) = q3p(4)
+ q3(2,1,3) = q3p(5)
  q3(2,2,1) = q3p(4)
- q3(2,3,1) = q3p(5)
+ q3(2,2,2) = q3p(7)
  q3(2,2,3) = q3p(8)
+ q3(2,3,1) = q3p(5)
  q3(2,3,2) = q3p(8)
  q3(2,3,3) = q3p(9)
 
- q3(3,2,1) = q3p(5)
  q3(3,1,1) = q3p(3)
- q3(3,3,3) = q3p(10)
+ q3(3,1,2) = q3p(5)
  q3(3,1,3) = q3p(6)
- q3(3,3,1) = q3p(6)
+ q3(3,2,1) = q3p(5)
  q3(3,2,2) = q3p(8)
- q3(3,3,2) = q3p(9)
  q3(3,2,3) = q3p(9)
+ q3(3,3,1) = q3p(6)
+ q3(3,3,2) = q3p(9)
+ q3(3,3,3) = q3p(10)
 
 
 !-----------------------------------------------------------------------
@@ -2909,24 +2910,6 @@ subroutine realignment_m2l_kernel(fnode, M, q1p, q2p, q3p, rx, ry, rz, dr1)
 
  do i = 1,3
     delta(i,i) = 1.0
- end do
-
-
-!-----------------------------------------------------------------------
-! Build B_ijk
-!
-! B_ijk = n_i/R^4 * (delta_jk - 2 n_j n_k)
-!-----------------------------------------------------------------------
-
- do i = 1,3
-    do j = 1,3
-       do k = 1,3
-
-          B(i,j,k) = rinv4 * n(i) * &
-              ( delta(j,k) - 2.0*n(j)*n(k) )
-
-       end do
-    end do
  end do
 
 
@@ -2952,11 +2935,11 @@ subroutine realignment_m2l_kernel(fnode, M, q1p, q2p, q3p, rx, ry, rz, dr1)
           do l = 1,3
 
              C(i,j,k,l) = rinv5 * (                 &
-                 (11.0/6.0) * (              &
+                 (5.0/2.0) * (              &
                     delta(i,j)*n(k)*n(l)           &
                   + delta(i,k)*n(j)*n(l)           &
                   + delta(i,l)*n(j)*n(k) )         &
-               - (1.0/6.0) * (              &
+               - (1.0/2.0) * (              &
                     delta(i,j)*delta(k,l)         &
                   + delta(i,k)*delta(j,l)         &
                   + delta(i,l)*delta(j,k) ) )
@@ -2976,15 +2959,6 @@ subroutine realignment_m2l_kernel(fnode, M, q1p, q2p, q3p, rx, ry, rz, dr1)
  F0(:) = 0.0
 
  do i = 1,3
-
-    do j = 1,3
-       do k = 1,3
-
-          F0(i) = F0(i) + B(i,j,k) * q2(j,k)
-
-       end do
-    end do
-
     do j = 1,3
        do k = 1,3
           do l = 1,3
@@ -3008,19 +2982,10 @@ subroutine realignment_m2l_kernel(fnode, M, q1p, q2p, q3p, rx, ry, rz, dr1)
 
  do i = 1,3
     do j = 1,3
-
-       do k = 1,3
-
-          F1(i,j) = F1(i,j) &
-                 - 2.0 * B(i,j,k) * q1(k)
-
-       end do
-
        do k = 1,3
           do l = 1,3
 
-             F1(i,j) = F1(i,j) &
-                    - 3.0 * C(i,j,k,l) * q2(k,l)
+             F1(i,j) = F1(i,j) - 3.0 * C(i,j,k,l) * q2(k,l)
 
           end do
        end do
@@ -3042,16 +3007,11 @@ subroutine realignment_m2l_kernel(fnode, M, q1p, q2p, q3p, rx, ry, rz, dr1)
  do i = 1,3
     do j = 1,3
        do k = 1,3
-
-          F2(i,j,k) = 2.0 * M * B(i,j,k)
-
           do l = 1,3
 
-             F2(i,j,k) = F2(i,j,k) &
-                      + 6.0 * C(i,j,k,l) * q1(l)
+             F2(i,j,k) = F2(i,j,k) + 6.0 * C(i,j,k,l) * q1(l)
 
           end do
-
        end do
     end do
  end do
@@ -3084,9 +3044,9 @@ subroutine realignment_m2l_kernel(fnode, M, q1p, q2p, q3p, rx, ry, rz, dr1)
 ! Add F_i
 !=======================================================================
 
- fnode(1) = fnode(1) + F0(1)
- fnode(2) = fnode(2) + F0(2)
- fnode(3) = fnode(3) + F0(3)
+ fnode(1) = fnode(1) - F0(1)
+ fnode(2) = fnode(2) - F0(2)
+ fnode(3) = fnode(3) - F0(3)
 
 
 !=======================================================================
@@ -3099,17 +3059,17 @@ subroutine realignment_m2l_kernel(fnode, M, q1p, q2p, q3p, rx, ry, rz, dr1)
 ! 10 zx  11 zy  12 zz
 !=======================================================================
 
- fnode(4)  = fnode(4)  + F1(1,1)
- fnode(5)  = fnode(5)  + F1(1,2)
- fnode(6)  = fnode(6)  + F1(1,3)
+ fnode(4)  = fnode(4)  - F1(1,1)
+ fnode(5)  = fnode(5)  - F1(1,2)
+ fnode(6)  = fnode(6)  - F1(1,3)
 
- fnode(7)  = fnode(7)  + F1(2,1)
- fnode(8)  = fnode(8)  + F1(2,2)
- fnode(9)  = fnode(9)  + F1(2,3)
+ fnode(7)  = fnode(7)  - F1(2,1)
+ fnode(8)  = fnode(8)  - F1(2,2)
+ fnode(9)  = fnode(9)  - F1(2,3)
 
- fnode(10) = fnode(10) + F1(3,1)
- fnode(11) = fnode(11) + F1(3,2)
- fnode(12) = fnode(12) + F1(3,3)
+ fnode(10) = fnode(10) - F1(3,1)
+ fnode(11) = fnode(11) - F1(3,2)
+ fnode(12) = fnode(12) - F1(3,3)
 
 
 !=======================================================================
@@ -3125,28 +3085,28 @@ subroutine realignment_m2l_kernel(fnode, M, q1p, q2p, q3p, rx, ry, rz, dr1)
 !=======================================================================
 
 ! x
- fnode(13) = fnode(13) + F2(1,1,1)
- fnode(14) = fnode(14) + F2(1,1,2)
- fnode(15) = fnode(15) + F2(1,1,3)
- fnode(16) = fnode(16) + F2(1,2,2)
- fnode(17) = fnode(17) + F2(1,2,3)
- fnode(18) = fnode(18) + F2(1,3,3)
+ fnode(13) = fnode(13) - F2(1,1,1)
+ fnode(14) = fnode(14) - F2(1,1,2)
+ fnode(15) = fnode(15) - F2(1,1,3)
+ fnode(16) = fnode(16) - F2(1,2,2)
+ fnode(17) = fnode(17) - F2(1,2,3)
+ fnode(18) = fnode(18) - F2(1,3,3)
 
 ! y
- fnode(19) = fnode(19) + F2(2,1,1)
- fnode(20) = fnode(20) + F2(2,1,2)
- fnode(21) = fnode(21) + F2(2,1,3)
- fnode(22) = fnode(22) + F2(2,2,2)
- fnode(23) = fnode(23) + F2(2,2,3)
- fnode(24) = fnode(24) + F2(2,3,3)
+ fnode(19) = fnode(19) - F2(2,1,1)
+ fnode(20) = fnode(20) - F2(2,1,2)
+ fnode(21) = fnode(21) - F2(2,1,3)
+ fnode(22) = fnode(22) - F2(2,2,2)
+ fnode(23) = fnode(23) - F2(2,2,3)
+ fnode(24) = fnode(24) - F2(2,3,3)
 
 ! z
- fnode(25) = fnode(25) + F2(3,1,1)
- fnode(26) = fnode(26) + F2(3,1,2)
- fnode(27) = fnode(27) + F2(3,1,3)
- fnode(28) = fnode(28) + F2(3,2,2)
- fnode(29) = fnode(29) + F2(3,2,3)
- fnode(30) = fnode(30) + F2(3,3,3)
+ fnode(25) = fnode(25) - F2(3,1,1)
+ fnode(26) = fnode(26) - F2(3,1,2)
+ fnode(27) = fnode(27) - F2(3,1,3)
+ fnode(28) = fnode(28) - F2(3,2,2)
+ fnode(29) = fnode(29) - F2(3,2,3)
+ fnode(30) = fnode(30) - F2(3,3,3)
 
 
 !=======================================================================
@@ -3162,40 +3122,40 @@ subroutine realignment_m2l_kernel(fnode, M, q1p, q2p, q3p, rx, ry, rz, dr1)
 !=======================================================================
 
 ! x
- fnode(31) = fnode(31) + F3(1,1,1,1)
- fnode(32) = fnode(32) + F3(1,1,1,2)
- fnode(33) = fnode(33) + F3(1,1,1,3)
- fnode(34) = fnode(34) + F3(1,1,2,2)
- fnode(35) = fnode(35) + F3(1,1,2,3)
- fnode(36) = fnode(36) + F3(1,1,3,3)
- fnode(37) = fnode(37) + F3(1,2,2,2)
- fnode(38) = fnode(38) + F3(1,2,2,3)
- fnode(39) = fnode(39) + F3(1,2,3,3)
- fnode(40) = fnode(40) + F3(1,3,3,3)
+ fnode(31) = fnode(31) - F3(1,1,1,1)
+ fnode(32) = fnode(32) - F3(1,1,1,2)
+ fnode(33) = fnode(33) - F3(1,1,1,3)
+ fnode(34) = fnode(34) - F3(1,1,2,2)
+ fnode(35) = fnode(35) - F3(1,1,2,3)
+ fnode(36) = fnode(36) - F3(1,1,3,3)
+ fnode(37) = fnode(37) - F3(1,2,2,2)
+ fnode(38) = fnode(38) - F3(1,2,2,3)
+ fnode(39) = fnode(39) - F3(1,2,3,3)
+ fnode(40) = fnode(40) - F3(1,3,3,3)
 
 ! y
- fnode(41) = fnode(41) + F3(2,1,1,1)
- fnode(42) = fnode(42) + F3(2,1,1,2)
- fnode(43) = fnode(43) + F3(2,1,1,3)
- fnode(44) = fnode(44) + F3(2,1,2,2)
- fnode(45) = fnode(45) + F3(2,1,2,3)
- fnode(46) = fnode(46) + F3(2,1,3,3)
- fnode(47) = fnode(47) + F3(2,2,2,2)
- fnode(48) = fnode(48) + F3(2,2,2,3)
- fnode(49) = fnode(49) + F3(2,2,3,3)
- fnode(50) = fnode(50) + F3(2,3,3,3)
+ fnode(41) = fnode(41) - F3(2,1,1,1)
+ fnode(42) = fnode(42) - F3(2,1,1,2)
+ fnode(43) = fnode(43) - F3(2,1,1,3)
+ fnode(44) = fnode(44) - F3(2,1,2,2)
+ fnode(45) = fnode(45) - F3(2,1,2,3)
+ fnode(46) = fnode(46) - F3(2,1,3,3)
+ fnode(47) = fnode(47) - F3(2,2,2,2)
+ fnode(48) = fnode(48) - F3(2,2,2,3)
+ fnode(49) = fnode(49) - F3(2,2,3,3)
+ fnode(50) = fnode(50) - F3(2,3,3,3)
 
 ! z
- fnode(51) = fnode(51) + F3(3,1,1,1)
- fnode(52) = fnode(52) + F3(3,1,1,2)
- fnode(53) = fnode(53) + F3(3,1,1,3)
- fnode(54) = fnode(54) + F3(3,1,2,2)
- fnode(55) = fnode(55) + F3(3,1,2,3)
- fnode(56) = fnode(56) + F3(3,1,3,3)
- fnode(57) = fnode(57) + F3(3,2,2,2)
- fnode(58) = fnode(58) + F3(3,2,2,3)
- fnode(59) = fnode(59) + F3(3,2,3,3)
- fnode(60) = fnode(60) + F3(3,3,3,3)
+ fnode(51) = fnode(51) - F3(3,1,1,1)
+ fnode(52) = fnode(52) - F3(3,1,1,2)
+ fnode(53) = fnode(53) - F3(3,1,1,3)
+ fnode(54) = fnode(54) - F3(3,1,2,2)
+ fnode(55) = fnode(55) - F3(3,1,2,3)
+ fnode(56) = fnode(56) - F3(3,1,3,3)
+ fnode(57) = fnode(57) - F3(3,2,2,2)
+ fnode(58) = fnode(58) - F3(3,2,2,3)
+ fnode(59) = fnode(59) - F3(3,2,3,3)
+ fnode(60) = fnode(60) - F3(3,3,3,3)
 
 
 !-----------------------------------------------------------------------

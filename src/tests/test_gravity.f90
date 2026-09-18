@@ -95,14 +95,15 @@ end subroutine test_gravity
 !+
 !-----------------------------------------------------------------------
 subroutine test_taylorseries(ntests,npass)
- use kdtree,    only:compute_M2L_new,expand_fgrav_in_taylor_series,propagate_fnode_to_node_new
+ use kdtree,    only:compute_M2L_new,expand_fgrav_in_taylor_series,propagate_fnode_to_node_new,&
+                     realignment_m2l_kernel
  use testutils, only:checkval,update_test_scores
  integer, intent(inout) :: ntests,npass
  integer :: nfailed(18),i,npnode
  real :: xposi(3),xposj(3),x0(3),dx(3),fexact(3),f0(3),f1(3),dge(3),fj(3)
  real :: xposjd(3,3), xposk(3)
  real :: fnode(61),fnode2(61),quads(9),octs(10)
- real :: dr,dr2,phi,phiexact,pmassi,totmass,dr1,fac,n(3),u(3),p(3),t,p2,C
+ real :: dr,dr2,phi,phiexact,pmassi,totmass,dr1,fac(3),n(3),u(3),p(3),t,u2,C
 
  if (id==master) write(*,"(/,a)") '--> testing taylor series expansion about current node'
  totmass = 5.
@@ -118,7 +119,7 @@ subroutine test_taylorseries(ntests,npass)
  fnode = 0.
  quads = 0.
  octs  = 0.
- call compute_M2L_new(dx(1),dx(2),dx(3),dr,totmass,quads,octs,fnode)
+ call compute_M2L_new(dx(1),dx(2),dx(3),dr,totmass,quads,fnode)
 
  dx = xposi - x0   ! perform expansion about x0
  call expand_fgrav_in_taylor_series(fnode,dx(1),dx(2),dx(3),f0(1),f0(2),f0(3),phi)
@@ -137,10 +138,10 @@ subroutine test_taylorseries(ntests,npass)
  if (id==master) write(*,"(/,a)") '--> testing taylor series expansion about distant node'
  totmass = 3.
  npnode = 3
- xposjd(:,1) = (/1.0, 0.1, 0.1/)          ! position of distant particle 1
+ xposjd(:,1) = (/1.0, 0.01, 0.01/)          ! position of distant particle 1
  xposjd(:,2) = (/1.05, 0.01, 0.03/)       ! position of distant particle 2
- xposjd(:,3) = (/0.01, 0.95, 0.05/)       ! position of distant particle 3
- xposj = (/1.,0.,0./)
+ xposjd(:,3) = (/1.01, 0.05, 0.05/)       ! position of distant particle 3
+ xposj = (/1.,0.0,0./)
  pmassi = totmass/real(npnode)
  ! do i=1,npnode
  !    xposj = xposj + pmassi*xposjd(:,i)     ! centre of mass of distant node
@@ -176,7 +177,7 @@ subroutine test_taylorseries(ntests,npass)
  enddo
 
  x0 = 0.      ! position of nearest node centre
- xposi = (/0.0,0.01,0.01/)   ! position to evaluate the force at
+ xposi = (/0.01,0.01,0.01/)   ! position to evaluate the force at
  fexact = 0.
  phiexact = 0.
  do i=1,npnode
@@ -186,7 +187,6 @@ subroutine test_taylorseries(ntests,npass)
     phiexact = phiexact - dr     ! exact force between i and j
  enddo
  fexact = fexact*pmassi
- print*,fexact
  phiexact = phiexact*pmassi
 
  dx = xposj - x0
@@ -207,300 +207,42 @@ subroutine test_taylorseries(ntests,npass)
     u = xposjd(:,i) - xposi - dx
 
 
-    t = dot_product(n,u)
+    t  = dot_product(n,u)
+    u2 = dot_product(u,u)
 
-    p(1) = u(1) - t*n(1)
-    p(2) = u(2) - t*n(2)
-    p(3) = u(3) - t*n(3)
+    fac = C*pmassi*(5*t**2 - u2)*u
 
-    p2 = dot_product(p,p)
-
-    fac = C*pmassi*(4.0*t*t - p2)
-
-    dge(1) = dge(1) + fac*p(1)
-    dge(2) = dge(2) + fac*p(2)
-    dge(3) = dge(3) + fac*p(3)
+    dge(1) = dge(1) + fac(1)
+    dge(2) = dge(2) + fac(2)
+    dge(3) = dge(3) + fac(3)
 
  enddo
 
  call get_dx_dr(xposj,x0,dx,dr)
  fnode = 0.
- call compute_M2L_new(dx(1),dx(2),dx(3),dr,totmass,quads,octs,fnode,.false.)
+
+ call compute_M2L_new(dx(1),dx(2),dx(3),dr,totmass,quads,fnode)
+ ! call realignment_m2l_kernel(fnode,totmass,quads(1:3),quads(4:9),octs,dx(1),dx(2),dx(3),dr)
 
  dx = xposi - x0   ! perform expansion about x0
  call expand_fgrav_in_taylor_series(fnode,dx(1),dx(2),dx(3),f0(1),f0(2),f0(3),phi)
  f0 = -f0 ! inverse the sign as g(r) = 1/r
  phi = -phi
- print*, fexact - f0
-
- call get_dx_dr(xposj,x0,dx,dr)
- fnode = 0.
- call compute_M2L_new(dx(1),dx(2),dx(3),dr,totmass,quads,octs,fnode,.true.)
-
- dx = xposi - x0   ! perform expansion about x0
- call expand_fgrav_in_taylor_series(fnode,dx(1),dx(2),dx(3),f1(1),f1(2),f1(3),phi)
- f1 = -f1 ! inverse the sign as g(r) = 1/r
- phi = -phi
- print*,  f1 - f0
- print*,  dge
- print*, log10(sqrt(dot_product(dge - (f1 - f0),dge - (f1 - f0)))), log10(totmass*dot_product(xposi,xposi)**2)
-
-
-
- !print*,'           exact force = ',fexact,' phi = ',phiexact
- !print*,'       force at origin = ',fnode(1:3), ' phi = ',fnode(20)
- !print*,'force w. taylor series = ',f0, ' phi = ',phi
- nfailed(:) = 0
- call checkval(f1(1),fexact(1),8.7e-5,nfailed(1),'fx taylor series about f0')
- call checkval(f1(2),fexact(2),1.5e-6,nfailed(2),'fy taylor series about f0')
- call checkval(f1(3),fexact(3),1.6e-5,nfailed(3),'fz taylor series about f0')
- call checkval(phi,phiexact,5.9e-6,nfailed(4),'phi taylor series about f0')
- call update_test_scores(ntests,nfailed,npass)
-
-
- if (id==master) write(*,"(/,a)") '--> testing taylor series expansion about distant node'
- totmass = 3.
- npnode = 2
- xposjd(:,1) = (/1.0, 0.1, 0.1/)          ! position of distant particle 1
- xposjd(:,2) = (/1.05, 0.01, 0.03/)       ! position of distant particle 2
- xposjd(:,3) = (/0.01, 0.95, 0.05/)       ! position of distant particle 3
- xposj = (/1.,0.,0./)
- pmassi = totmass/real(npnode)
- ! do i=1,npnode
- !    xposj = xposj + pmassi*xposjd(:,i)     ! centre of mass of distant node
- ! enddo
- ! xposj = xposj/totmassi
-
- !print*,' centre of mass of distant node = ',xposj
- !--compute quadrupole moments
- quads = 0.
- octs  = 0.
- do i=1,npnode
-    dx(:) = xposjd(:,i) - xposj
-    dr2   = dot_product(dx,dx)
-    quads(1) = quads(1) + pmassi*dx(1)
-    quads(2) = quads(2) + pmassi*dx(2)
-    quads(3) = quads(3) + pmassi*dx(3)
-    quads(4) = quads(4) + pmassi*(dx(1)*dx(1))
-    quads(5) = quads(5) + pmassi*(dx(1)*dx(2))
-    quads(6) = quads(6) + pmassi*(dx(1)*dx(3))
-    quads(7) = quads(7) + pmassi*(dx(2)*dx(2))
-    quads(8) = quads(8) + pmassi*(dx(2)*dx(3))
-    quads(9) = quads(9) + pmassi*(dx(3)*dx(3))
-    octs(1)  = octs(1)  + pmassi*dx(1)**3       ! xxx
-    octs(2)  = octs(2)  + pmassi*dx(1)**2*dx(2)       ! xxy
-    octs(3)  = octs(3)  + pmassi*dx(1)**2*dx(3)       ! xxz
-    octs(4)  = octs(4)  + pmassi*dx(1)*dx(2)**2       ! xyy
-    octs(5)  = octs(5)  + pmassi*dx(1)*dx(2)*dx(3)     ! xyz
-    octs(6)  = octs(6)  + pmassi*dx(1)*dx(3)**2       ! xzz
-    octs(7)  = octs(7)  + pmassi*dx(2)**3       ! yyy
-    octs(8)  = octs(8)  + pmassi*dx(2)**2*dx(3)       ! yyz
-    octs(9)  = octs(9)  + pmassi*dx(2)*dx(3)**2       ! yzz
-    octs(10) = octs(10) + pmassi*dx(3)**3       ! zzz
- enddo
-
- x0 = 0.      ! position of nearest node centre
- xposi = (/0.0,0.01,0.01/)   ! position to evaluate the force at
- fexact = 0.
- phiexact = 0.
- do i=1,npnode
-    dx = xposi - xposjd(:,i)
-    dr = 1./sqrt(dot_product(dx,dx))
-    fexact = fexact - dr**3*dx   ! exact force between i and j
-    phiexact = phiexact - dr     ! exact force between i and j
- enddo
- fexact = fexact*pmassi
- phiexact = phiexact*pmassi
-
- xposk = (/-0.2,0.,0./) ! position of a parent node
- dx = xposj - xposk
- dr1 = 1.0/sqrt(dot_product(dx,dx))
-
- n(1) = dx(1)*dr1
- n(2) = dx(2)*dr1
- n(3) = dx(3)*dr1
-
- C  = 1.5*dr1**5
-
- dge(1) = 0.0
- dge(2) = 0.0
- dge(3) = 0.0
-
- do i = 1, npnode
-
-    u = xposjd(:,i) - xposi - dx
-
-
-    t = dot_product(n,u)
-
-    p(1) = u(1) - t*n(1)
-    p(2) = u(2) - t*n(2)
-    p(3) = u(3) - t*n(3)
-
-    p2 = dot_product(p,p)
-
-    fac = C*pmassi*(4.0*t*t - p2)
-
-    dge(1) = dge(1) + fac*p(1)
-    dge(2) = dge(2) + fac*p(2)
-    dge(3) = dge(3) + fac*p(3)
-
- enddo
-
-
- call get_dx_dr(xposj,xposk,dx,dr)
- fnode = 0.
- call compute_M2L_new(dx(1),dx(2),dx(3),dr,totmass,quads,octs,fnode,.true.)
-
- dx = x0 - xposk
-
- fnode2 = 0.
- call propagate_fnode_to_node_new(fnode2,fnode,dx(1),dx(2),dx(3))
-
-
- dx = xposi - x0   ! perform expansion about x0
- call expand_fgrav_in_taylor_series(fnode2,dx(1),dx(2),dx(3),f0(1),f0(2),f0(3),phi)
- f0 = -f0 ! inverse the sign as g(r) = 1/r
- phi = -phi
-
- dx = xposi -xposk
- call expand_fgrav_in_taylor_series(fnode,dx(1),dx(2),dx(3),f1(1),f1(2),f1(3),phi)
- f1 = -f1
-
- print*, fexact - f1
- print*, fexact - f0
  print*, fexact
- print*,  f0
- print*,  f1
- print*,  dge
- print*, log10(sqrt(dot_product(dge - f0,dge - f0))), log10(totmass*dot_product(xposi,xposi)**2)
-
-
-
- !print*,'           exact force = ',fexact,' phi = ',phiexact
- !print*,'       force at origin = ',fnode(1:3), ' phi = ',fnode(20)
- !print*,'force w. taylor series = ',f0, ' phi = ',phi
- nfailed(:) = 0
- call checkval(f1(1),fexact(1),8.7e-5,nfailed(1),'fx taylor series about f0')
- call checkval(f1(2),fexact(2),1.5e-6,nfailed(2),'fy taylor series about f0')
- call checkval(f1(3),fexact(3),1.6e-5,nfailed(3),'fz taylor series about f0')
- call checkval(phi,phiexact,5.9e-6,nfailed(4),'phi taylor series about f0')
- call update_test_scores(ntests,nfailed,npass)
-
- if (id==master) write(*,"(/,a)") '--> testing taylor series expansion about distant node'
- totmass = 2.
- npnode = 2
- xposjd(:,1) = (/1.0, 0.1, 0.1/)          ! position of distant particle 1
- xposjd(:,2) = (/1.05, 0.01, 0.03/)       ! position of distant particle 2
- xposjd(:,3) = (/0.01, 0.95, 0.05/)       ! position of distant particle 3
- xposj = (/1.,0.,0./)
- pmassi = totmass/real(npnode)
- ! do i=1,npnode
- !    xposj = xposj + pmassi*xposjd(:,i)     ! centre of mass of distant node
- ! enddo
- ! xposj = xposj/totmassi
-
- !print*,' centre of mass of distant node = ',xposj
- !--compute quadrupole moments
- quads = 0.
- octs  = 0.
- do i=1,npnode
-    dx(:) = xposjd(:,i) - xposj
-    dr2   = dot_product(dx,dx)
-    quads(1) = quads(1) + pmassi*dx(1)
-    quads(2) = quads(2) + pmassi*dx(2)
-    quads(3) = quads(3) + pmassi*dx(3)
-    quads(4) = quads(4) + pmassi*(dx(1)*dx(1))
-    quads(5) = quads(5) + pmassi*(dx(1)*dx(2))
-    quads(6) = quads(6) + pmassi*(dx(1)*dx(3))
-    quads(7) = quads(7) + pmassi*(dx(2)*dx(2))
-    quads(8) = quads(8) + pmassi*(dx(2)*dx(3))
-    quads(9) = quads(9) + pmassi*(dx(3)*dx(3))
-    octs(1)  = octs(1)  + pmassi*dx(1)**3       ! xxx
-    octs(2)  = octs(2)  + pmassi*dx(1)**2*dx(2)       ! xxy
-    octs(3)  = octs(3)  + pmassi*dx(1)**2*dx(3)       ! xxz
-    octs(4)  = octs(4)  + pmassi*dx(1)*dx(2)**2       ! xyy
-    octs(5)  = octs(5)  + pmassi*dx(1)*dx(2)*dx(3)     ! xyz
-    octs(6)  = octs(6)  + pmassi*dx(1)*dx(3)**2       ! xzz
-    octs(7)  = octs(7)  + pmassi*dx(2)**3       ! yyy
-    octs(8)  = octs(8)  + pmassi*dx(2)**2*dx(3)       ! yyz
-    octs(9)  = octs(9)  + pmassi*dx(2)*dx(3)**2       ! yzz
-    octs(10) = octs(10) + pmassi*dx(3)**3       ! zzz
- enddo
-
- x0 = 0.      ! position of nearest node centre
- xposi = (/0.0,0.01,0.01/)   ! position to evaluate the force at
- fexact = 0.
- phiexact = 0.
- do i=1,npnode
-    dx = xposi - xposjd(:,i)
-    dr = 1./sqrt(dot_product(dx,dx))
-    fexact = fexact - dr**3*dx   ! exact force between i and j
-    phiexact = phiexact - dr     ! exact force between i and j
- enddo
- fexact = fexact*pmassi
- phiexact = phiexact*pmassi
-
-
- call get_dx_dr(xposj,x0,dx,dr)
- fnode = 0.
- call compute_M2L_new(dx(1),dx(2),dx(3),dr,totmass,quads,octs,fnode,.true.)
-
-
- octs = 0.
- quads = 0.
- dx = xposi - x0
- dr2   = dot_product(dx,dx)
- quads(1) = quads(1) + dx(1)
- quads(2) = quads(2) + dx(2)
- quads(3) = quads(3) + dx(3)
- quads(4) = quads(4) + (dx(1)*dx(1))
- quads(5) = quads(5) + (dx(1)*dx(2))
- quads(6) = quads(6) + (dx(1)*dx(3))
- quads(7) = quads(7) + (dx(2)*dx(2))
- quads(8) = quads(8) + (dx(2)*dx(3))
- quads(9) = quads(9) + (dx(3)*dx(3))
- octs(1)  = octs(1)  + dx(1)**3       ! xxx
- octs(2)  = octs(2)  + dx(1)**2*dx(2)       ! xxy
- octs(3)  = octs(3)  + dx(1)**2*dx(3)       ! xxz
- octs(4)  = octs(4)  + dx(1)*dx(2)**2       ! xyy
- octs(5)  = octs(5)  + dx(1)*dx(2)*dx(3)     ! xyz
- octs(6)  = octs(6)  + dx(1)*dx(3)**2       ! xzz
- octs(7)  = octs(7)  + dx(2)**3       ! yyy
- octs(8)  = octs(8)  + dx(2)**2*dx(3)       ! yyz
- octs(9)  = octs(9)  + dx(2)*dx(3)**2       ! yzz
- octs(10) = octs(10) + dx(3)**3       ! zzz
-
- call get_dx_dr(x0,xposj,dx,dr)
- fnode2 = 0.
-
- call compute_M2L_new(dx(1),dx(2),dx(3),dr,1.,quads,octs,fnode2,.true.)
-
- dx = xposi - x0   ! perform expansion about x0
- call expand_fgrav_in_taylor_series(fnode,dx(1),dx(2),dx(3),f0(1),f0(2),f0(3),phi)
- f0 = -f0 ! inverse the sign as g(r) = 1/r
- phi = -phi
-
- f1 = 0.
- do i=1,npnode
-    dx = xposjd(:,i) - xposj
-    call expand_fgrav_in_taylor_series(fnode2,dx(1),dx(2),dx(3),fj(1),fj(2),fj(3),phi)
-    f1 = f1 - fj
- enddo
-
- print*, f1
+ print*, dge
  print*, f0
- print*, sqrt(dot_product(f1+f0,f1+f0))
+
 
  !print*,'           exact force = ',fexact,' phi = ',phiexact
  !print*,'       force at origin = ',fnode(1:3), ' phi = ',fnode(20)
  !print*,'force w. taylor series = ',f0, ' phi = ',phi
  nfailed(:) = 0
- call checkval(f1(1),fexact(1),8.7e-5,nfailed(1),'fx taylor series about f0')
- call checkval(f1(2),fexact(2),1.5e-6,nfailed(2),'fy taylor series about f0')
- call checkval(f1(3),fexact(3),1.6e-5,nfailed(3),'fz taylor series about f0')
+ call checkval(f0(1),fexact(1),8.7e-5,nfailed(1),'fx taylor series about f0')
+ call checkval(f0(2),fexact(2),1.5e-6,nfailed(2),'fy taylor series about f0')
+ call checkval(f0(3),fexact(3),1.6e-5,nfailed(3),'fz taylor series about f0')
  call checkval(phi,phiexact,5.9e-6,nfailed(4),'phi taylor series about f0')
  call update_test_scores(ntests,nfailed,npass)
+
  if (id==master) write(*,"(/,a)") '--> testing taylor series expansion about both current and distant nodes'
  x0 = 0.                      ! position of nearest node centre
  xposi = (/0.05,0.05,-0.05/)  ! position to evaluate the force at
@@ -517,7 +259,7 @@ subroutine test_taylorseries(ntests,npass)
 
  call get_dx_dr(xposj,x0,dx,dr)
  fnode = 0.
- call compute_M2L_new(dx(1),dx(2),dx(3),dr,totmass,quads,octs,fnode)
+ call compute_M2L_new(dx(1),dx(2),dx(3),dr,totmass,quads,fnode)
 
  dx = xposi - x0   ! perform expansion about x0
  call expand_fgrav_in_taylor_series(fnode,dx(1),dx(2),dx(3),f0(1),f0(2),f0(3),phi)
