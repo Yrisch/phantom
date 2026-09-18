@@ -68,7 +68,8 @@ module kdtree
  public :: maketree, revtree, getneigh,getneigh_dual,kdnode,lenfgrav
  public :: maketreeglobal
  public :: empty_tree
- public :: compute_M2L,expand_fgrav_in_taylor_series
+ public :: compute_M2L,compute_M2L_new,expand_fgrav_in_taylor_series
+ public :: propagate_fnode_to_node_new
  integer, public :: maxlevel_indexed, maxlevel
 
  ! neighbour cache indices (xyzcache); imported with only: from dens/force
@@ -326,7 +327,7 @@ subroutine maketree(node, xyzh, np, leaf_is_active, ncells, apr_tree, refineleve
     ncells = 2**(maxlevel+1) - 1
  endif
  !-- if octree is used, we need to propagate information from leaf to root (hmax and quads)
- if (use_geosplit) call propagate_upward(int(ncells), node)
+ ! if (use_geosplit) call propagate_upward(int(ncells), node)
 
  if (maxlevel > maxlevel_indexed .and. .not.already_warned) then
     write(string,"(i10)") 2**(maxlevel-maxlevel_indexed)
@@ -854,7 +855,7 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
 
  if (use_geosplit) then !--for geotree we use the middle point to split the node and propagate properties after
     x0        = (xmaxi+xmini)*0.5       ! middle point of the node
-    comp_node = .not.wassplit
+    comp_node = .true. !.not.wassplit
  else  !--for gravity and default KDtree, we need the centre of the node to be the centre of mass
     call compute_nodes_cofm(npnode,nnode,xyzcofm,totmass_node,doparallel)
     ! if this is global node construction, get the cofm and total mass
@@ -1363,12 +1364,14 @@ end subroutine propagate_upward
 subroutine translate_node(node,ip,il,ir)
  type(kdnode), intent(inout) :: node(:)
  integer,      intent(in)    :: ip,il,ir
- real    :: dx(3),massp,massc,quadsp(9),quadsc(9),dips(3),hmaxc,hmaxp
+ real    :: dx(3),massp,massc,quadsp(9),quadsc(9)
+ real    :: octsc(10),octsp(10),dips(3),hmaxc,hmaxp
  integer :: j,ic(2),k
 
  ic = (/il,ir/)
  massp  = 0.
  hmaxp  = 0.
+ octsp  = 0.
  quadsp = 0.
  dips   = 0.
 
@@ -1376,6 +1379,7 @@ subroutine translate_node(node,ip,il,ir)
     k = ic(j)
     massc  = node(k)%mass
     quadsc = node(k)%quads
+    octsc  = node(k)%octs
     hmaxc  = node(k)%hmax
     dx     = node(k)%xcen - node(ip)%xcen
 
@@ -1393,12 +1397,25 @@ subroutine translate_node(node,ip,il,ir)
     quadsp(8)   = quadsp(8) + quadsc(8) + dx(2)*dips(3) + quadsc(2)*dx(3)
     quadsp(9)   = quadsp(9) + quadsc(9) + dx(3)*dips(3) + quadsc(3)*dx(3)
 
+
+    octsp(1) = octsp(1) -dips(1)*dx(1)**2 + dx(1)*quadsc(4) + 2*dx(1)*quadsp(4) + octsc(1) ! xxx
+    octsp(2) = octsp(2) -dips(2)*dx(1)**2 + 2*dx(1)*quadsp(5) + dx(2)*quadsc(4) + octsc(2) ! xxy
+    octsp(3) = octsp(3) -dips(3)*dx(1)**2 + 2*dx(1)*quadsp(6) + dx(3)*quadsc(4) + octsc(3) ! xxz
+    octsp(4) = octsp(4) -dips(2)*dx(1)*dx(2) + dx(1)*quadsp(7) + dx(2)*quadsc(5) + dx(2)*quadsp(5) + octsc(4) ! xyy
+    octsp(5) = octsp(5) -dips(3)*dx(1)*dx(2) + dx(1)*quadsp(8) + dx(2)*quadsp(6) + dx(3)*quadsc(5) + octsc(5) ! xyz
+    octsp(6) = octsp(6) -dips(3)*dx(1)*dx(3) + dx(1)*quadsp(9) + dx(3)*quadsc(6) + dx(3)*quadsp(6) + octsc(6) ! xzz
+    octsp(7) = octsp(7) -dips(2)*dx(2)**2 + dx(2)*quadsc(7) + 2*dx(2)*quadsp(7) + octsc(7) ! yyy
+    octsp(8) = octsp(8) -dips(3)*dx(2)**2 + 2*dx(2)*quadsp(8) + dx(3)*quadsc(7) + octsc(8) ! yyz
+    octsp(9) = octsp(9) -dips(3)*dx(2)*dx(3) + dx(2)*quadsp(9) + dx(3)*quadsc(8) + dx(3)*quadsp(8) + octsc(9) ! yzz
+    octsp(10) = octsp(10) -dips(3)*dx(3)**2 + dx(3)*quadsc(9) + 2*dx(3)*quadsp(9) + octsc(10) ! zzz
+
     hmaxp = max(hmaxp,hmaxc)
 
  enddo
 
  node(ip)%mass  = massp
  node(ip)%quads = quadsp
+ node(ip)%octs  = octsp
  node(ip)%hmax  = hmaxp
 
 end subroutine translate_node
@@ -1761,7 +1778,7 @@ subroutine getneigh_dual(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzca
 #endif
     call get_sep(node(iparent)%xcen,node(branch(i-1))%xcen,dx,dy,dz,xoffset,yoffset,zoffset)
     fnode = fnode_acc + fnode_branch(:,i)
-    call propagate_fnode_to_node(fnode_acc,fnode,dx,dy,dz)
+    call propagate_fnode_to_node_new(fnode_acc,fnode,dx,dy,dz)
  enddo
 
  fnode = fnode_acc + fnode_branch(:,1)
@@ -1873,6 +1890,436 @@ pure subroutine propagate_fnode_to_node(fnode,fnode_sup,dx,dy,dz)
 
 end subroutine propagate_fnode_to_node
 
+pure subroutine propagate_fnode_to_node_new(fnode,fnode_sup,dx,dy,dz)
+
+ real, intent(in)  :: fnode_sup(lenfgrav),dx,dy,dz
+ real, intent(out) :: fnode(lenfgrav)
+
+ real :: dx2,dy2,dz2
+ real :: dx3,dy3,dz3
+ real :: dx4,dy4,dz4
+
+ ! ================================================================
+ ! Powers of displacement
+ ! ================================================================
+
+ dx2 = dx*dx
+ dy2 = dy*dy
+ dz2 = dz*dz
+
+ dx3 = dx*dx2
+ dy3 = dy*dy2
+ dz3 = dz*dz2
+
+ dx4 = dx2*dx2
+ dy4 = dy2*dy2
+ dz4 = dz2*dz2
+
+ ! ================================================================
+ ! CONSTANT ACCELERATION
+ !
+ ! A'_i =
+ !     A_i
+ !   + B_ij d_j
+ !   + 1/2 C_ijk d_j d_k
+ !   + 1/6 D_ijkl d_j d_k d_l
+ ! ================================================================
+
+ fnode(1) = fnode_sup(1) &
+          + dx*fnode_sup(4) &
+          + dy*fnode_sup(5) &
+          + dz*fnode_sup(6) &
+          + 0.5*( &
+                dx2*fnode_sup(13) &
+              + 2.*dx*dy*fnode_sup(14) &
+              + 2.*dx*dz*fnode_sup(15) &
+              + dy2*fnode_sup(16) &
+              + 2.*dy*dz*fnode_sup(17) &
+              + dz2*fnode_sup(18) ) &
+          + (1./6.)*( &
+                dx3*fnode_sup(31) &
+              + 3.*dx2*dy*fnode_sup(32) &
+              + 3.*dx2*dz*fnode_sup(33) &
+              + 3.*dx*dy2*fnode_sup(34) &
+              + 6.*dx*dy*dz*fnode_sup(35) &
+              + 3.*dx*dz2*fnode_sup(36) &
+              + dy3*fnode_sup(37) &
+              + 3.*dy2*dz*fnode_sup(38) &
+              + 3.*dy*dz2*fnode_sup(39) &
+              + dz3*fnode_sup(40) )
+
+ fnode(2) = fnode_sup(2) &
+          + dx*fnode_sup(7) &
+          + dy*fnode_sup(8) &
+          + dz*fnode_sup(9) &
+          + 0.5*( &
+                dx2*fnode_sup(19) &
+              + 2.*dx*dy*fnode_sup(20) &
+              + 2.*dx*dz*fnode_sup(21) &
+              + dy2*fnode_sup(22) &
+              + 2.*dy*dz*fnode_sup(23) &
+              + dz2*fnode_sup(24) ) &
+          + (1./6.)*( &
+                dx3*fnode_sup(41) &
+              + 3.*dx2*dy*fnode_sup(42) &
+              + 3.*dx2*dz*fnode_sup(43) &
+              + 3.*dx*dy2*fnode_sup(44) &
+              + 6.*dx*dy*dz*fnode_sup(45) &
+              + 3.*dx*dz2*fnode_sup(46) &
+              + dy3*fnode_sup(47) &
+              + 3.*dy2*dz*fnode_sup(48) &
+              + 3.*dy*dz2*fnode_sup(49) &
+              + dz3*fnode_sup(50) )
+
+ fnode(3) = fnode_sup(3) &
+          + dx*fnode_sup(10) &
+          + dy*fnode_sup(11) &
+          + dz*fnode_sup(12) &
+          + 0.5*( &
+                dx2*fnode_sup(25) &
+              + 2.*dx*dy*fnode_sup(26) &
+              + 2.*dx*dz*fnode_sup(27) &
+              + dy2*fnode_sup(28) &
+              + 2.*dy*dz*fnode_sup(29) &
+              + dz2*fnode_sup(30) ) &
+          + (1./6.)*( &
+                dx3*fnode_sup(51) &
+              + 3.*dx2*dy*fnode_sup(52) &
+              + 3.*dx2*dz*fnode_sup(53) &
+              + 3.*dx*dy2*fnode_sup(54) &
+              + 6.*dx*dy*dz*fnode_sup(55) &
+              + 3.*dx*dz2*fnode_sup(56) &
+              + dy3*fnode_sup(57) &
+              + 3.*dy2*dz*fnode_sup(58) &
+              + 3.*dy*dz2*fnode_sup(59) &
+              + dz3*fnode_sup(60) )
+
+
+ ! ================================================================
+ ! LINEAR COEFFICIENTS
+ !
+ ! B'_ij =
+ !     B_ij
+ !   + C_ijk d_k
+ !   + 1/2 D_ijkl d_k d_l
+ !
+ ! ================================================================
+
+ ! -----------------------------
+ ! output x
+ ! -----------------------------
+
+ fnode(4) = fnode_sup(4) &
+          + dx*fnode_sup(13) &
+          + dy*fnode_sup(14) &
+          + dz*fnode_sup(15) &
+          + 0.5*( &
+                dx2*fnode_sup(31) &
+              + 2.*dx*dy*fnode_sup(32) &
+              + 2.*dx*dz*fnode_sup(33) &
+              + dy2*fnode_sup(34) &
+              + 2.*dy*dz*fnode_sup(35) &
+              + dz2*fnode_sup(36) )
+
+ fnode(5) = fnode_sup(5) &
+          + dx*fnode_sup(14) &
+          + dy*fnode_sup(16) &
+          + dz*fnode_sup(17) &
+          + 0.5*( &
+                dx2*fnode_sup(32) &
+              + 2.*dx*dy*fnode_sup(34) &
+              + 2.*dx*dz*fnode_sup(35) &
+              + dy2*fnode_sup(37) &
+              + 2.*dy*dz*fnode_sup(38) &
+              + dz2*fnode_sup(39) )
+
+ fnode(6) = fnode_sup(6) &
+          + dx*fnode_sup(15) &
+          + dy*fnode_sup(17) &
+          + dz*fnode_sup(18) &
+          + 0.5*( &
+                dx2*fnode_sup(33) &
+              + 2.*dx*dy*fnode_sup(35) &
+              + 2.*dx*dz*fnode_sup(36) &
+              + dy2*fnode_sup(38) &
+              + 2.*dy*dz*fnode_sup(39) &
+              + dz2*fnode_sup(40) )
+
+ ! -----------------------------
+ ! output y
+ ! -----------------------------
+
+ fnode(7) = fnode_sup(7) &
+          + dx*fnode_sup(19) &
+          + dy*fnode_sup(20) &
+          + dz*fnode_sup(21) &
+          + 0.5*( &
+                dx2*fnode_sup(41) &
+              + 2.*dx*dy*fnode_sup(42) &
+              + 2.*dx*dz*fnode_sup(43) &
+              + dy2*fnode_sup(44) &
+              + 2.*dy*dz*fnode_sup(45) &
+              + dz2*fnode_sup(46) )
+
+ fnode(8) = fnode_sup(8) &
+          + dx*fnode_sup(20) &
+          + dy*fnode_sup(22) &
+          + dz*fnode_sup(23) &
+          + 0.5*( &
+                dx2*fnode_sup(42) &
+              + 2.*dx*dy*fnode_sup(44) &
+              + 2.*dx*dz*fnode_sup(45) &
+              + dy2*fnode_sup(47) &
+              + 2.*dy*dz*fnode_sup(48) &
+              + dz2*fnode_sup(49) )
+
+ fnode(9) = fnode_sup(9) &
+          + dx*fnode_sup(21) &
+          + dy*fnode_sup(23) &
+          + dz*fnode_sup(24) &
+          + 0.5*( &
+                dx2*fnode_sup(43) &
+              + 2.*dx*dy*fnode_sup(45) &
+              + 2.*dx*dz*fnode_sup(46) &
+              + dy2*fnode_sup(48) &
+              + 2.*dy*dz*fnode_sup(49) &
+              + dz2*fnode_sup(50) )
+
+ ! -----------------------------
+ ! output z
+ ! -----------------------------
+
+ fnode(10) = fnode_sup(10) &
+           + dx*fnode_sup(25) &
+           + dy*fnode_sup(26) &
+           + dz*fnode_sup(27) &
+           + 0.5*( &
+                 dx2*fnode_sup(51) &
+               + 2.*dx*dy*fnode_sup(52) &
+               + 2.*dx*dz*fnode_sup(53) &
+               + dy2*fnode_sup(54) &
+               + 2.*dy*dz*fnode_sup(55) &
+               + dz2*fnode_sup(56) )
+
+ fnode(11) = fnode_sup(11) &
+           + dx*fnode_sup(26) &
+           + dy*fnode_sup(28) &
+           + dz*fnode_sup(29) &
+           + 0.5*( &
+                 dx2*fnode_sup(52) &
+               + 2.*dx*dy*fnode_sup(54) &
+               + 2.*dx*dz*fnode_sup(55) &
+               + dy2*fnode_sup(57) &
+               + 2.*dy*dz*fnode_sup(58) &
+               + dz2*fnode_sup(59) )
+
+ fnode(12) = fnode_sup(12) &
+           + dx*fnode_sup(27) &
+           + dy*fnode_sup(29) &
+           + dz*fnode_sup(30) &
+           + 0.5*( &
+                 dx2*fnode_sup(53) &
+               + 2.*dx*dy*fnode_sup(55) &
+               + 2.*dx*dz*fnode_sup(56) &
+               + dy2*fnode_sup(58) &
+               + 2.*dy*dz*fnode_sup(59) &
+               + dz2*fnode_sup(60) )
+
+
+ ! ================================================================
+ ! QUADRATIC COEFFICIENTS
+ !
+ ! C'_ijk = C_ijk + D_ijkl d_l
+ !
+ ! Symmetric in j,k.
+ ! ================================================================
+
+ ! -----------------------------
+ ! output x
+ ! -----------------------------
+
+ fnode(13) = fnode_sup(13) &
+           + dx*fnode_sup(31) &
+           + dy*fnode_sup(32) &
+           + dz*fnode_sup(33)
+
+ fnode(14) = fnode_sup(14) &
+           + dx*fnode_sup(32) &
+           + dy*fnode_sup(34) &
+           + dz*fnode_sup(35)
+
+ fnode(15) = fnode_sup(15) &
+           + dx*fnode_sup(33) &
+           + dy*fnode_sup(35) &
+           + dz*fnode_sup(36)
+
+ fnode(16) = fnode_sup(16) &
+           + dx*fnode_sup(34) &
+           + dy*fnode_sup(37) &
+           + dz*fnode_sup(38)
+
+ fnode(17) = fnode_sup(17) &
+           + dx*fnode_sup(35) &
+           + dy*fnode_sup(38) &
+           + dz*fnode_sup(39)
+
+ fnode(18) = fnode_sup(18) &
+           + dx*fnode_sup(36) &
+           + dy*fnode_sup(39) &
+           + dz*fnode_sup(40)
+
+ ! -----------------------------
+ ! output y
+ ! -----------------------------
+
+ fnode(19) = fnode_sup(19) &
+           + dx*fnode_sup(41) &
+           + dy*fnode_sup(42) &
+           + dz*fnode_sup(43)
+
+ fnode(20) = fnode_sup(20) &
+           + dx*fnode_sup(42) &
+           + dy*fnode_sup(44) &
+           + dz*fnode_sup(45)
+
+ fnode(21) = fnode_sup(21) &
+           + dx*fnode_sup(43) &
+           + dy*fnode_sup(45) &
+           + dz*fnode_sup(46)
+
+ fnode(22) = fnode_sup(22) &
+           + dx*fnode_sup(44) &
+           + dy*fnode_sup(47) &
+           + dz*fnode_sup(48)
+
+ fnode(23) = fnode_sup(23) &
+           + dx*fnode_sup(45) &
+           + dy*fnode_sup(48) &
+           + dz*fnode_sup(49)
+
+ fnode(24) = fnode_sup(24) &
+           + dx*fnode_sup(46) &
+           + dy*fnode_sup(49) &
+           + dz*fnode_sup(50)
+
+ ! -----------------------------
+ ! output z
+ ! -----------------------------
+
+ fnode(25) = fnode_sup(25) &
+           + dx*fnode_sup(51) &
+           + dy*fnode_sup(52) &
+           + dz*fnode_sup(53)
+
+ fnode(26) = fnode_sup(26) &
+           + dx*fnode_sup(52) &
+           + dy*fnode_sup(54) &
+           + dz*fnode_sup(55)
+
+ fnode(27) = fnode_sup(27) &
+           + dx*fnode_sup(53) &
+           + dy*fnode_sup(55) &
+           + dz*fnode_sup(56)
+
+ fnode(28) = fnode_sup(28) &
+           + dx*fnode_sup(54) &
+           + dy*fnode_sup(57) &
+           + dz*fnode_sup(58)
+
+ fnode(29) = fnode_sup(29) &
+           + dx*fnode_sup(55) &
+           + dy*fnode_sup(58) &
+           + dz*fnode_sup(59)
+
+ fnode(30) = fnode_sup(30) &
+           + dx*fnode_sup(56) &
+           + dy*fnode_sup(59) &
+           + dz*fnode_sup(60)
+
+
+ ! ================================================================
+ ! CUBIC COEFFICIENTS
+ !
+ ! D' = D
+ ! ================================================================
+
+ fnode(31) = fnode_sup(31)
+ fnode(32) = fnode_sup(32)
+ fnode(33) = fnode_sup(33)
+ fnode(34) = fnode_sup(34)
+ fnode(35) = fnode_sup(35)
+ fnode(36) = fnode_sup(36)
+ fnode(37) = fnode_sup(37)
+ fnode(38) = fnode_sup(38)
+ fnode(39) = fnode_sup(39)
+ fnode(40) = fnode_sup(40)
+
+ fnode(41) = fnode_sup(41)
+ fnode(42) = fnode_sup(42)
+ fnode(43) = fnode_sup(43)
+ fnode(44) = fnode_sup(44)
+ fnode(45) = fnode_sup(45)
+ fnode(46) = fnode_sup(46)
+ fnode(47) = fnode_sup(47)
+ fnode(48) = fnode_sup(48)
+ fnode(49) = fnode_sup(49)
+ fnode(50) = fnode_sup(50)
+
+ fnode(51) = fnode_sup(51)
+ fnode(52) = fnode_sup(52)
+ fnode(53) = fnode_sup(53)
+ fnode(54) = fnode_sup(54)
+ fnode(55) = fnode_sup(55)
+ fnode(56) = fnode_sup(56)
+ fnode(57) = fnode_sup(57)
+ fnode(58) = fnode_sup(58)
+ fnode(59) = fnode_sup(59)
+ fnode(60) = fnode_sup(60)
+
+
+ ! ================================================================
+ ! POTENTIAL
+ !
+ ! Your convention is
+ !
+ !     g = - grad(Phi)
+ !
+ ! Therefore
+ !
+ ! Phi' = Phi
+ !      - A_i d_i
+ !      - 1/2 B_ij d_i d_j
+ !      - 1/6 C_ijk d_i d_j d_k
+ !      - 1/24 D_ijkl d_i d_j d_k d_l
+ !
+ ! ================================================================
+
+ fnode(61) = fnode_sup(61) &
+           - ( &
+                 dx*fnode_sup(1) &
+               + dy*fnode_sup(2) &
+               + dz*fnode_sup(3) ) &
+           - 0.5*( &
+                 dx2*fnode_sup(4) &
+               + 2.*dx*dy*fnode_sup(5) &
+               + 2.*dx*dz*fnode_sup(6) &
+               + dy2*fnode_sup(8) &
+               + 2.*dy*dz*fnode_sup(9) &
+               + dz2*fnode_sup(12) ) &
+           - (1./6.)*( &
+                 dx3*fnode_sup(13) &
+               + 3.*dx2*dy*fnode_sup(14) &
+               + 3.*dx2*dz*fnode_sup(15) &
+               + 3.*dx*dy2*fnode_sup(16) &
+               + 6.*dx*dy*dz*fnode_sup(17) &
+               + 3.*dx*dz2*fnode_sup(18) &
+               + dy3*fnode_sup(22) &
+               + 3.*dy2*dz*fnode_sup(23) &
+               + 3.*dy*dz2*fnode_sup(24) &
+               + dz3*fnode_sup(30) )
+
+
+end subroutine propagate_fnode_to_node_new
 !-----------------------------------------------------------
 !+
 !  return list of parents of current node
@@ -2008,9 +2455,10 @@ subroutine node_interaction(node_dst,node_src,tree_acc2,fnode,stackit,xoffset,yo
 #ifdef GRAVITY
     if (.not.fcached) then
        dr1 = 1./sqrt(r2)
-       call compute_M2L(dx,dy,dz,dr1,node_src%mass,node_src%quads,fnode)
-       call add_torque_correction(dx,dy,dz,dr1,node_dst%mass,node_src%mass, &
-                                  node_dst%octs,node_src%octs,fnode)
+       call compute_M2L_new(dx,dy,dz,dr1,node_src%mass,node_src%quads,fnode)
+       call realignment_m2l_kernel(fnode,node_src%mass,node_src%quads(1:3),node_src%quads,node_src%octs,dx,dy,dz,dr1)
+       ! call add_torque_correction(dx,dy,dz,dr1,node_dst%mass,node_src%mass, &
+       !                            node_dst%octs,node_src%octs,fnode)
     endif
 #endif
     stackit = .false.
@@ -2111,6 +2559,647 @@ pure subroutine compute_M2L(dx,dy,dz,dr1,q0,quads,fnode)
 
 end subroutine compute_M2L
 
+pure subroutine compute_M2L_new(dx,dy,dz,dr1,q0,quads,fnode)
+
+ real, intent(in)    :: dx,dy,dz,dr1,q0
+ real, intent(in)    :: quads(9)
+ real, intent(inout) :: fnode(lenfgrav)
+
+ real :: qx,qy,qz
+ real :: qxx,qxy,qxz,qyy,qyz,qzz
+
+ real :: dx2,dx3,dy2,dy3,dz2,dz3
+ real :: dr12
+ real :: g0,g1,g2,g3
+ real :: g2dx,g2dy,g2dz
+
+ real :: D1(3),D2(6),D3(10)
+
+ ! ------------------------------------------------------------------
+ ! Source moments
+ ! ------------------------------------------------------------------
+ qx  = quads(1)
+ qy  = quads(2)
+ qz  = quads(3)
+
+ qxx = quads(4)
+ qxy = quads(5)
+ qxz = quads(6)
+ qyy = quads(7)
+ qyz = quads(8)
+ qzz = quads(9)
+
+ ! ------------------------------------------------------------------
+ ! Distance powers
+ ! ------------------------------------------------------------------
+
+ dr12 = dr1*dr1
+
+ dx2  = dx*dx
+ dx3  = dx*dx2
+
+ dy2  = dy*dy
+ dy3  = dy*dy2
+
+ dz2  = dz*dz
+ dz3  = dz*dz2
+
+ ! ------------------------------------------------------------------
+ ! Green's function derivatives
+ !
+ ! Note:
+ !   dr1 = 1/R
+ !   G   = 1
+ !
+ ! Signs are kept identical to the existing Phantom convention.
+ ! ------------------------------------------------------------------
+
+ g0   =  dr1
+ g1   = -dr12*g0
+ g2   = -3.*dr12*g1
+ g3   = -5.*dr12*g2
+
+ g2dx = g2*dx
+ g2dy = g2*dy
+ g2dz = g2*dz
+
+ ! ------------------------------------------------------------------
+ ! D3
+ ! ------------------------------------------------------------------
+
+ D3(1)  = 3.*g2dx + g3*dx3
+ D3(2)  = g2dy + g3*dx2*dy
+ D3(3)  = g2dz + g3*dx2*dz
+ D3(4)  = g2dx + g3*dy2*dx
+ D3(5)  = g3*dx*dy*dz
+ D3(6)  = g2dx + g3*dz2*dx
+ D3(7)  = 3.*g2dy + g3*dy3
+ D3(8)  = g2dz + g3*dy2*dz
+ D3(9)  = g2dy + g3*dz2*dy
+ D3(10) = 3.*g2dz + g3*dz3
+
+ ! ------------------------------------------------------------------
+ ! D2
+ ! ------------------------------------------------------------------
+
+ D2(1) = g1 + g2*dx2
+ D2(2) = g2dx*dy
+ D2(3) = g2dx*dz
+ D2(4) = g1 + g2*dy2
+ D2(5) = g2dy*dz
+ D2(6) = g1 + g2*dz2
+
+ ! ------------------------------------------------------------------
+ ! D1
+ ! ------------------------------------------------------------------
+
+ D1(1) = g1*dx
+ D1(2) = g1*dy
+ D1(3) = g1*dz
+
+ ! ==================================================================
+ ! STANDARD FMM CONTRIBUTION
+ !
+ ! g_i(a) =
+ !     D1_i M
+ !   + D2_ij Q1_j
+ !   + 1/2 D3_ijk Q2_jk
+ !
+ ! T1_ij =
+ !   -(M D2_ij + D3_ijk Q1_k)
+ !
+ ! T2_ijk =
+ !    M D3_ijk
+ !
+ ! ==================================================================
+
+ ! ------------------------------------------------------------------
+ ! Constant acceleration
+ ! ------------------------------------------------------------------
+
+ fnode(1) = fnode(1) + &
+      D1(1)*q0 + D2(1)*qx + D2(2)*qy + D2(3)*qz + &
+      0.5*( D3(1)*qxx &
+          + 2.*D3(2)*qxy &
+          + 2.*D3(3)*qxz &
+          + D3(4)*qyy &
+          + 2.*D3(5)*qyz &
+          + D3(6)*qzz )
+
+ fnode(2) = fnode(2) + &
+      D1(2)*q0 + D2(2)*qx + D2(4)*qy + D2(5)*qz + &
+      0.5*( D3(2)*qxx &
+          + 2.*D3(4)*qxy &
+          + 2.*D3(5)*qxz &
+          + D3(7)*qyy &
+          + 2.*D3(8)*qyz &
+          + D3(9)*qzz )
+
+ fnode(3) = fnode(3) + &
+      D1(3)*q0 + D2(3)*qx + D2(5)*qy + D2(6)*qz + &
+      0.5*( D3(3)*qxx &
+          + 2.*D3(5)*qxy &
+          + 2.*D3(6)*qxz &
+          + D3(8)*qyy &
+          + 2.*D3(9)*qyz &
+          + D3(10)*qzz )
+
+ ! ------------------------------------------------------------------
+ ! Linear Taylor tensor
+ !
+ ! fnode(4:12) = T1_ij
+ !
+ ! The standard FMM part is symmetric, but the realignment
+ ! correction is not. Therefore all 9 components are stored.
+ ! ------------------------------------------------------------------
+
+ fnode(4) = fnode(4) - &
+      (D2(1)*q0 + D3(1)*qx + D3(2)*qy + D3(3)*qz)
+
+ fnode(5) = fnode(5) - &
+      (D2(2)*q0 + D3(2)*qx + D3(4)*qy + D3(5)*qz)
+
+ fnode(6) = fnode(6) - &
+      (D2(3)*q0 + D3(3)*qx + D3(5)*qy + D3(6)*qz)
+
+ fnode(7) = fnode(7) - &
+      (D2(2)*q0 + D3(2)*qx + D3(4)*qy + D3(5)*qz)
+
+ fnode(8) = fnode(8) - &
+      (D2(4)*q0 + D3(4)*qx + D3(7)*qy + D3(8)*qz)
+
+ fnode(9) = fnode(9) - &
+      (D2(5)*q0 + D3(5)*qx + D3(8)*qy + D3(9)*qz)
+
+ fnode(10) = fnode(10) - &
+      (D2(3)*q0 + D3(3)*qx + D3(5)*qy + D3(6)*qz)
+
+ fnode(11) = fnode(11) - &
+      (D2(5)*q0 + D3(5)*qx + D3(8)*qy + D3(9)*qz)
+
+ fnode(12) = fnode(12) - &
+      (D2(6)*q0 + D3(6)*qx + D3(9)*qy + D3(10)*qz)
+
+ ! ------------------------------------------------------------------
+ ! Quadratic Taylor tensor
+ !
+ ! T2_ijk = M D3_ijk
+ !
+ ! Symmetric in j,k.
+ ! ------------------------------------------------------------------
+
+ ! output x
+ fnode(13) = fnode(13) + q0*D3(1)
+ fnode(14) = fnode(14) + q0*D3(2)
+ fnode(15) = fnode(15) + q0*D3(3)
+ fnode(16) = fnode(16) + q0*D3(4)
+ fnode(17) = fnode(17) + q0*D3(5)
+ fnode(18) = fnode(18) + q0*D3(6)
+
+ ! output y
+ fnode(19) = fnode(19) + q0*D3(2)
+ fnode(20) = fnode(20) + q0*D3(4)
+ fnode(21) = fnode(21) + q0*D3(5)
+ fnode(22) = fnode(22) + q0*D3(7)
+ fnode(23) = fnode(23) + q0*D3(8)
+ fnode(24) = fnode(24) + q0*D3(9)
+
+ ! output z
+ fnode(25) = fnode(25) + q0*D3(3)
+ fnode(26) = fnode(26) + q0*D3(5)
+ fnode(27) = fnode(27) + q0*D3(6)
+ fnode(28) = fnode(28) + q0*D3(8)
+ fnode(29) = fnode(29) + q0*D3(9)
+ fnode(30) = fnode(30) + q0*D3(10)
+
+ fnode(61) = fnode(61) + g0*q0 + (D1(1)*qx + D1(2)*qy + D1(3)*qz)  + &
+                         0.5*(D2(1)*qxx + D2(4)*qyy + D2(6)*qzz + 2*(D2(2)*qxy + D2(3)*qxz + D2(5)*qyz))! C⁰ (potential)
+
+end subroutine compute_M2L_new
+
+
+subroutine realignment_m2l_kernel(fnode, M, q1p, q2p, q3p, rx, ry, rz, dr1)
+!
+!-----------------------------------------------------------------------
+! Realignment correction through S2.
+!
+! Adds the Taylor coefficients
+!
+!   Delta a_i =
+!       F_i
+!     + F_ij a_j
+!     + 1/2 F_ijk a_j a_k
+!     + 1/6 F_ijkl a_j a_k a_l
+!
+! to the existing FMM local expansion.
+!
+! Input:
+!   fnode(1:61) : existing FMM local expansion
+!   M           : source-node mass
+!   q1(3)       : source dipole Q_i
+!   q2(3,3)     : source raw quadrupole Q_ij
+!   q3(3,3,3)   : source raw octupole Q_ijk
+!   rx,ry,rz    : R = X_B - X_A
+!   G           : gravitational constant
+!
+! The correction is based on
+!
+!   u = b-a
+!   n = R/R
+!
+! and the S0+S1+S2 Korobkin-style direction expansion.
+!
+! fnode convention:
+!
+!   1:3       F_i
+!   4:12      F_ij, full 3x3
+!   13:30     F_ijk, symmetric in j,k
+!   31:60     F_ijkl, symmetric in j,k,l
+!   61        potential -- untouched
+!
+!-----------------------------------------------------------------------
+
+ real, intent(inout) :: fnode(61)
+
+ real, intent(in) :: M
+ real, intent(in) :: q1p(3)
+ real, intent(in) :: q2p(6)
+ real, intent(in) :: q3p(10)
+ real, intent(in) :: rx, ry, rz, dr1
+
+ real :: q1(3)
+ real :: q2(3,3)
+ real :: q3(3,3,3)
+
+ real :: rinv4, rinv5
+ real :: n(3)
+ real :: delta(3,3)
+
+ real :: B(3,3,3)
+ real :: C(3,3,3,3)
+
+ real :: F0(3)
+ real :: F1(3,3)
+ real :: F2(3,3,3)
+ real :: F3(3,3,3,3)
+
+ integer :: i,j,k,l
+
+
+!-----------------------------------------------------------------------
+! R and unit vector n
+!-----------------------------------------------------------------------
+
+
+ n(1) = rx*dr1
+ n(2) = ry*dr1
+ n(3) = rz*dr1
+
+ rinv4 = dr1**4
+ rinv5 = rinv4*dr1
+
+
+ q1 = q1p
+ q2(1,1) = q2p(1)
+ q2(2,2) = q2p(4)
+ q2(3,3) = q2p(6)
+ q2(1,2) = q2p(2)
+ q2(2,1) = q2(1,2)
+ q2(1,3) = q2p(3)
+ q2(3,1) = q2(1,3)
+ q2(2,3) = q2p(5)
+ q2(3,2) = q2(2,3)
+
+
+ q3(1,1,1) = q3p(1)
+ q3(2,2,2) = q3p(7)
+ q3(3,3,3) = q3p(10)
+ q3(1,1,2) = q3p(2)
+ q3(1,2,1) = q3p(2)
+ q3(2,1,2) = q3p(2)
+ q3(1,1,3) = q3p(3)
+ q3(1,3,1) = q3p(3)
+ q3(3,1,1) = q3p(3)
+ q3(1,2,2) = q3p(4)
+ q3(2,1,2) = q3p(4)
+ q3(2,2,1) = q3p(4)
+ q3(1,2,3) = q3p(5)
+ q3(2,3,1) = q3p(5)
+ q3(3,2,1) = q3p(5)
+ q3(1,3,3) = q3p(6)
+ q3(3,1,3) = q3p(6)
+ q3(3,3,1) = q3p(6)
+ q3(2,2,3) = q3p(8)
+ q3(2,3,2) = q3p(8)
+ q3(3,2,2) = q3p(8)
+ q3(3,3,2) = q3p(9)
+ q3(3,2,3) = q3p(9)
+ q3(2,3,3) = q3p(9)
+
+
+!-----------------------------------------------------------------------
+! Kronecker delta
+!-----------------------------------------------------------------------
+
+ delta(:,:) = 0.0
+
+ do i = 1,3
+    delta(i,i) = 1.0
+ end do
+
+
+!-----------------------------------------------------------------------
+! Build B_ijk
+!
+! B_ijk = n_i/R^4 * (delta_jk - 2 n_j n_k)
+!-----------------------------------------------------------------------
+
+ do i = 1,3
+    do j = 1,3
+       do k = 1,3
+
+          B(i,j,k) = rinv4 * n(i) * &
+              ( delta(j,k) - 2.0*n(j)*n(k) )
+
+       end do
+    end do
+ end do
+
+
+!-----------------------------------------------------------------------
+! Build C_ijkl
+!
+! C_ijkl =
+!
+! 1/R^5 [
+!   11/6 (delta_ij n_k n_l
+!        +delta_ik n_j n_l
+!        +delta_il n_j n_k)
+!
+!  -1/6 (delta_ij delta_kl
+!       +delta_ik delta_jl
+!       +delta_il delta_jk)
+! ]
+!-----------------------------------------------------------------------
+
+ do i = 1,3
+    do j = 1,3
+       do k = 1,3
+          do l = 1,3
+
+             C(i,j,k,l) = rinv5 * (                 &
+                 (11.0/6.0) * (              &
+                    delta(i,j)*n(k)*n(l)           &
+                  + delta(i,k)*n(j)*n(l)           &
+                  + delta(i,l)*n(j)*n(k) )         &
+               - (1.0/6.0) * (              &
+                    delta(i,j)*delta(k,l)         &
+                  + delta(i,k)*delta(j,l)         &
+                  + delta(i,l)*delta(j,k) ) )
+
+          end do
+       end do
+    end do
+ end do
+
+
+!-----------------------------------------------------------------------
+! F_i
+!
+! F_i = G [ B_ijk Q_jk + C_ijkl Q_jkl ]
+!-----------------------------------------------------------------------
+
+ F0(:) = 0.0
+
+ do i = 1,3
+
+    do j = 1,3
+       do k = 1,3
+
+          F0(i) = F0(i) + B(i,j,k) * q2(j,k)
+
+       end do
+    end do
+
+    do j = 1,3
+       do k = 1,3
+          do l = 1,3
+
+             F0(i) = F0(i) + C(i,j,k,l) * q3(j,k,l)
+
+          end do
+       end do
+    end do
+
+ end do
+
+
+!-----------------------------------------------------------------------
+! F_ij
+!
+! F_ij = G [ -2 B_ijk Q_k - 3 C_ijkl Q_kl ]
+!-----------------------------------------------------------------------
+
+ F1(:,:) = 0.0
+
+ do i = 1,3
+    do j = 1,3
+
+       do k = 1,3
+
+          F1(i,j) = F1(i,j) &
+                 - 2.0 * B(i,j,k) * q1(k)
+
+       end do
+
+       do k = 1,3
+          do l = 1,3
+
+             F1(i,j) = F1(i,j) &
+                    - 3.0 * C(i,j,k,l) * q2(k,l)
+
+          end do
+       end do
+
+    end do
+ end do
+
+
+!-----------------------------------------------------------------------
+! F_ijk
+!
+! F_ijk = G [ 2 M B_ijk + 6 C_ijkl Q_l ]
+!
+! Symmetric in j,k.
+!-----------------------------------------------------------------------
+
+ F2(:,:,:) = 0.0
+
+ do i = 1,3
+    do j = 1,3
+       do k = 1,3
+
+          F2(i,j,k) = 2.0 * M * B(i,j,k)
+
+          do l = 1,3
+
+             F2(i,j,k) = F2(i,j,k) &
+                      + 6.0 * C(i,j,k,l) * q1(l)
+
+          end do
+
+       end do
+    end do
+ end do
+
+
+!-----------------------------------------------------------------------
+! F_ijkl
+!
+! F_ijkl = -6 G M C_ijkl
+!
+! Symmetric in j,k,l.
+!-----------------------------------------------------------------------
+
+ F3(:,:,:,:) = 0.0
+
+ do i = 1,3
+    do j = 1,3
+       do k = 1,3
+          do l = 1,3
+
+             F3(i,j,k,l) = -6.0 * M * C(i,j,k,l)
+
+          end do
+       end do
+    end do
+ end do
+
+
+!=======================================================================
+! Add F_i
+!=======================================================================
+
+ fnode(1) = fnode(1) + F0(1)
+ fnode(2) = fnode(2) + F0(2)
+ fnode(3) = fnode(3) + F0(3)
+
+
+!=======================================================================
+! Add F_ij
+!
+! 4:12 is full 3x3:
+!
+!  4 xx   5 xy   6 xz
+!  7 yx   8 yy   9 yz
+! 10 zx  11 zy  12 zz
+!=======================================================================
+
+ fnode(4)  = fnode(4)  + F1(1,1)
+ fnode(5)  = fnode(5)  + F1(1,2)
+ fnode(6)  = fnode(6)  + F1(1,3)
+
+ fnode(7)  = fnode(7)  + F1(2,1)
+ fnode(8)  = fnode(8)  + F1(2,2)
+ fnode(9)  = fnode(9)  + F1(2,3)
+
+ fnode(10) = fnode(10) + F1(3,1)
+ fnode(11) = fnode(11) + F1(3,2)
+ fnode(12) = fnode(12) + F1(3,3)
+
+
+!=======================================================================
+! Add F_ijk
+!
+! Six independent jk components for each output i:
+!
+!  xx, xy, xz, yy, yz, zz
+!
+! x output: 13:18
+! y output: 19:24
+! z output: 25:30
+!=======================================================================
+
+! x
+ fnode(13) = fnode(13) + F2(1,1,1)
+ fnode(14) = fnode(14) + F2(1,1,2)
+ fnode(15) = fnode(15) + F2(1,1,3)
+ fnode(16) = fnode(16) + F2(1,2,2)
+ fnode(17) = fnode(17) + F2(1,2,3)
+ fnode(18) = fnode(18) + F2(1,3,3)
+
+! y
+ fnode(19) = fnode(19) + F2(2,1,1)
+ fnode(20) = fnode(20) + F2(2,1,2)
+ fnode(21) = fnode(21) + F2(2,1,3)
+ fnode(22) = fnode(22) + F2(2,2,2)
+ fnode(23) = fnode(23) + F2(2,2,3)
+ fnode(24) = fnode(24) + F2(2,3,3)
+
+! z
+ fnode(25) = fnode(25) + F2(3,1,1)
+ fnode(26) = fnode(26) + F2(3,1,2)
+ fnode(27) = fnode(27) + F2(3,1,3)
+ fnode(28) = fnode(28) + F2(3,2,2)
+ fnode(29) = fnode(29) + F2(3,2,3)
+ fnode(30) = fnode(30) + F2(3,3,3)
+
+
+!=======================================================================
+! Add F_ijkl
+!
+! Ten independent jkl components:
+!
+! xxx,xxy,xxz,xyy,xyz,xzz,yyy,yyz,yzz,zzz
+!
+! x output: 31:40
+! y output: 41:50
+! z output: 51:60
+!=======================================================================
+
+! x
+ fnode(31) = fnode(31) + F3(1,1,1,1)
+ fnode(32) = fnode(32) + F3(1,1,1,2)
+ fnode(33) = fnode(33) + F3(1,1,1,3)
+ fnode(34) = fnode(34) + F3(1,1,2,2)
+ fnode(35) = fnode(35) + F3(1,1,2,3)
+ fnode(36) = fnode(36) + F3(1,1,3,3)
+ fnode(37) = fnode(37) + F3(1,2,2,2)
+ fnode(38) = fnode(38) + F3(1,2,2,3)
+ fnode(39) = fnode(39) + F3(1,2,3,3)
+ fnode(40) = fnode(40) + F3(1,3,3,3)
+
+! y
+ fnode(41) = fnode(41) + F3(2,1,1,1)
+ fnode(42) = fnode(42) + F3(2,1,1,2)
+ fnode(43) = fnode(43) + F3(2,1,1,3)
+ fnode(44) = fnode(44) + F3(2,1,2,2)
+ fnode(45) = fnode(45) + F3(2,1,2,3)
+ fnode(46) = fnode(46) + F3(2,1,3,3)
+ fnode(47) = fnode(47) + F3(2,2,2,2)
+ fnode(48) = fnode(48) + F3(2,2,2,3)
+ fnode(49) = fnode(49) + F3(2,2,3,3)
+ fnode(50) = fnode(50) + F3(2,3,3,3)
+
+! z
+ fnode(51) = fnode(51) + F3(3,1,1,1)
+ fnode(52) = fnode(52) + F3(3,1,1,2)
+ fnode(53) = fnode(53) + F3(3,1,1,3)
+ fnode(54) = fnode(54) + F3(3,1,2,2)
+ fnode(55) = fnode(55) + F3(3,1,2,3)
+ fnode(56) = fnode(56) + F3(3,1,3,3)
+ fnode(57) = fnode(57) + F3(3,2,2,2)
+ fnode(58) = fnode(58) + F3(3,2,2,3)
+ fnode(59) = fnode(59) + F3(3,2,3,3)
+ fnode(60) = fnode(60) + F3(3,3,3,3)
+
+
+!-----------------------------------------------------------------------
+! fnode(61) is deliberately untouched.
+!-----------------------------------------------------------------------
+
+end subroutine realignment_m2l_kernel
+
 #ifdef GRAVITY
 !----------------------------------------------------------------
 !+
@@ -2209,7 +3298,7 @@ end subroutine add_torque_correction
 !   fxi,fyi,fzi : gravitational force at the new position
 !+
 !----------------------------------------------------------------
-pure subroutine expand_fgrav_in_taylor_series(fnode,dx,dy,dz,fxi,fyi,fzi,poti)
+pure subroutine expand_fgrav_in_taylor_series_old(fnode,dx,dy,dz,fxi,fyi,fzi,poti)
  real, intent(in)  :: fnode(lenfgrav)
  real, intent(in)  :: dx,dy,dz
  real, intent(out) :: fxi,fyi,fzi,poti
@@ -2251,8 +3340,130 @@ pure subroutine expand_fgrav_in_taylor_series(fnode,dx,dy,dz,fxi,fyi,fzi,poti)
              - dy*(fyi - 0.5*(dx*dfxy + dy*dfyy + dz*dfyz)) &
              - dz*(fzi - 0.5*(dx*dfxz + dy*dfyz + dz*dfzz))
 
-end subroutine expand_fgrav_in_taylor_series
+end subroutine expand_fgrav_in_taylor_series_old
 
+pure subroutine expand_fgrav_in_taylor_series(fnode,dx,dy,dz,fxi,fyi,fzi,poti)
+ real, intent(in)  :: fnode(lenfgrav)
+ real, intent(in)  :: dx,dy,dz
+ real, intent(out) :: fxi,fyi,fzi,poti
+ real :: dx2,dy2,dz2
+ real :: dx3,dy3,dz3
+
+ dx2 = dx*dx
+ dy2 = dy*dy
+ dz2 = dz*dz
+
+ dx3 = dx*dx2
+ dy3 = dy*dy2
+ dz3 = dz*dz2
+
+ ! ================================================================
+ ! Constant acceleration
+ ! ================================================================
+
+ fxi = fnode(1)
+ fyi = fnode(2)
+ fzi = fnode(3)
+
+ ! ================================================================
+ ! Linear acceleration: B_ij dx_j
+ !
+ ! B:
+ !   [ 4  5  6 ]
+ !   [ 7  8  9 ]
+ !   [10 11 12 ]
+ ! ================================================================
+
+ fxi = fxi + dx*fnode(4)  + dy*fnode(5)  + dz*fnode(6)
+ fyi = fyi + dx*fnode(7)  + dy*fnode(8)  + dz*fnode(9)
+ fzi = fzi + dx*fnode(10) + dy*fnode(11) + dz*fnode(12)
+
+ ! ================================================================
+ ! Quadratic acceleration: 1/2 C_ijk dx_j dx_k
+ !
+ ! x output: 13:18
+ ! y output: 19:24
+ ! z output: 25:30
+ !
+ ! local-index order:
+ ! xx, xy, xz, yy, yz, zz
+ ! ================================================================
+
+ fxi = fxi + 0.5*( &
+          dx2*fnode(13) + 2.*dx*dy*fnode(14) + 2.*dx*dz*fnode(15) &
+        + dy2*fnode(16) + 2.*dy*dz*fnode(17) + dz2*fnode(18) )
+
+ fyi = fyi + 0.5*( &
+          dx2*fnode(19) + 2.*dx*dy*fnode(20) + 2.*dx*dz*fnode(21) &
+        + dy2*fnode(22) + 2.*dy*dz*fnode(23) + dz2*fnode(24) )
+
+ fzi = fzi + 0.5*( &
+          dx2*fnode(25) + 2.*dx*dy*fnode(26) + 2.*dx*dz*fnode(27) &
+        + dy2*fnode(28) + 2.*dy*dz*fnode(29) + dz2*fnode(30) )
+
+ ! ================================================================
+ ! Cubic acceleration: 1/6 D_ijkl dx_j dx_k dx_l
+ !
+ ! x output: 31:40
+ ! y output: 41:50
+ ! z output: 51:60
+ !
+ ! local-index order:
+ ! xxx,xxy,xxz,xyy,xyz,xzz,yyy,yyz,yzz,zzz
+ ! ================================================================
+
+ fxi = fxi + (1./6.)*( &
+          dx3*fnode(31) &
+        + 3.*dx2*dy*fnode(32) &
+        + 3.*dx2*dz*fnode(33) &
+        + 3.*dx*dy2*fnode(34) &
+        + 6.*dx*dy*dz*fnode(35) &
+        + 3.*dx*dz2*fnode(36) &
+        + dy3*fnode(37) &
+        + 3.*dy2*dz*fnode(38) &
+        + 3.*dy*dz2*fnode(39) &
+        + dz3*fnode(40) )
+
+ fyi = fyi + (1./6.)*( &
+          dx3*fnode(41) &
+        + 3.*dx2*dy*fnode(42) &
+        + 3.*dx2*dz*fnode(43) &
+        + 3.*dx*dy2*fnode(44) &
+        + 6.*dx*dy*dz*fnode(45) &
+        + 3.*dx*dz2*fnode(46) &
+        + dy3*fnode(47) &
+        + 3.*dy2*dz*fnode(48) &
+        + 3.*dy*dz2*fnode(49) &
+        + dz3*fnode(50) )
+
+ fzi = fzi + (1./6.)*( &
+          dx3*fnode(51) &
+        + 3.*dx2*dy*fnode(52) &
+        + 3.*dx2*dz*fnode(53) &
+        + 3.*dx*dy2*fnode(54) &
+        + 6.*dx*dy*dz*fnode(55) &
+        + 3.*dx*dz2*fnode(56) &
+        + dy3*fnode(57) &
+        + 3.*dy2*dz*fnode(58) &
+        + 3.*dy*dz2*fnode(59) &
+        + dz3*fnode(60) )
+
+ ! ================================================================
+ ! Potential
+ !
+ ! The realigned acceleration field is not generally conservative:
+ !
+ !       B_ij != B_ji
+ !
+ ! so there is no scalar potential whose gradient reproduces the
+ ! complete realigned acceleration field.
+ !
+ ! Keep fnode(61) as the separately transported FMM potential.
+ ! ================================================================
+
+ poti = fnode(61)
+
+end subroutine expand_fgrav_in_taylor_series
 !-----------------------------------------------
 !+
 !  Routine to update a constructed tree

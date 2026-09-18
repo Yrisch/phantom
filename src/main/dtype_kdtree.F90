@@ -18,7 +18,7 @@ module dtypekdtree
 !
  implicit none
 
- integer, parameter, public :: lenfgrav = 20
+ integer, parameter, public :: lenfgrav = 61
 
  integer, parameter :: kdnode_bytes = &
                       8*3 &  ! xcen(3)

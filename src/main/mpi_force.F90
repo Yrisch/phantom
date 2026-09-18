@@ -30,7 +30,7 @@ module mpiforce
  integer, parameter :: ndata = 20 ! number of elements in the cell (including padding)
  integer, parameter :: nbytes_cellforce = 8 * maxxpartveciforce * minpart + &  !  xpartvec(maxxpartveciforce,minpart)
                                           8 * maxfsum * minpart           + &  !  fsums(maxfsum,minpart)
-                                          8 * 20                          + &  !  fgrav(20)
+                                          8 * 61                          + &  !  fgrav(20)
                                           8 * 3                           + &  !  xpos(3)
                                           8                               + &  !  xsizei
                                           8                               + &  !  rcuti
@@ -52,7 +52,7 @@ module mpiforce
     sequence
     real             :: xpartvec(maxxpartveciforce,minpart)
     real             :: fsums(maxfsum,minpart)
-    real             :: fgrav(20)
+    real             :: fgrav(61)
     real             :: xpos(3)
     real             :: xsizei
     real             :: rcuti
