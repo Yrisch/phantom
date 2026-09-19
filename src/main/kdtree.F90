@@ -1636,11 +1636,12 @@ subroutine getneigh_dual(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzca
  integer :: istack,i,iparent,idstbranch,idst,isrc,maxcache,tobecached,ibase
  integer :: branch(maxdepth),nparents,stack(3,2048),startwith(2)
  real    :: dx,dy,dz,xoffset,yoffset,zoffset
- real    :: tree_acc2
+ real    :: tree_acc2,mroot
  real    :: fnode_acc(lenfgrav)
  logical :: stackit,fcached
 
  tree_acc2 = tree_accuracy*tree_accuracy
+ mroot     = node(irootnode)%mass
 
  if (ixyzcachesize > 0) then
     maxcache = size(xyzcache,1)
@@ -1690,7 +1691,7 @@ subroutine getneigh_dual(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzca
        yoffset = 0.
        zoffset = 0.
     else
-       call node_interaction(node(idst),node(isrc),tree_acc2,fnode_branch(:,idstbranch),stackit,xoffset,yoffset,zoffset)
+       call node_interaction(node(idst),node(isrc),tree_acc2,mroot,fnode_branch(:,idstbranch),stackit,xoffset,yoffset,zoffset)
     endif
 
     if (stackit) then
@@ -1973,15 +1974,15 @@ end subroutine open_nodes
 !  the interaction if needed
 !+
 !-----------------------------------------------------------
-subroutine node_interaction(node_dst,node_src,tree_acc2,fnode,stackit,xoffset,yoffset,zoffset)
+subroutine node_interaction(node_dst,node_src,tree_acc2,mroot,fnode,stackit,xoffset,yoffset,zoffset)
  type(kdnode), intent(in)    :: node_dst,node_src
- real,         intent(in)    :: tree_acc2
+ real,         intent(in)    :: tree_acc2,mroot
  real,         intent(inout) :: fnode(lenfgrav)
  real,         intent(out)   :: xoffset,yoffset,zoffset
  logical,      intent(out)   :: stackit
  real    :: dx,dy,dz,r2
  real    :: rcut_dst,rcut_src,rcut,rcut2
- real    :: size_dst,size_src
+ real    :: size_dst,size_src,Qnorm_src,Dnorm_src,Qs(9),Ts
  logical :: wellsep,fcached
 #ifdef GRAVITY
  real    :: dr1
@@ -2002,15 +2003,21 @@ subroutine node_interaction(node_dst,node_src,tree_acc2,fnode,stackit,xoffset,yo
 #endif
  rcut  = max(rcut_dst,rcut_src)
  rcut2 = (size_dst+size_src+rcut)**2
- wellsep = (tree_acc2*r2 > (size_dst+size_src)**2) .and. (r2 > rcut2)
+ Qs = node_src%quads
+ Dnorm_src = 2. * sqrt(2.*(Qs(1)**2+Qs(2)**2+Qs(3)**2))
+ Qnorm_src = sqrt(12.*(Qs(4)**2+Qs(7)**2+Qs(9)**2) + 16.*(Qs(5)**2+Qs(6)**2+Qs(8)**2))
+ Ts = tree_acc2*(mroot/node_src%mass)**(1./6.)
+ wellsep = (Ts*r2 > ((size_dst)**2 + ((Qnorm_src + Dnorm_src*size_dst)/node_src%mass))) .and. (r2 > rcut2)
+ ! wellsep = (Ts*r2 > ((size_dst)**2 + (Qnorm_src/node_src%mass))) .and. (r2 > rcut2)
+ ! wellsep = (tree_acc2*r2 > (size_dst + size_src)**2) .and. (r2 > rcut2)
 
  if (wellsep) then
 #ifdef GRAVITY
     if (.not.fcached) then
        dr1 = 1./sqrt(r2)
        call compute_M2L(dx,dy,dz,dr1,node_src%mass,node_src%quads,fnode)
-       call add_torque_correction(dx,dy,dz,dr1,node_dst%mass,node_src%mass, &
-                                  node_dst%octs,node_src%octs,fnode)
+       ! call add_torque_correction(dx,dy,dz,dr1,node_dst%mass,node_src%mass, &
+       !                            node_dst%octs,node_src%octs,fnode)
     endif
 #endif
     stackit = .false.
