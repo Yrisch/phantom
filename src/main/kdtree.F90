@@ -326,7 +326,7 @@ subroutine maketree(node, xyzh, np, leaf_is_active, ncells, apr_tree, refineleve
     ncells = 2**(maxlevel+1) - 1
  endif
  !-- if octree is used, we need to propagate information from leaf to root (hmax and quads)
- if (use_geosplit) call propagate_upward(int(ncells), node)
+ ! if (use_geosplit) call propagate_upward(int(ncells), node)
 
  if (maxlevel > maxlevel_indexed .and. .not.already_warned) then
     write(string,"(i10)") 2**(maxlevel-maxlevel_indexed)
@@ -683,10 +683,10 @@ subroutine set_nodes_properties(npnode,nnode,x0,totmass_node,mymum,nodeentry,xmi
           dx    = xi - x0(1)
           dy    = yi - x0(2)
           dz    = zi - x0(3)
-          if (.not.use_geosplit) then
-             dr2   = dx*dx + dy*dy + dz*dz
-             r2max = max(r2max,dr2)
-          endif
+          ! if (.not.use_geosplit) then
+          dr2   = dx*dx + dy*dy + dz*dz
+          r2max = max(r2max,dr2)
+          ! endif
           hmax  = max(hmax,hi)
 #ifdef GRAVITY
           pmassi = treecache(5,i)
@@ -704,10 +704,10 @@ subroutine set_nodes_properties(npnode,nnode,x0,totmass_node,mymum,nodeentry,xmi
           dx    = xi - x0(1)
           dy    = yi - x0(2)
           dz    = zi - x0(3)
-          if (.not.use_geosplit) then
-             dr2   = dx*dx + dy*dy + dz*dz
-             r2max = max(r2max,dr2)
-          endif
+          ! if (.not.use_geosplit) then
+          dr2   = dx*dx + dy*dy + dz*dz
+          r2max = max(r2max,dr2)
+          ! endif
           hmax = max(hmax,hi)
 #ifdef GRAVITY
           pmassi = treecache(5,i)
@@ -718,10 +718,10 @@ subroutine set_nodes_properties(npnode,nnode,x0,totmass_node,mymum,nodeentry,xmi
     endif
  endif
 
- if (use_geosplit) then
-    r2max = 0.25*sum((xmaxi-xmini)**2)
-    totmass_node  = totmass
- endif
+ ! if (use_geosplit) then
+ !    r2max = 0.25*sum((xmaxi-xmini)**2)
+ !    totmass_node  = totmass
+ ! endif
  ! reduce node limits and quads across MPI tasks belonging to this group
  if (mpi .and. global_build) then
     r2max     = reduce_group(r2max,'max',level)
@@ -852,28 +852,29 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
 
  xyzcofm(:) = 0.
 
+ call compute_nodes_cofm(npnode,nnode,xyzcofm,totmass_node,doparallel)
+ ! if this is global node construction, get the cofm and total mass
+ ! of all particles in this node (some on other MPI tasks)
+ if (mpi .and. global_build) then
+    call get_group_cofm(xyzcofm,totmass_node,level,xyzcofmg,totmassg)
+    xyzcofm = xyzcofmg
+    totmass_node = totmassg
+ endif
+ ! checks the reduced mass in the case of global maketree
+ if (totmass_node<=0. .and. use_apr) call fatal('mtree + apr', &
+    'totmass_node==0, something almost certainly wrong with aprmassoftype')
+ if (totmass_node<=0.) call fatal('mtree','totmass_node==0',val=totmass_node)
+
  if (use_geosplit) then !--for geotree we use the middle point to split the node and propagate properties after
     x0        = (xmaxi+xmini)*0.5       ! middle point of the node
-    comp_node = .not.wassplit
+    comp_node = .true. !.not.wassplit
  else  !--for gravity and default KDtree, we need the centre of the node to be the centre of mass
-    call compute_nodes_cofm(npnode,nnode,xyzcofm,totmass_node,doparallel)
-    ! if this is global node construction, get the cofm and total mass
-    ! of all particles in this node (some on other MPI tasks)
-    if (mpi .and. global_build) then
-       call get_group_cofm(xyzcofm,totmass_node,level,xyzcofmg,totmassg)
-       xyzcofm = xyzcofmg
-       totmass_node = totmassg
-    endif
     x0 = xyzcofm
     comp_node = .true.
-    ! checks the reduced mass in the case of global maketree
-    if (totmass_node<=0. .and. use_apr) call fatal('mtree + apr', &
-    'totmass_node==0, something almost certainly wrong with aprmassoftype')
-    if (totmass_node<=0.) call fatal('mtree','totmass_node==0',val=totmass_node)
  endif
 
 
- call set_nodes_properties(npnode,nnode,x0,totmass_node,mymum,nodeentry,xmini,xmaxi,&
+ call set_nodes_properties(npnode,nnode,xyzcofm,totmass_node,mymum,nodeentry,xmini,xmaxi,&
                            level,global_build,doparallel,comp_node)
 
  if (apr_tree)   wassplit = (npnode > 2)
