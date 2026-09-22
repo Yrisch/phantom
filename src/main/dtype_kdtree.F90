@@ -35,6 +35,8 @@ module dtypekdtree
                     + 4 &    ! fcached
                     + 8*9 &  ! quads(9) (dips+quads)
                     + 8*10 & ! octs(10)
+                    + 8 &    ! mratio
+                    + 8 &    ! qnorm
 #endif
                     + 0
 
@@ -68,6 +70,8 @@ module dtypekdtree
     logical :: fcached
     real    :: quads(9)
     real    :: octs(10)  ! xxx,xxy,xxz,xyy,xyz,xzz,yyy,yyz,yzz,zzz
+    real    :: mratio
+    real    :: qnorm
 #endif
  end type kdnode
 

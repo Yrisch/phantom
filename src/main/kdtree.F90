@@ -58,6 +58,7 @@ module kdtree
  logical, private :: done_init_kdtree = .false.
  logical, private :: already_warned   = .false.
  integer, private :: numthreads
+ real,    private :: mroot
 
 ! Index of the last node in the local tree that has been copied to
 ! the global tree
@@ -365,6 +366,8 @@ subroutine empty_tree(node)
     node(i)%mass  = 0.
     node(i)%quads = 0.
     node(i)%octs  = 0.
+    node(i)%mratio = 0.
+    node(i)%qnorm   = 0.
 #endif
  enddo
 !$omp end parallel do
@@ -404,6 +407,7 @@ subroutine construct_root_node(np,nproot,irootnode,xmini,xmaxi,leaf_is_active,xy
 
  ncross = 0
  nproot = 0
+ mroot  = 0
  !$omp parallel default(none) &
  !$omp shared(np,xyzh,nptmass,xyzmh_ptmass) &
  !$omp shared(inodeparts,iphase,treecache,nproot) &
@@ -484,6 +488,7 @@ subroutine construct_root_node(np,nproot,irootnode,xmini,xmaxi,leaf_is_active,xy
        else
           treecache(5,nproot) = massoftype(igas)
        endif
+       mroot = mroot + treecache(5,nproot)
     endif isnotdead
  enddo
 
@@ -499,6 +504,7 @@ subroutine construct_root_node(np,nproot,irootnode,xmini,xmaxi,leaf_is_active,xy
           treecache(1:3,nproot) = xyzmh_ptmass(1:3,i)
           treecache(4,nproot)   = xyzmh_ptmass(ihsoft,i)
           treecache(5,nproot)   = xyzmh_ptmass(4,i)
+          mroot = mroot + treecache(5,nproot)
        enddo
     endif
  endif
@@ -642,7 +648,7 @@ subroutine set_nodes_properties(npnode,nnode,x0,totmass_node,mymum,nodeentry,xmi
  logical,         intent(in)    :: doparallel,global_build,comp_node
  real    :: pmassi
  real    :: dx,dy,dz,dr2,xi,yi,zi,hi
- real    :: hmax,r2max,totmass
+ real    :: hmax,r2max,totmass,mratio,qnorm
  integer :: i1,i
 #ifdef GRAVITY
  real    :: quads(9)
@@ -718,6 +724,9 @@ subroutine set_nodes_properties(npnode,nnode,x0,totmass_node,mymum,nodeentry,xmi
     endif
  endif
 
+ mratio = (mroot/totmass)**(1./6.)
+ qnorm    = sqrt(0.5*((quads(4)-quads(7))**2+(quads(7)-quads(9))**2+(quads(7)-quads(4))**2) +&
+            3.0*(quads(5)**2+quads(6)**2+quads(8)**2))/totmass
  ! if (use_geosplit) then
  !    r2max = 0.25*sum((xmaxi-xmini)**2)
  !    totmass_node  = totmass
@@ -771,6 +780,8 @@ subroutine set_nodes_properties(npnode,nnode,x0,totmass_node,mymum,nodeentry,xmi
  nodeentry%tobecached = 1
  nodeentry%fcached    = .false.
  nodeentry%ncached    = .false.
+ nodeentry%mratio     = mratio
+ nodeentry%qnorm      = qnorm
 #endif
 
 end subroutine set_nodes_properties
@@ -1642,7 +1653,6 @@ subroutine getneigh_dual(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzca
  logical :: stackit,fcached
 
  tree_acc2 = tree_accuracy*tree_accuracy
- mroot     = node(irootnode)%mass
 
  if (ixyzcachesize > 0) then
     maxcache = size(xyzcache,1)
@@ -1692,7 +1702,7 @@ subroutine getneigh_dual(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzca
        yoffset = 0.
        zoffset = 0.
     else
-       call node_interaction(node(idst),node(isrc),tree_acc2,mroot,fnode_branch(:,idstbranch),stackit,xoffset,yoffset,zoffset)
+       call node_interaction(node(idst),node(isrc),tree_acc2,fnode_branch(:,idstbranch),stackit,xoffset,yoffset,zoffset)
     endif
 
     if (stackit) then
@@ -1975,15 +1985,15 @@ end subroutine open_nodes
 !  the interaction if needed
 !+
 !-----------------------------------------------------------
-subroutine node_interaction(node_dst,node_src,tree_acc2,mroot,fnode,stackit,xoffset,yoffset,zoffset)
+subroutine node_interaction(node_dst,node_src,tree_acc2,fnode,stackit,xoffset,yoffset,zoffset)
  type(kdnode), intent(in)    :: node_dst,node_src
- real,         intent(in)    :: tree_acc2,mroot
+ real,         intent(in)    :: tree_acc2
  real,         intent(inout) :: fnode(lenfgrav)
  real,         intent(out)   :: xoffset,yoffset,zoffset
  logical,      intent(out)   :: stackit
  real    :: dx,dy,dz,r2
  real    :: rcut_dst,rcut_src,rcut,rcut2
- real    :: size_dst,size_src,Qnorm_src,Dnorm_src,Qs(9),Ts
+ real    :: size_dst,size_src
  logical :: wellsep,fcached
 #ifdef GRAVITY
  real    :: dr1
@@ -2004,12 +2014,9 @@ subroutine node_interaction(node_dst,node_src,tree_acc2,mroot,fnode,stackit,xoff
 #endif
  rcut  = max(rcut_dst,rcut_src)
  rcut2 = (size_dst+size_src+rcut)**2
- Qs = node_src%quads
- Dnorm_src = 2. * sqrt(2.*(Qs(1)**2+Qs(2)**2+Qs(3)**2))
- Qnorm_src = sqrt(12.*(Qs(4)**2+Qs(7)**2+Qs(9)**2) + 16.*(Qs(5)**2+Qs(6)**2+Qs(8)**2))
- Ts = tree_acc2*(mroot/node_src%mass)**(1./6.)
- wellsep = (Ts*r2 > ((size_dst)**2 + ((Qnorm_src + Dnorm_src*size_dst)/node_src%mass))) .and. (r2 > rcut2)
- ! wellsep = (Ts*r2 > ((size_dst)**2 + (Qnorm_src/node_src%mass))) .and. (r2 > rcut2)
+
+ wellsep = (tree_acc2*node_src%mratio*r2 > 8.*(max(size_dst,size_src)/(size_src+size_dst))*((size_dst)**2 +&
+            node_src%qnorm)) .and. (r2 > rcut2)
  ! wellsep = (tree_acc2*r2 > (size_dst + size_src)**2) .and. (r2 > rcut2)
 
  if (wellsep) then
@@ -2017,8 +2024,8 @@ subroutine node_interaction(node_dst,node_src,tree_acc2,mroot,fnode,stackit,xoff
     if (.not.fcached) then
        dr1 = 1./sqrt(r2)
        call compute_M2L(dx,dy,dz,dr1,node_src%mass,node_src%quads,fnode)
-       ! call add_torque_correction(dx,dy,dz,dr1,node_dst%mass,node_src%mass, &
-       !                            node_dst%octs,node_src%octs,fnode)
+       call add_torque_correction(dx,dy,dz,dr1,node_dst%mass,node_src%mass, &
+                                  node_dst%octs,node_src%octs,fnode)
     endif
 #endif
     stackit = .false.
