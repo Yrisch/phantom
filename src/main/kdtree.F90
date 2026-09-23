@@ -55,15 +55,20 @@ module kdtree
 !
  real,    public  :: tree_accuracy    = 0.5
  logical, public  :: use_geosplit     = .true.
- logical, public  :: use_geosplit_fast = .true. ! key-sorted fast build for geosplit trees
- logical, public  :: use_cache        = .true.
+  logical, public  :: use_geosplit_fast = .false. ! key-sorted fast build for geosplit trees (experimental)
+  logical, public  :: use_tree_renumber = .true. ! deterministic DFS-preorder node numbering
+  logical, public  :: use_cache        = .true.
  integer, private :: kdpat(0:keydepth_max-1) ! split axis (0,1,2) per dyadic level
  integer(kind=8), private, allocatable :: kdkey(:)     ! dyadic sort key per particle slot
  integer(kind=8), private, allocatable :: kdkey_buf(:) ! radix sort scratch
  integer,         private, allocatable :: kdord(:)     ! permutation carried through the key sort
  integer,         private, allocatable :: kdord_buf(:) ! radix sort scratch
- real,            private, allocatable :: kdtmp(:,:)   ! scratch for parallel key-order permute
- integer(kind=8), private :: kdkeymax = 0              ! max key value (sets radix passes)
+  real,            private, allocatable :: kdtmp(:,:)   ! scratch for parallel key-order permute
+  integer(kind=8), private :: kdkeymax = 0              ! max key value (sets radix passes)
+  integer,         private, allocatable :: kddone(:)    ! marks fallback-built nodes (skipped in Phase B)
+  integer,         private, allocatable :: kdmap(:)     ! old->new ids for deterministic renumbering
+  integer,         private, allocatable :: kdbkt_start(:) ! level bucket starts (Phase B)
+  integer,         private, allocatable :: kdbkt_list(:)  ! node ids by level (Phase B)
  logical, private :: done_init_kdtree = .false.
  logical, private :: already_warned   = .false.
  integer, private :: numthreads
@@ -88,7 +93,6 @@ module kdtree
     integer :: parent
     integer :: level
     integer :: npnode
-    integer :: state ! build state flag (fast build only: 0 = unexpanded, 1 = children done)
     real    :: xmin(3)
     real    :: xmax(3)
  end type kdbuildstack
@@ -98,7 +102,7 @@ module kdtree
 contains
 
 subroutine allocate_kdtree
- use dim, only:mpi,maxp
+ use dim, only:mpi,maxp,ncellsmax
  use allocutils, only:allocate_array
 
  call allocate_array('inoderange', inoderange, 2, ncellsmax+1)
@@ -108,6 +112,10 @@ subroutine allocate_kdtree
  call allocate_array('kdord', kdord, maxp)
  call allocate_array('kdord_buf', kdord_buf, maxp)
  call allocate_array('kdtmp', kdtmp, 5, maxp)
+ call allocate_array('kddone', kddone, ncellsmax+1)
+ call allocate_array('kdmap', kdmap, ncellsmax+1)
+ call allocate_array('kdbkt_start', kdbkt_start, maxdepth+3)
+ call allocate_array('kdbkt_list', kdbkt_list, ncellsmax+1)
  if (mpi) call allocate_array('refinementnode', refinementnode, ncellsmax+1)
  call allocate_array('fnodecache', fnodecache, lenfgrav, ncellsmax+1)
  call allocate_array('neighnodecache',neighnodecache,ncellsmax*maxneigh_per_node)
@@ -131,6 +139,10 @@ subroutine deallocate_kdtree
  if (allocated(kdord)) deallocate(kdord)
  if (allocated(kdord_buf)) deallocate(kdord_buf)
  if (allocated(kdtmp)) deallocate(kdtmp)
+ if (allocated(kddone)) deallocate(kddone)
+ if (allocated(kdmap)) deallocate(kdmap)
+ if (allocated(kdbkt_start)) deallocate(kdbkt_start)
+ if (allocated(kdbkt_list)) deallocate(kdbkt_list)
  if (mpi .and. allocated(refinementnode)) deallocate(refinementnode)
  if (allocated(fnodecache)) deallocate(fnodecache)
  if (allocated(neighnodecache)) deallocate(neighnodecache)
@@ -364,12 +376,17 @@ subroutine maketree(node, xyzh, np, leaf_is_active, ncells, apr_tree, refineleve
                'NCELLSMAX='//trim(adjustl(string))//'*maxp,')
  endif
 
- if (present(refinelevels)) refinelevels = minlevel
+  if (present(refinelevels)) refinelevels = minlevel
 
- if (iverbose >= 3) then
-    write(iprint,"(a,i10,3(a,i2))") ' maketree: nodes = ',ncells,', max level = ',maxlevel,&
-       ', min leaf level = ',minlevel,' max level indexed = ',maxlevel_indexed
- endif
+  ! deterministic DFS-preorder numbering (geosplit serial builds only:
+  ! the 2^k indexed and MPI-refined paths rely on their own layouts)
+  if (use_tree_renumber .and. use_geosplit .and. nprocs == 1) &
+     call renumber_tree_dfs(node,ncells,leaf_is_active)
+
+  if (iverbose >= 3) then
+     write(iprint,"(a,i10,3(a,i2))") ' maketree: nodes = ',ncells,', max level = ',maxlevel,&
+        ', min leaf level = ',minlevel,' max level indexed = ',maxlevel_indexed
+  endif
 
 end subroutine maketree
 
@@ -390,6 +407,7 @@ end subroutine maketree
 subroutine maketree_fast(node,np,nproot,xminroot,xmaxroot,leaf_is_active,ncells,refinelevels)
  use io,   only:fatal,warning,iprint,iverbose
 !$ use omp_lib
+ use dim, only:minpart
  use sortutils, only:radixsort_i8
  type(kdnode),    intent(out)   :: node(:)
  integer,         intent(in)    :: np,nproot
@@ -398,20 +416,22 @@ subroutine maketree_fast(node,np,nproot,xminroot,xmaxroot,leaf_is_active,ncells,
  integer(kind=8), intent(out)   :: ncells
  integer,         intent(out),   optional :: refinelevels
  integer :: i,npnode,il,ir,istack,nl,nr,mymum
- integer :: nnode,minlevel,level,nqueue,npass,nanc,istate
+ integer :: nnode,minlevel,level,nqueue,npass,nlvl,i0,i1
  real :: xmini(3),xmaxi(3),xminl(3),xmaxl(3),xminr(3),xmaxr(3)
+ real :: dumbox(3),dumbox2(3)
  integer, parameter :: istacksize = 512
- integer, parameter :: nancmax = 2*istacksize
  type(kdbuildstack), save :: stack(istacksize)
  !$omp threadprivate(stack)
  type(kdbuildstack) :: queue(istacksize)
- type(kdbuildstack) :: ancestors(nancmax)
 !$ integer :: threadid
- logical :: wassplit,dofallback,finished
+ logical :: wassplit,dofallback,finished,dobig
  character(len=10) :: string
 
  itail_neigh = 0
  leaf_is_active = 0
+ kddone = 0
+ dumbox = 0.
+ dumbox2 = 0.
 
  ncells = 1
  maxlevel = 0
@@ -447,9 +467,8 @@ subroutine maketree_fast(node,np,nproot,xminroot,xmaxroot,leaf_is_active,ncells,
  call push_onto_stack(queue(istack),irootnode,0,0,nproot,xminroot,xmaxroot)
 
  nqueue = numthreads
- nanc = 0
- ! build level by level until number of nodes = number of threads;
- ! splits only (no property scans yet), leaves are scanned immediately
+ ! Phase A: structure only. Build level by level until number of nodes
+ ! equals number of threads; no property scans, leaves just stop here
  over_queue: do while (istack < nqueue)
     if (istack <= 0) then
        finished = .true.
@@ -468,30 +487,26 @@ subroutine maketree_fast(node,np,nproot,xminroot,xmaxroot,leaf_is_active,ncells,
     elseif (wassplit) then
        if (istack+2 > istacksize) call fatal('maketree_fast',&
            'queue size exceeded in tree build, increase istacksize and recompile')
-       if (nanc+1 > nancmax) call fatal('maketree_fast',&
-           'ancestor list exceeded in tree build, increase nancmax and recompile')
-       nanc = nanc + 1
-       call push_onto_stack(ancestors(nanc),nnode,mymum,level,npnode,xmini,xmaxi)
+       maxlevel = max(level+1,maxlevel)
        istack = istack + 1
        call push_onto_stack(queue(istack),il,nnode,level+1,nl,xminl,xmaxl)
        istack = istack + 1
        call push_onto_stack(queue(istack),ir,nnode,level+1,nr,xminr,xmaxr)
     else
-       call scan_leaf_fast(node(nnode),nnode,mymum,level,xmini,xmaxi,.true., &
-                           leaf_is_active,minlevel,maxlevel)
+       maxlevel = max(level,maxlevel)
+       minlevel = min(level,minlevel)
     endif
  enddo over_queue
 
  done: if (.not.finished) then
-    ! each thread builds its subtree post-order: split on first visit,
-    ! single property scan once children are complete
+    ! each thread splits its subtree fully (structure only)
     !$omp parallel default(none) &
     !$omp shared(queue) &
     !$omp shared(ll, leaf_is_active) &
     !$omp shared(node, ncells) &
     !$omp shared(nqueue) &
     !$omp private(istack) &
-    !$omp private(nnode, mymum, level, npnode, xmini, xmaxi, istate) &
+    !$omp private(nnode, mymum, level, npnode, xmini, xmaxi) &
     !$omp private(ir, il, nl, nr) &
     !$omp private(xminr, xmaxr, xminl, xmaxl) &
     !$omp private(threadid) &
@@ -501,32 +516,26 @@ subroutine maketree_fast(node,np,nproot,xminroot,xmaxroot,leaf_is_active,ncells,
     !$omp do schedule(static)
     do i = 1, nqueue
        stack(1) = queue(i)
-       stack(1)%state = 0
        istack = 1
        over_stack: do while(istack > 0)
-          call pop_off_stack(stack(istack),istack,nnode,mymum,level,npnode,xmini,xmaxi,istate)
-          if (istate == 1) then
-             call scan_internal_fast(node,nnode,mymum,level,xmini,xmaxi,.false.)
+          call pop_off_stack(stack(istack), istack, nnode, mymum, level, npnode, xmini, xmaxi)
+          call try_split_fast(node,nnode,level,xmini,xmaxi, &
+                              il,ir,nl,nr,xminl,xmaxl,xminr,xmaxr,ncells,leaf_is_active, &
+                              wassplit,dofallback)
+          if (dofallback) then
+             call build_old_subtree(node,nnode,mymum,level,npnode,xmini,xmaxi,ncells, &
+                                    leaf_is_active,minlevel,maxlevel,.false.)
+          elseif (wassplit) then
+             if (istack+2 > istacksize) call fatal('maketree_fast',&
+                 'stack size exceeded in tree build, increase istacksize and recompile')
+             maxlevel = max(level+1,maxlevel)
+             istack = istack + 1
+             call push_onto_stack(stack(istack),il,nnode,level+1,nl,xminl,xmaxl)
+             istack = istack + 1
+             call push_onto_stack(stack(istack),ir,nnode,level+1,nr,xminr,xmaxr)
           else
-             call try_split_fast(node,nnode,level,xmini,xmaxi, &
-                                 il,ir,nl,nr,xminl,xmaxl,xminr,xmaxr,ncells,leaf_is_active, &
-                                 wassplit,dofallback)
-             if (dofallback) then
-                call build_old_subtree(node,nnode,mymum,level,npnode,xmini,xmaxi,ncells, &
-                                       leaf_is_active,minlevel,maxlevel,.false.)
-             elseif (wassplit) then
-                if (istack+3 > istacksize) call fatal('maketree_fast',&
-                    'stack size exceeded in tree build, increase istacksize and recompile')
-                istack = istack + 1
-                call push_onto_stack(stack(istack),nnode,mymum,level,npnode,xmini,xmaxi,state=1)
-                istack = istack + 1
-                call push_onto_stack(stack(istack),ir,nnode,level+1,nr,xminr,xmaxr,state=0)
-                istack = istack + 1
-                call push_onto_stack(stack(istack),il,nnode,level+1,nl,xminl,xmaxl,state=0)
-             else
-                call scan_leaf_fast(node(nnode),nnode,mymum,level,xmini,xmaxi,.false., &
-                                    leaf_is_active,minlevel,maxlevel)
-             endif
+             maxlevel = max(level,maxlevel)
+             minlevel = min(level,minlevel)
           endif
        enddo over_stack
     enddo
@@ -534,16 +543,61 @@ subroutine maketree_fast(node,np,nproot,xminroot,xmaxroot,leaf_is_active,ncells,
     !$omp end parallel
  endif done
 
- ! finalize bootstrap ancestors in reverse (children-first) order:
- ! all descendants are complete, so this is one O(1) combine + one scan each
- do i = nanc,1,-1
-    nnode = ancestors(i)%node
-    mymum = ancestors(i)%parent
-    level = ancestors(i)%level
-    xmini = ancestors(i)%xmin
-    xmaxi = ancestors(i)%xmax
-    call scan_internal_fast(node,nnode,mymum,level,xmini,xmaxi,.true.)
- enddo
+ ! bucket nodes by level for the bottom-up property pass
+ call bucket_nodes_by_level(node,int(ncells))
+
+ ! Phase B: properties bottom-up, one level at a time (deepest first).
+ ! Nodes on the same level are independent. Levels with fewer nodes
+ ! than threads hold the biggest nodes: run those serially so each
+ ! scan gets a full thread team (as in the old queue build).
+ over_levels: do nlvl = maxlevel,0,-1
+    i0 = kdbkt_start(nlvl+1)
+    i1 = kdbkt_start(nlvl+2)-1
+    if (i1 < i0) cycle
+    dobig = (i1-i0+1 < numthreads)
+    ! leaf test by range size (exact restatement of the split rule);
+    ! child/parent pointers of unscanned nodes are not valid yet
+    if (dobig) then
+       ! few (big) nodes: serial loop, each scan gets a full thread team
+       do i = i0,i1
+          nnode = kdbkt_list(i)
+          if (kddone(nnode) == 1) cycle
+          mymum = node(nnode)%parent
+          level = node(nnode)%level
+          npnode = inoderange(2,nnode)-inoderange(1,nnode)+1
+          if (npnode <= minpart) then
+             call scan_leaf_fast(node(nnode),nnode,mymum,level,dumbox,dumbox2,.true., &
+                                 leaf_is_active,minlevel,maxlevel)
+          else
+             call scan_internal_fast(node,nnode,mymum,level,dumbox,dumbox2,.true.)
+          endif
+       enddo
+    else
+       !$omp parallel do default(none) schedule(guided) &
+       !$omp shared(kdbkt_list,node,inoderange,kddone,leaf_is_active,i0,i1,dumbox,dumbox2) &
+       !$omp private(i,nnode,mymum,level,npnode) &
+       !$omp reduction(min:minlevel) &
+       !$omp reduction(max:maxlevel)
+       do i = i0,i1
+          nnode = kdbkt_list(i)
+          if (kddone(nnode) == 1) cycle
+          mymum = node(nnode)%parent
+          level = node(nnode)%level
+          npnode = inoderange(2,nnode)-inoderange(1,nnode)+1
+          if (npnode <= minpart) then
+             call scan_leaf_fast(node(nnode),nnode,mymum,level,dumbox,dumbox2,.false., &
+                                 leaf_is_active,minlevel,maxlevel)
+          else
+             call scan_internal_fast(node,nnode,mymum,level,dumbox,dumbox2,.false.)
+          endif
+       enddo
+       !$omp end parallel do
+    endif
+ enddo over_levels
+
+ ! deterministic DFS-preorder numbering (serial builds only: the MPI
+ ! global-tree refinement indexes the local tree by level ranges)
+ if (use_tree_renumber .and. nprocs == 1) call renumber_tree_dfs(node,ncells,leaf_is_active)
 
  if (maxlevel > maxlevel_indexed .and. .not.already_warned) then
     write(string,"(i10)") 2**(maxlevel-maxlevel_indexed)
@@ -738,6 +792,9 @@ subroutine try_split_fast(node,nnode,level,xmini,xmaxi, &
  dofallback = .false.
  wassplit = .false.
 
+ ! stamp the level now: Phase B buckets nodes before any scan
+ node(nnode)%level = level
+
  if (inoderange(1,nnode) > 0) then
     npnode = inoderange(2,nnode) - inoderange(1,nnode) + 1
  else
@@ -770,6 +827,11 @@ subroutine try_split_fast(node,nnode,level,xmini,xmaxi, &
     'number of nodes exceeds array dimensions, increase ncellsmax and recompile',ival=int(ncellsmax))
  node(nnode)%leftchild  = il
  node(nnode)%rightchild = ir
+ ! stamp linkage now: Phase B reads parent/level straight from the nodes
+ node(il)%parent = nnode
+ node(ir)%parent = nnode
+ node(il)%level = level+1
+ node(ir)%level = level+1
 
  leaf_is_active(nnode) = 0
 
@@ -900,6 +962,7 @@ subroutine build_old_subtree(node,nnode,mymum,level,npnode,xmini,xmaxi,ncells, &
  logical :: owas
 
  call push_onto_stack(ostack(1),nnode,mymum,level,npnode,xmini,xmaxi)
+ kddone(nnode) = 1
  iold = 1
  over_old: do while (iold > 0)
     call pop_off_stack(ostack(iold),iold,onode,omum,olev,onp,oxmini,oxmaxi)
@@ -909,6 +972,8 @@ subroutine build_old_subtree(node,nnode,mymum,level,npnode,xmini,xmaxi,ncells, &
     if (owas) then
        if (iold+2 > istacksize) call fatal('maketree_fast',&
            'stack size exceeded in fallback tree build, increase istacksize and recompile')
+       kddone(oil) = 1
+       kddone(oir) = 1
        iold = iold + 1
        call push_onto_stack(ostack(iold),oil,onode,olev+1,onl,oxminl,oxmaxl)
        iold = iold + 1
@@ -917,6 +982,128 @@ subroutine build_old_subtree(node,nnode,mymum,level,npnode,xmini,xmaxi,ncells, &
  enddo over_old
 
 end subroutine build_old_subtree
+
+!--------------------------------------------------------------------
+!+
+!  Bucket node ids 1..ncells by tree level (serial counting sort,
+!  trivial cost next to particle scans) for the bottom-up Phase B.
+!  Slots of level L run from kdbkt_start(L+1) to kdbkt_start(L+2)-1.
+!+
+!--------------------------------------------------------------------
+subroutine bucket_nodes_by_level(node,ncells)
+ type(kdnode), intent(in) :: node(:)
+ integer,      intent(in) :: ncells
+ integer :: id,lev,pos,tmp
+
+ kdbkt_start = 0
+ do id = 1,ncells
+    lev = node(id)%level
+    if (lev < 0) lev = 0
+    if (lev > maxdepth) lev = maxdepth
+    kdbkt_start(lev+1) = kdbkt_start(lev+1) + 1
+ enddo
+ pos = 1
+ do lev = 0,maxdepth
+    tmp = kdbkt_start(lev+1)
+    kdbkt_start(lev+1) = pos
+    pos = pos + tmp
+ enddo
+ kdbkt_start(maxdepth+2) = pos
+ do id = 1,ncells
+    lev = node(id)%level
+    if (lev < 0) lev = 0
+    if (lev > maxdepth) lev = maxdepth
+    kdbkt_list(kdbkt_start(lev+1)) = id
+    kdbkt_start(lev+1) = kdbkt_start(lev+1) + 1
+ enddo
+ do lev = maxdepth,0,-1
+    kdbkt_start(lev+2) = kdbkt_start(lev+1)
+ enddo
+ kdbkt_start(1) = 1
+
+end subroutine bucket_nodes_by_level
+
+!--------------------------------------------------------------------
+!+
+!  Deterministic DFS-preorder renumbering of the tree (serial builds
+!  only): each subtree becomes contiguous in memory, which matches
+!  the top-down DFS order of the tree walks. Root keeps id 1.
+!  Permutes node/inoderange/leaf_is_active consistently and rewrites
+!  all child/parent pointers. O(ncells), no extra memory beyond kdmap
+!  (kdbkt_list is reused as the inverse map scratch).
+!+
+!--------------------------------------------------------------------
+subroutine renumber_tree_dfs(node,ncells,leaf_is_active)
+ use io, only:fatal
+ type(kdnode), intent(inout) :: node(:)
+ integer(kind=8), intent(in) :: ncells
+ integer,         intent(inout) :: leaf_is_active(:)
+ integer :: n,newid,sp,top,old,new,k,j
+ integer :: st(1024)
+ type(kdnode) :: ntmp
+ integer :: rtmp(2),itmp
+
+ ! 1. left-first traversal from the root: kdmap(old) = new
+ newid = 0
+ sp = 1
+ st(1) = irootnode
+ do while (sp > 0)
+    n = st(sp)
+    sp = sp - 1
+    if (n <= 0 .or. n > ncells) call fatal('renumber_tree_dfs','invalid node id in traversal')
+    newid = newid + 1
+    kdmap(n) = newid
+    if (node(n)%rightchild /= 0) then
+       sp = sp + 1
+       if (sp > 1024) call fatal('renumber_tree_dfs','traversal stack exceeded')
+       st(sp) = node(n)%rightchild
+    endif
+    if (node(n)%leftchild /= 0) then
+       sp = sp + 1
+       if (sp > 1024) call fatal('renumber_tree_dfs','traversal stack exceeded')
+       st(sp) = node(n)%leftchild
+    endif
+ enddo
+ if (newid /= ncells) call fatal('renumber_tree_dfs','unreachable nodes: cannot renumber')
+
+ ! 2. rewrite pointers to new ids (in place, map is complete)
+ do old = 1,int(ncells)
+    if (node(old)%leftchild /= 0) node(old)%leftchild = kdmap(node(old)%leftchild)
+    if (node(old)%rightchild /= 0) node(old)%rightchild = kdmap(node(old)%rightchild)
+    if (node(old)%parent /= 0) node(old)%parent = kdmap(node(old)%parent)
+ enddo
+
+ ! 3. inverse map into bucket scratch: result(new) = arrays(old=inv(new))
+ do old = 1,int(ncells)
+    kdbkt_list(kdmap(old)) = old
+ enddo
+
+ ! 4. in-place cycle permutation of node/inoderange/leaf_is_active
+ !    (result(new) = arrays(invmap(new)); rotate each cycle)
+ top = int(ncells)
+ do new = 1,top
+    if (kdbkt_list(new) <= 0) cycle
+    j = new
+    ntmp = node(j)
+    rtmp = inoderange(:,j)
+    itmp = leaf_is_active(j)
+    do
+       k = kdbkt_list(j)
+       if (k == new) exit
+       node(j) = node(k)
+       inoderange(:,j) = inoderange(:,k)
+       leaf_is_active(j) = leaf_is_active(k)
+       kdbkt_list(j) = -k
+       j = k
+    enddo
+    node(j) = ntmp
+    inoderange(:,j) = rtmp
+    leaf_is_active(j) = itmp
+    kdbkt_list(j) = -abs(kdbkt_list(j))
+    kdbkt_list(new) = -abs(kdbkt_list(new))
+ enddo
+
+end subroutine renumber_tree_dfs
 
 !----------------------------
 !+
@@ -1096,12 +1283,11 @@ subroutine construct_root_node(np,nproot,irootnode,xmini,xmaxi,leaf_is_active,xy
 end subroutine construct_root_node
 
 ! also used for queue push
-pure subroutine push_onto_stack(stackentry,node,parent,level,npnode,xmin,xmax,state)
+pure subroutine push_onto_stack(stackentry,node,parent,level,npnode,xmin,xmax)
  type(kdbuildstack), intent(out) :: stackentry
  integer,            intent(in)  :: node,parent,level
  integer,            intent(in)  :: npnode
  real,               intent(in)  :: xmin(3),xmax(3)
- integer,            intent(in), optional :: state
 
  stackentry%node   = node
  stackentry%parent = parent
@@ -1109,21 +1295,15 @@ pure subroutine push_onto_stack(stackentry,node,parent,level,npnode,xmin,xmax,st
  stackentry%npnode = npnode
  stackentry%xmin   = xmin
  stackentry%xmax   = xmax
- if (present(state)) then
-    stackentry%state = state
- else
-    stackentry%state = 0
- endif
 
 end subroutine push_onto_stack
 
 ! also used for queue pop
-pure subroutine pop_off_stack(stackentry, istack, nnode, mymum, level, npnode, xmini, xmaxi, state)
+pure subroutine pop_off_stack(stackentry, istack, nnode, mymum, level, npnode, xmini, xmaxi)
  type(kdbuildstack), intent(in)    :: stackentry
  integer,            intent(inout) :: istack
  integer,            intent(out)   :: nnode, mymum, level, npnode
  real,               intent(out)   :: xmini(3), xmaxi(3)
- integer,            intent(out), optional :: state
 
  nnode  = stackentry%node
  mymum  = stackentry%parent
@@ -1131,7 +1311,6 @@ pure subroutine pop_off_stack(stackentry, istack, nnode, mymum, level, npnode, x
  npnode = stackentry%npnode
  xmini  = stackentry%xmin
  xmaxi  = stackentry%xmax
- if (present(state)) state = stackentry%state
  istack = istack - 1
 
 end subroutine pop_off_stack
