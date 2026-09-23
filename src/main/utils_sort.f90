@@ -19,6 +19,7 @@ module sortutils
  implicit none
  public :: indexx,indexxfunc,Knnfunc,parqsort,find_rank
  public :: sort_by_radius
+ public :: radixsort_i8
  public :: r2func,r2func_origin,set_r2func_origin
  interface indexx
   module procedure indexx_r4, indexx_i8
@@ -612,7 +613,120 @@ subroutine parqsort(n, arr,func, indx)
     enddo
  enddo
 
-end subroutine parqsort
+ end subroutine parqsort
+
+!----------------------------------------------------------------
+!+
+!  Parallel LSD radix sort of 64-bit integer keys, carrying an
+!  integer payload array (e.g. a permutation index).
+!
+!  Sorts key(1:n) in ascending order; indx(1:n) is permuted
+!  identically. keybuf/indxbuf are caller-provided scratch arrays
+!  of size >= n. The sort is stable and deterministic. npass 8-bit
+!  digits are sorted (up to 8, covering keys < 2**64).
+!+
+!----------------------------------------------------------------
+subroutine radixsort_i8(n,key,indx,keybuf,indxbuf,npass)
+!$ use omp_lib, only: omp_get_num_threads
+ integer,         intent(in)    :: n,npass
+ integer(kind=8), intent(inout) :: key(n),keybuf(n)
+ integer,         intent(inout) :: indx(n),indxbuf(n)
+ integer, allocatable :: cnt(:,:),off(:,:)
+ integer :: nthreads,ipass,i,np
+ integer, parameter :: nradix = 256
+
+ if (n <= 1) return
+ np = min(max(npass,1),8)
+
+ nthreads = 1
+ !$omp parallel default(none) shared(nthreads)
+ !$ nthreads = omp_get_num_threads()
+ !$omp end parallel
+ allocate(cnt(0:nradix-1,nthreads),off(0:nradix-1,nthreads))
+
+ do ipass = 0,np-1
+    if (mod(ipass,2) == 0) then
+       call radix_pass_i8(n,key,indx,keybuf,indxbuf,ipass,nthreads,cnt,off)
+    else
+       call radix_pass_i8(n,keybuf,indxbuf,key,indx,ipass,nthreads,cnt,off)
+    endif
+ enddo
+
+ ! odd number of passes: sorted data is in the scratch buffers
+ if (mod(np,2) == 1) then
+    !$omp parallel do default(none) shared(n,key,indx,keybuf,indxbuf) private(i)
+    do i = 1,n
+       key(i)  = keybuf(i)
+       indx(i) = indxbuf(i)
+    enddo
+ endif
+ deallocate(cnt,off)
+
+end subroutine radixsort_i8
+
+!----------------------------------------------------------------
+!+
+!  One digit pass of radixsort_i8: stable count-and-scatter of the
+!  8-bit digit ipass of ksrc into kdst, carrying isrc into idst.
+!+
+!----------------------------------------------------------------
+subroutine radix_pass_i8(n,ksrc,isrc,kdst,idst,ipass,nthreads,cnt,off)
+!$ use omp_lib, only: omp_get_thread_num
+ integer,         intent(in)    :: n,ipass,nthreads
+ integer(kind=8), intent(in)    :: ksrc(n)
+ integer,         intent(in)    :: isrc(n)
+ integer(kind=8), intent(out)   :: kdst(n)
+ integer,         intent(out)   :: idst(n)
+ integer,         intent(inout) :: cnt(0:255,nthreads),off(0:255,nthreads)
+ integer :: myoff(0:255)
+ integer :: tid,t,istart,iend,pos,dg,i
+ integer(kind=8) :: kval
+ integer :: ival
+ integer, parameter :: nradix = 256, nbits = 8
+
+ !$omp parallel default(none) &
+ !$omp shared(n,nthreads,ksrc,isrc,kdst,idst,ipass,cnt,off) &
+ !$omp private(tid,t,istart,iend,dg,pos,i,kval,ival,myoff)
+ tid = 1
+ !$ tid = omp_get_thread_num() + 1
+ istart = (tid-1)*n/nthreads + 1
+ iend   = tid*n/nthreads
+
+ ! count digit occurrences in this thread's chunk
+ cnt(:,tid) = 0
+ if (iend >= istart) then
+    do i = istart,iend
+       dg = int(ibits(ksrc(i),nbits*ipass,nbits))
+       cnt(dg,tid) = cnt(dg,tid) + 1
+    enddo
+ endif
+ !$omp barrier
+ ! prefix sums over digits and threads -> global write offsets
+ !$omp single
+ pos = 1
+ do dg = 0,nradix-1
+    do t = 1,nthreads
+       off(dg,t) = pos
+       pos = pos + cnt(dg,t)
+    enddo
+ enddo
+ !$omp end single
+ ! stable scatter of this thread's chunk
+ myoff(:) = off(:,tid)
+ if (iend >= istart) then
+    do i = istart,iend
+       kval = ksrc(i)
+       ival = isrc(i)
+       dg = int(ibits(kval,nbits*ipass,nbits))
+       pos = myoff(dg)
+       kdst(pos) = kval
+       idst(pos) = ival
+       myoff(dg) = pos + 1
+    enddo
+ endif
+ !$omp end parallel
+
+end subroutine radix_pass_i8
 
 !----------------------------------------------------------------
 !+

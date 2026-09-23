@@ -20,7 +20,7 @@ module kdtree
 ! :Runtime parameters: None
 !
 ! :Dependencies: allocutils, boundary, dim, dtypekdtree, io, kernel,
-!   mpibalance, mpidomain, mpitree, mpiutils, part, timing
+!   mpibalance, mpidomain, mpitree, mpiutils, part, sortutils, timing
 !
  use dim,         only:maxp,ncellsmax,minpart,use_apr,use_sinktree,maxptmass,maxpsph
  use io,          only:nprocs
@@ -49,12 +49,21 @@ module kdtree
  integer,          parameter         :: maxdepth     = 64
  integer,          parameter         :: maxnodecache_local = 512
  integer,          parameter         :: maxneigh_per_node  = 16
+ integer,          parameter         :: keydepth_max = 52
 !
 !--runtime options for this module
 !
  real,    public  :: tree_accuracy    = 0.5
  logical, public  :: use_geosplit     = .true.
+ logical, public  :: use_geosplit_fast = .true. ! key-sorted fast build for geosplit trees
  logical, public  :: use_cache        = .true.
+ integer, private :: kdpat(0:keydepth_max-1) ! split axis (0,1,2) per dyadic level
+ integer(kind=8), private, allocatable :: kdkey(:)     ! dyadic sort key per particle slot
+ integer(kind=8), private, allocatable :: kdkey_buf(:) ! radix sort scratch
+ integer,         private, allocatable :: kdord(:)     ! permutation carried through the key sort
+ integer,         private, allocatable :: kdord_buf(:) ! radix sort scratch
+ real,            private, allocatable :: kdtmp(:,:)   ! scratch for parallel key-order permute
+ integer(kind=8), private :: kdkeymax = 0              ! max key value (sets radix passes)
  logical, private :: done_init_kdtree = .false.
  logical, private :: already_warned   = .false.
  integer, private :: numthreads
@@ -79,6 +88,7 @@ module kdtree
     integer :: parent
     integer :: level
     integer :: npnode
+    integer :: state ! build state flag (fast build only: 0 = unexpanded, 1 = children done)
     real    :: xmin(3)
     real    :: xmax(3)
  end type kdbuildstack
@@ -88,11 +98,16 @@ module kdtree
 contains
 
 subroutine allocate_kdtree
- use dim, only:mpi
+ use dim, only:mpi,maxp
  use allocutils, only:allocate_array
 
  call allocate_array('inoderange', inoderange, 2, ncellsmax+1)
  call allocate_array('inodeparts', inodeparts, maxp)
+ call allocate_array('kdkey', kdkey, maxp)
+ call allocate_array('kdkey_buf', kdkey_buf, maxp)
+ call allocate_array('kdord', kdord, maxp)
+ call allocate_array('kdord_buf', kdord_buf, maxp)
+ call allocate_array('kdtmp', kdtmp, 5, maxp)
  if (mpi) call allocate_array('refinementnode', refinementnode, ncellsmax+1)
  call allocate_array('fnodecache', fnodecache, lenfgrav, ncellsmax+1)
  call allocate_array('neighnodecache',neighnodecache,ncellsmax*maxneigh_per_node)
@@ -111,6 +126,11 @@ subroutine deallocate_kdtree
  use dim, only:mpi
  if (allocated(inoderange)) deallocate(inoderange)
  if (allocated(inodeparts)) deallocate(inodeparts)
+ if (allocated(kdkey)) deallocate(kdkey)
+ if (allocated(kdkey_buf)) deallocate(kdkey_buf)
+ if (allocated(kdord)) deallocate(kdord)
+ if (allocated(kdord_buf)) deallocate(kdord_buf)
+ if (allocated(kdtmp)) deallocate(kdtmp)
  if (mpi .and. allocated(refinementnode)) deallocate(refinementnode)
  if (allocated(fnodecache)) deallocate(fnodecache)
  if (allocated(neighnodecache)) deallocate(neighnodecache)
@@ -188,6 +208,16 @@ subroutine maketree(node, xyzh, np, leaf_is_active, ncells, apr_tree, refineleve
 
  if (inoderange(1,irootnode)==0 .or. inoderange(2,irootnode)==0 ) then
     call fatal('maketree','no particles or all particles dead/accreted')
+ endif
+
+! Fast key-sorted build for geosplit trees: dyadic cells, single
+! property scan per node, no per-level partitioning. Properties are
+! computed with the same routines as the standard build, so every
+! stored node quantity is identical for a given particle set; only
+! the split planes (topology) differ.
+ if (use_geosplit .and. use_geosplit_fast .and. .not.apr_tree) then
+    call maketree_fast(node,np,npcounter,xmini,xmaxi,leaf_is_active,ncells,refinelevels)
+    return
  endif
 
 ! Put root node on top of stack
@@ -342,6 +372,551 @@ subroutine maketree(node, xyzh, np, leaf_is_active, ncells, apr_tree, refineleve
  endif
 
 end subroutine maketree
+
+!--------------------------------------------------------------------------------
+!+
+!  Fast build for geosplit trees using a precomputed dyadic sort key.
+!
+!  The split cells are strictly dyadic (each child box is the geometric
+!  half of its parent, no re-fitting to particle extents), so every
+!  node's particles form a contiguous range in key order. The tree is
+!  therefore assembled from key-range cuts with a single property scan
+!  per node and no per-level partitioning. Node properties are computed
+!  with compute_nodes_cofm/set_nodes_properties, i.e. identical values
+!  to the standard build for a given particle set; only the split
+!  planes (topology) differ.
+!+
+!-------------------------------------------------------------------------------
+subroutine maketree_fast(node,np,nproot,xminroot,xmaxroot,leaf_is_active,ncells,refinelevels)
+ use io,   only:fatal,warning,iprint,iverbose
+!$ use omp_lib
+ use sortutils, only:radixsort_i8
+ type(kdnode),    intent(out)   :: node(:)
+ integer,         intent(in)    :: np,nproot
+ real,            intent(in)    :: xminroot(3),xmaxroot(3)
+ integer,         intent(out)   :: leaf_is_active(:)
+ integer(kind=8), intent(out)   :: ncells
+ integer,         intent(out),   optional :: refinelevels
+ integer :: i,npnode,il,ir,istack,nl,nr,mymum
+ integer :: nnode,minlevel,level,nqueue,npass,nanc,istate
+ real :: xmini(3),xmaxi(3),xminl(3),xmaxl(3),xminr(3),xmaxr(3)
+ integer, parameter :: istacksize = 512
+ integer, parameter :: nancmax = 2*istacksize
+ type(kdbuildstack), save :: stack(istacksize)
+ !$omp threadprivate(stack)
+ type(kdbuildstack) :: queue(istacksize)
+ type(kdbuildstack) :: ancestors(nancmax)
+!$ integer :: threadid
+ logical :: wassplit,dofallback,finished
+ character(len=10) :: string
+
+ itail_neigh = 0
+ leaf_is_active = 0
+
+ ncells = 1
+ maxlevel = 0
+ minlevel = maxdepth - 1
+ finished = .false.
+ maxlevel_indexed = int(log(real(ncellsmax+1))/log(2.)) - 1
+
+ if (.not.done_init_kdtree) then
+    numthreads = 1
+    !$omp parallel default(none) shared(numthreads)
+!$  numthreads = omp_get_num_threads()
+    !$omp end parallel
+    done_init_kdtree = .true.
+ endif
+
+ ! dyadic split-axis pattern from the root box (data independent)
+ call get_dyadic_axis_pattern(xminroot,xmaxroot)
+
+ ! one sort replaces all per-level partitioning
+ call compute_dyadic_keys(nproot,xminroot,xmaxroot)
+ ! number of radix digits from the largest key actually present
+ npass = 1
+ do while (ishft(kdkeymax,-8*npass) > 0_8 .and. npass < 8)
+    npass = npass + 1
+ enddo
+ call radixsort_i8(nproot,kdkey,kdord,kdkey_buf,kdord_buf,npass)
+ call permute_to_key_order(nproot)
+
+ ! root range (already set by construct_root_node, ensured here)
+ inoderange(1,irootnode) = 1
+ inoderange(2,irootnode) = nproot
+ istack = 1
+ call push_onto_stack(queue(istack),irootnode,0,0,nproot,xminroot,xmaxroot)
+
+ nqueue = numthreads
+ nanc = 0
+ ! build level by level until number of nodes = number of threads;
+ ! splits only (no property scans yet), leaves are scanned immediately
+ over_queue: do while (istack < nqueue)
+    if (istack <= 0) then
+       finished = .true.
+       exit over_queue
+    endif
+    call pop_off_stack(queue(1), istack, nnode, mymum, level, npnode, xmini, xmaxi)
+    do i=1,istack
+       queue(i) = queue(i+1)
+    enddo
+    call try_split_fast(node,nnode,level,xmini,xmaxi, &
+                        il,ir,nl,nr,xminl,xmaxl,xminr,xmaxr,ncells,leaf_is_active, &
+                        wassplit,dofallback)
+    if (dofallback) then
+       call build_old_subtree(node,nnode,mymum,level,npnode,xmini,xmaxi,ncells, &
+                              leaf_is_active,minlevel,maxlevel,.true.)
+    elseif (wassplit) then
+       if (istack+2 > istacksize) call fatal('maketree_fast',&
+           'queue size exceeded in tree build, increase istacksize and recompile')
+       if (nanc+1 > nancmax) call fatal('maketree_fast',&
+           'ancestor list exceeded in tree build, increase nancmax and recompile')
+       nanc = nanc + 1
+       call push_onto_stack(ancestors(nanc),nnode,mymum,level,npnode,xmini,xmaxi)
+       istack = istack + 1
+       call push_onto_stack(queue(istack),il,nnode,level+1,nl,xminl,xmaxl)
+       istack = istack + 1
+       call push_onto_stack(queue(istack),ir,nnode,level+1,nr,xminr,xmaxr)
+    else
+       call scan_leaf_fast(node(nnode),nnode,mymum,level,xmini,xmaxi,.true., &
+                           leaf_is_active,minlevel,maxlevel)
+    endif
+ enddo over_queue
+
+ done: if (.not.finished) then
+    ! each thread builds its subtree post-order: split on first visit,
+    ! single property scan once children are complete
+    !$omp parallel default(none) &
+    !$omp shared(queue) &
+    !$omp shared(ll, leaf_is_active) &
+    !$omp shared(node, ncells) &
+    !$omp shared(nqueue) &
+    !$omp private(istack) &
+    !$omp private(nnode, mymum, level, npnode, xmini, xmaxi, istate) &
+    !$omp private(ir, il, nl, nr) &
+    !$omp private(xminr, xmaxr, xminl, xmaxl) &
+    !$omp private(threadid) &
+    !$omp private(wassplit,dofallback) &
+    !$omp reduction(min:minlevel) &
+    !$omp reduction(max:maxlevel)
+    !$omp do schedule(static)
+    do i = 1, nqueue
+       stack(1) = queue(i)
+       stack(1)%state = 0
+       istack = 1
+       over_stack: do while(istack > 0)
+          call pop_off_stack(stack(istack),istack,nnode,mymum,level,npnode,xmini,xmaxi,istate)
+          if (istate == 1) then
+             call scan_internal_fast(node,nnode,mymum,level,xmini,xmaxi,.false.)
+          else
+             call try_split_fast(node,nnode,level,xmini,xmaxi, &
+                                 il,ir,nl,nr,xminl,xmaxl,xminr,xmaxr,ncells,leaf_is_active, &
+                                 wassplit,dofallback)
+             if (dofallback) then
+                call build_old_subtree(node,nnode,mymum,level,npnode,xmini,xmaxi,ncells, &
+                                       leaf_is_active,minlevel,maxlevel,.false.)
+             elseif (wassplit) then
+                if (istack+3 > istacksize) call fatal('maketree_fast',&
+                    'stack size exceeded in tree build, increase istacksize and recompile')
+                istack = istack + 1
+                call push_onto_stack(stack(istack),nnode,mymum,level,npnode,xmini,xmaxi,state=1)
+                istack = istack + 1
+                call push_onto_stack(stack(istack),ir,nnode,level+1,nr,xminr,xmaxr,state=0)
+                istack = istack + 1
+                call push_onto_stack(stack(istack),il,nnode,level+1,nl,xminl,xmaxl,state=0)
+             else
+                call scan_leaf_fast(node(nnode),nnode,mymum,level,xmini,xmaxi,.false., &
+                                    leaf_is_active,minlevel,maxlevel)
+             endif
+          endif
+       enddo over_stack
+    enddo
+    !$omp enddo
+    !$omp end parallel
+ endif done
+
+ ! finalize bootstrap ancestors in reverse (children-first) order:
+ ! all descendants are complete, so this is one O(1) combine + one scan each
+ do i = nanc,1,-1
+    nnode = ancestors(i)%node
+    mymum = ancestors(i)%parent
+    level = ancestors(i)%level
+    xmini = ancestors(i)%xmin
+    xmaxi = ancestors(i)%xmax
+    call scan_internal_fast(node,nnode,mymum,level,xmini,xmaxi,.true.)
+ enddo
+
+ if (maxlevel > maxlevel_indexed .and. .not.already_warned) then
+    write(string,"(i10)") 2**(maxlevel-maxlevel_indexed)
+    if (iverbose > 0) call warning('maketree_fast','maxlevel > max_indexed: will run faster if recompiled with '// &
+               'NCELLSMAX='//trim(adjustl(string))//'*maxp,')
+ endif
+
+ if (present(refinelevels)) refinelevels = minlevel
+
+ if (iverbose >= 3) then
+    write(iprint,"(a,i10,3(a,i2))") ' maketree_fast: nodes = ',ncells,', max level = ',maxlevel,&
+       ', min leaf level = ',minlevel,' max level indexed = ',maxlevel_indexed
+ endif
+
+end subroutine maketree_fast
+
+!--------------------------------------------------------------------
+!+
+!  Axis pattern for the dyadic subdivision: at each level split the
+!  longest axis of the current (geometric) box in half, exactly as
+!  maxloc(xmax-xmin) would select it during the build. Pure geometry,
+!  hence data independent and precomputable from the root box.
+!+
+!--------------------------------------------------------------------
+subroutine get_dyadic_axis_pattern(xminroot,xmaxroot)
+ real, intent(in) :: xminroot(3),xmaxroot(3)
+ real :: blen(3)
+ integer :: l
+
+ blen(:) = xmaxroot(:) - xminroot(:)
+ do l = 0,keydepth_max-1
+    kdpat(l) = maxloc(blen,1) - 1
+    blen(kdpat(l)+1) = 0.5*blen(kdpat(l)+1)
+ enddo
+
+end subroutine get_dyadic_axis_pattern
+
+!--------------------------------------------------------------------
+!+
+!  Compute the dyadic (morton-like) sort key of each particle: bit
+!  (keydepth_max-1-l) is 0/1 depending on which half of the level-l
+!  dyadic cell the particle falls in along the pattern axis. The
+!  sorted key order therefore groups every dyadic cell contiguously.
+!+
+!--------------------------------------------------------------------
+subroutine compute_dyadic_keys(nproot,xminroot,xmaxroot)
+ integer, intent(in) :: nproot
+ real,    intent(in) :: xminroot(3),xmaxroot(3)
+ integer :: i,a,l,nbits(0:2),cursor(0:2)
+ integer(kind=8) :: ix(0:2),k,imax
+ real :: sca(0:2),ext
+ real :: x0(3)
+
+ nbits(:) = 0
+ do l = 0,keydepth_max-1
+    nbits(kdpat(l)) = nbits(kdpat(l)) + 1
+ enddo
+ do a = 0,2
+    ext = xmaxroot(a+1) - xminroot(a+1)
+    if (ext > 0. .and. nbits(a) > 0) then
+       sca(a) = (2.0**nbits(a))/ext
+    else
+       sca(a) = 0.
+    endif
+ enddo
+
+ kdkeymax = 0_8
+ !$omp parallel do default(none) schedule(static) &
+ !$omp shared(nproot,xminroot,sca,nbits,treecache,kdkey,kdord,kdpat) &
+ !$omp private(i,a,l,ix,cursor,k,imax,x0) &
+ !$omp reduction(max:kdkeymax)
+ do i = 1,nproot
+    x0(1) = treecache(1,i)
+    x0(2) = treecache(2,i)
+    x0(3) = treecache(3,i)
+    do a = 0,2
+       if (sca(a) > 0.) then
+          ix(a) = int((x0(a+1)-xminroot(a+1))*sca(a),kind=8)
+          imax = ishft(1_8,nbits(a)) - 1_8
+          if (ix(a) < 0_8) ix(a) = 0_8
+          if (ix(a) > imax) ix(a) = imax
+       else
+          ix(a) = 0_8
+       endif
+       cursor(a) = nbits(a)
+    enddo
+    k = 0_8
+    do l = 0,keydepth_max-1
+       a = kdpat(l)
+       cursor(a) = cursor(a) - 1
+       if (btest(ix(a),cursor(a))) k = ibset(k,keydepth_max-1-l)
+    enddo
+    kdkey(i) = k
+    if (k > kdkeymax) kdkeymax = k
+    kdord(i) = i
+ enddo
+ !$omp end parallel do
+
+end subroutine compute_dyadic_keys
+
+!--------------------------------------------------------------------
+!+
+!  Permute inodeparts/treecache into key order. treecache rows go
+!  through the kdtmp scratch buffer (parallel streaming copy, then
+!  parallel gather); inodeparts follows by serial cycles (cheap).
+!+
+!--------------------------------------------------------------------
+subroutine permute_to_key_order(nproot)
+ integer, intent(in) :: nproot
+ integer :: i,k
+
+ ! kdord_buf is free (radix scratch): save inodeparts through it
+ !$omp parallel do default(none) schedule(static) shared(nproot,treecache,kdtmp,inodeparts,kdord_buf) private(i)
+ do i = 1,nproot
+    kdtmp(:,i) = treecache(:,i)
+    kdord_buf(i) = inodeparts(i)
+ enddo
+ !$omp parallel do default(none) schedule(static) &
+ !$omp shared(nproot,treecache,kdtmp,inodeparts,kdord,kdord_buf) private(i,k)
+ do i = 1,nproot
+    k = kdord(i)
+    treecache(:,i) = kdtmp(:,k)
+    inodeparts(i) = kdord_buf(k)
+ enddo
+
+end subroutine permute_to_key_order
+
+!--------------------------------------------------------------------
+!+
+!  First index in kdkey(lo:hi) with bitpos set (keys are sorted, so
+!  the bit is monotone 0..1 within any dyadic cell range). Returns
+!  hi+1 if no key in the range has the bit set.
+!+
+!--------------------------------------------------------------------
+pure integer function key_lower_bound(lo,hi,bitpos)
+ integer, intent(in) :: lo,hi,bitpos
+ integer :: a,b,mid
+
+ a = lo
+ b = hi + 1
+ do while (a < b)
+    mid = (a + b)/2
+    if (btest(kdkey(mid),bitpos)) then
+       b = mid
+    else
+       a = mid + 1
+    endif
+ enddo
+ key_lower_bound = a
+
+end function key_lower_bound
+
+!--------------------------------------------------------------------
+!+
+!  Fast version of construct_node for dyadic cells: identical node
+!  properties (same routines), but children ranges come from key
+!  cuts instead of partitioning, and child boxes are the geometric
+!  halves of the parent box instead of particle extents. Sets
+!  dofallback=.true. (no children created) if the split would exceed
+!  the key depth; the caller then builds that subtree the old way.
+!+
+!--------------------------------------------------------------------
+!--------------------------------------------------------------------
+!+
+!  Split a dyadic node by key-range cut (no scans, no partitioning):
+!  children ranges come from the level bit in the sorted keys, child
+!  boxes are the geometric halves of the parent box. Sets
+!  dofallback=.true. (no children created) if the split would exceed
+!  the key depth; the caller then builds that subtree the old way.
+!+
+!--------------------------------------------------------------------
+subroutine try_split_fast(node,nnode,level,xmini,xmaxi, &
+                          il,ir,nl,nr,xminl,xmaxl,xminr,xmaxr,ncells,leaf_is_active, &
+                          wassplit,dofallback)
+ use dim, only:minpart
+ use io,  only:fatal
+ type(kdnode),    intent(inout) :: node(:)
+ integer,         intent(in)    :: nnode,level
+ real,            intent(in)    :: xmini(3),xmaxi(3)
+ integer,         intent(out)   :: il,ir,nl,nr
+ real,            intent(out)   :: xminl(3),xmaxl(3),xminr(3),xmaxr(3)
+ integer(kind=8), intent(inout) :: ncells
+ integer,         intent(inout) :: leaf_is_active(:)
+ logical,         intent(out)   :: wassplit,dofallback
+ integer(kind=8) :: myslot
+ integer :: npnode,iaxis,bitpos,m
+
+ ir = 0
+ il = 0
+ nl = 0
+ nr = 0
+ dofallback = .false.
+ wassplit = .false.
+
+ if (inoderange(1,nnode) > 0) then
+    npnode = inoderange(2,nnode) - inoderange(1,nnode) + 1
+ else
+    npnode = 0
+ endif
+ if (npnode < 1) return
+ wassplit = (npnode > minpart)
+ if (.not. wassplit) return
+
+ ! no key bit left to split on: build this subtree the old way
+ if (level+1 > keydepth_max-1) then
+    dofallback = .true.
+    return
+ endif
+ if (level+1 > maxdepth) call fatal('maketree_fast','maximum tree depth reached !!')
+ iaxis  = kdpat(level) + 1
+ bitpos = keydepth_max-1-level
+ m = key_lower_bound(inoderange(1,nnode),inoderange(2,nnode),bitpos)
+ if (m == inoderange(1,nnode) .or. m == inoderange(2,nnode)+1) then
+    ! all particles on one side: balanced split as in construct_node
+    m = inoderange(1,nnode) + npnode/2
+ endif
+ !$omp atomic capture
+ ncells = ncells + 2
+ myslot = ncells
+ !$omp end atomic
+ ir = int(myslot)
+ il = int(myslot-1)
+ if (ir > ncellsmax) call fatal('maketree_fast',&
+    'number of nodes exceeds array dimensions, increase ncellsmax and recompile',ival=int(ncellsmax))
+ node(nnode)%leftchild  = il
+ node(nnode)%rightchild = ir
+
+ leaf_is_active(nnode) = 0
+
+ inoderange(1,il) = inoderange(1,nnode)
+ inoderange(2,il) = m-1
+ inoderange(1,ir) = m
+ inoderange(2,ir) = inoderange(2,nnode)
+ nl = m - inoderange(1,nnode)
+ nr = inoderange(2,nnode) - m + 1
+
+ xminl(:) = xmini(:)
+ xmaxl(:) = xmaxi(:)
+ xmaxl(iaxis) = 0.5*(xmini(iaxis) + xmaxi(iaxis))
+ xminr(:) = xmini(:)
+ xmaxr(:) = xmaxi(:)
+ xminr(iaxis) = 0.5*(xmini(iaxis) + xmaxi(iaxis))
+
+end subroutine try_split_fast
+
+!--------------------------------------------------------------------
+!+
+!  Full property scan for a leaf node (identical values to the
+!  standard build for the same particle set).
+!+
+!--------------------------------------------------------------------
+subroutine scan_leaf_fast(nodeentry,nnode,mymum,level,xmini,xmaxi,doparallel, &
+                          leaf_is_active,minlevel,maxlevel)
+ use dim, only:ind_timesteps
+ use io,  only:fatal
+ type(kdnode),    intent(out)   :: nodeentry
+ integer,         intent(in)    :: nnode,mymum,level
+ real,            intent(inout) :: xmini(3),xmaxi(3)
+ logical,         intent(in)    :: doparallel
+ integer,         intent(inout) :: leaf_is_active(:)
+ integer,         intent(inout) :: minlevel,maxlevel
+ real    :: xyzcofm(3),totmass_node
+ integer :: npnode,i
+ logical :: nodeisactive
+
+ nodeisactive = .false.
+ if (inoderange(1,nnode) > 0) then
+    do i = inoderange(1,nnode),inoderange(2,nnode)
+       if (inodeparts(i) > 0) then
+          nodeisactive = .true.
+          exit
+       endif
+    enddo
+    npnode = inoderange(2,nnode) - inoderange(1,nnode) + 1
+ else
+    npnode = 0
+ endif
+
+ call compute_nodes_cofm(npnode,nnode,xyzcofm,totmass_node,doparallel)
+ if (totmass_node <= 0.) call fatal('maketree_fast','totmass_node==0',val=totmass_node)
+
+ ! geosplit keeps the centre of mass at the node centre (as in construct_node)
+ call set_nodes_properties(npnode,nnode,xyzcofm,totmass_node,mymum,nodeentry,xmini,xmaxi, &
+                           level,.false.,doparallel,.true.)
+
+ nodeentry%leftchild  = 0
+ nodeentry%rightchild = 0
+ maxlevel = max(level,maxlevel)
+ minlevel = min(level,minlevel)
+ if (ind_timesteps) then
+    if (nodeisactive) then
+       leaf_is_active(nnode) = 1
+    else
+       leaf_is_active(nnode) = -1
+    endif
+ else
+    leaf_is_active(nnode) = 1
+ endif
+
+end subroutine scan_leaf_fast
+
+!--------------------------------------------------------------------
+!+
+!  Property scan for an internal node whose children are complete:
+!  centre of mass in O(1) from the children's masses and centres,
+!  then a single scan for moments/size/hmax. Children ranges and
+!  child pointers must already be set.
+!+
+!--------------------------------------------------------------------
+subroutine scan_internal_fast(node,nnode,mymum,level,xmini,xmaxi,doparallel)
+ use io, only:fatal
+ type(kdnode),    intent(inout) :: node(:)
+ integer,         intent(in)    :: nnode,mymum,level
+ real,            intent(inout) :: xmini(3),xmaxi(3)
+ logical,         intent(in)    :: doparallel
+ integer :: il,ir,npnode
+ real :: xyzcofm(3),totmass_node,ml,mr
+
+ il = node(nnode)%leftchild
+ ir = node(nnode)%rightchild
+ ml = node(il)%mass
+ mr = node(ir)%mass
+ totmass_node = ml + mr
+ if (totmass_node <= 0.) call fatal('maketree_fast','totmass_node==0 in internal combine')
+ xyzcofm(:) = (ml*node(il)%xcen(:) + mr*node(ir)%xcen(:))/totmass_node
+ npnode = inoderange(2,nnode) - inoderange(1,nnode) + 1
+
+ call set_nodes_properties(npnode,nnode,xyzcofm,totmass_node,mymum,node(nnode),xmini,xmaxi, &
+                           level,.false.,doparallel,.true.)
+
+end subroutine scan_internal_fast
+
+!--------------------------------------------------------------------
+!+
+!  Build the subtree rooted at nnode with the standard (partitioning)
+!  construct_node. Used for nodes that would split beyond the key
+!  depth, operating on their private contiguous slice only.
+!+
+!--------------------------------------------------------------------
+subroutine build_old_subtree(node,nnode,mymum,level,npnode,xmini,xmaxi,ncells, &
+                             leaf_is_active,minlevel,maxlevel,doparallel)
+ use io, only:fatal
+ type(kdnode),    intent(inout) :: node(:)
+ integer,         intent(in)    :: nnode,mymum,level,npnode
+ real,            intent(in)    :: xmini(3),xmaxi(3)
+ integer(kind=8), intent(inout) :: ncells
+ integer,         intent(inout) :: leaf_is_active(:)
+ integer,         intent(inout) :: minlevel,maxlevel
+ logical,         intent(in)    :: doparallel
+ integer, parameter :: istacksize = 512
+ type(kdbuildstack) :: ostack(istacksize)
+ integer :: iold,onode,omum,olev,onp,oil,oir,onl,onr
+ real :: oxmini(3),oxmaxi(3),oxminl(3),oxmaxl(3),oxminr(3),oxmaxr(3)
+ logical :: owas
+
+ call push_onto_stack(ostack(1),nnode,mymum,level,npnode,xmini,xmaxi)
+ iold = 1
+ over_old: do while (iold > 0)
+    call pop_off_stack(ostack(iold),iold,onode,omum,olev,onp,oxmini,oxmaxi)
+    call construct_node(node(onode),onode,omum,olev,oxmini,oxmaxi,onp,doparallel, &
+                        oil,oir,onl,onr,oxminl,oxmaxl,oxminr,oxmaxr,ncells,leaf_is_active, &
+                        minlevel,maxlevel,owas,.false.,.false.)
+    if (owas) then
+       if (iold+2 > istacksize) call fatal('maketree_fast',&
+           'stack size exceeded in fallback tree build, increase istacksize and recompile')
+       iold = iold + 1
+       call push_onto_stack(ostack(iold),oil,onode,olev+1,onl,oxminl,oxmaxl)
+       iold = iold + 1
+       call push_onto_stack(ostack(iold),oir,onode,olev+1,onr,oxminr,oxmaxr)
+    endif
+ enddo over_old
+
+end subroutine build_old_subtree
 
 !----------------------------
 !+
@@ -521,11 +1096,12 @@ subroutine construct_root_node(np,nproot,irootnode,xmini,xmaxi,leaf_is_active,xy
 end subroutine construct_root_node
 
 ! also used for queue push
-pure subroutine push_onto_stack(stackentry,node,parent,level,npnode,xmin,xmax)
+pure subroutine push_onto_stack(stackentry,node,parent,level,npnode,xmin,xmax,state)
  type(kdbuildstack), intent(out) :: stackentry
  integer,            intent(in)  :: node,parent,level
  integer,            intent(in)  :: npnode
  real,               intent(in)  :: xmin(3),xmax(3)
+ integer,            intent(in), optional :: state
 
  stackentry%node   = node
  stackentry%parent = parent
@@ -533,15 +1109,21 @@ pure subroutine push_onto_stack(stackentry,node,parent,level,npnode,xmin,xmax)
  stackentry%npnode = npnode
  stackentry%xmin   = xmin
  stackentry%xmax   = xmax
+ if (present(state)) then
+    stackentry%state = state
+ else
+    stackentry%state = 0
+ endif
 
 end subroutine push_onto_stack
 
 ! also used for queue pop
-pure subroutine pop_off_stack(stackentry, istack, nnode, mymum, level, npnode, xmini, xmaxi)
+pure subroutine pop_off_stack(stackentry, istack, nnode, mymum, level, npnode, xmini, xmaxi, state)
  type(kdbuildstack), intent(in)    :: stackentry
  integer,            intent(inout) :: istack
  integer,            intent(out)   :: nnode, mymum, level, npnode
  real,               intent(out)   :: xmini(3), xmaxi(3)
+ integer,            intent(out), optional :: state
 
  nnode  = stackentry%node
  mymum  = stackentry%parent
@@ -549,6 +1131,7 @@ pure subroutine pop_off_stack(stackentry, istack, nnode, mymum, level, npnode, x
  npnode = stackentry%npnode
  xmini  = stackentry%xmin
  xmaxi  = stackentry%xmax
+ if (present(state)) state = stackentry%state
  istack = istack - 1
 
 end subroutine pop_off_stack
