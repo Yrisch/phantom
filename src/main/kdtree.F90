@@ -56,7 +56,7 @@ module kdtree
  real,    public  :: tree_accuracy    = 0.5
  logical, public  :: use_geosplit     = .true.
   logical, public  :: use_geosplit_fast = .false. ! key-sorted fast build for geosplit trees (experimental)
-  logical, public  :: use_tree_renumber = .true. ! deterministic DFS-preorder node numbering
+  logical, public  :: use_tree_renumber = .true. ! deterministic level-order node numbering
   logical, public  :: use_cache        = .true.
  integer, private :: kdpat(0:keydepth_max-1) ! split axis (0,1,2) per dyadic level
  integer(kind=8), private, allocatable :: kdkey(:)     ! dyadic sort key per particle slot
@@ -378,10 +378,12 @@ subroutine maketree(node, xyzh, np, leaf_is_active, ncells, apr_tree, refineleve
 
   if (present(refinelevels)) refinelevels = minlevel
 
-  ! deterministic DFS-preorder numbering (geosplit serial builds only:
+  ! deterministic level-order numbering (geosplit serial builds only:
   ! the 2^k indexed and MPI-refined paths rely on their own layouts)
-  if (use_tree_renumber .and. use_geosplit .and. nprocs == 1) &
-     call renumber_tree_dfs(node,ncells,leaf_is_active)
+  if (use_tree_renumber .and. use_geosplit .and. nprocs == 1) then
+     call bucket_nodes_by_level(node,int(ncells))
+     call renumber_tree_bfs(node,ncells,leaf_is_active)
+  endif
 
   if (iverbose >= 3) then
      write(iprint,"(a,i10,3(a,i2))") ' maketree: nodes = ',ncells,', max level = ',maxlevel,&
@@ -595,9 +597,9 @@ subroutine maketree_fast(node,np,nproot,xminroot,xmaxroot,leaf_is_active,ncells,
     endif
  enddo over_levels
 
- ! deterministic DFS-preorder numbering (serial builds only: the MPI
+ ! deterministic level-order numbering (serial builds only: the MPI
  ! global-tree refinement indexes the local tree by level ranges)
- if (use_tree_renumber .and. nprocs == 1) call renumber_tree_dfs(node,ncells,leaf_is_active)
+ if (use_tree_renumber .and. nprocs == 1) call renumber_tree_bfs(node,ncells,leaf_is_active)
 
  if (maxlevel > maxlevel_indexed .and. .not.already_warned) then
     write(string,"(i10)") 2**(maxlevel-maxlevel_indexed)
@@ -1025,46 +1027,35 @@ end subroutine bucket_nodes_by_level
 
 !--------------------------------------------------------------------
 !+
-!  Deterministic DFS-preorder renumbering of the tree (serial builds
-!  only): each subtree becomes contiguous in memory, which matches
-!  the top-down DFS order of the tree walks. Root keeps id 1.
-!  Permutes node/inoderange/leaf_is_active consistently and rewrites
-!  all child/parent pointers. O(ncells), no extra memory beyond kdmap
+!  Deterministic level-order (BFS) renumbering of the tree: levels
+!  become contiguous id ranges, root keeps id 1, and full levels land
+!  exactly on [2^L, 2^(L+1)) as maketreeglobal refinement expects.
+!  ids follow the level buckets, so no traversal is needed. Permutes
+!  node/inoderange/leaf_is_active consistently and rewrites all
+!  child/parent pointers. O(ncells), no extra memory beyond kdmap
 !  (kdbkt_list is reused as the inverse map scratch).
 !+
 !--------------------------------------------------------------------
-subroutine renumber_tree_dfs(node,ncells,leaf_is_active)
+subroutine renumber_tree_bfs(node,ncells,leaf_is_active)
  use io, only:fatal
  type(kdnode), intent(inout) :: node(:)
  integer(kind=8), intent(in) :: ncells
  integer,         intent(inout) :: leaf_is_active(:)
- integer :: n,newid,sp,top,old,new,k,j
- integer :: st(1024)
+ integer :: newid,top,old,new,k,j,lev
  type(kdnode) :: ntmp
  integer :: rtmp(2),itmp
 
- ! 1. left-first traversal from the root: kdmap(old) = new
+ ! 1. level order through the buckets: kdmap(old) = new
  newid = 0
- sp = 1
- st(1) = irootnode
- do while (sp > 0)
-    n = st(sp)
-    sp = sp - 1
-    if (n <= 0 .or. n > ncells) call fatal('renumber_tree_dfs','invalid node id in traversal')
-    newid = newid + 1
-    kdmap(n) = newid
-    if (node(n)%rightchild /= 0) then
-       sp = sp + 1
-       if (sp > 1024) call fatal('renumber_tree_dfs','traversal stack exceeded')
-       st(sp) = node(n)%rightchild
-    endif
-    if (node(n)%leftchild /= 0) then
-       sp = sp + 1
-       if (sp > 1024) call fatal('renumber_tree_dfs','traversal stack exceeded')
-       st(sp) = node(n)%leftchild
-    endif
+ do lev = 0,maxdepth
+    do k = kdbkt_start(lev+1),kdbkt_start(lev+2)-1
+       old = kdbkt_list(k)
+       if (old > 1 .and. node(old)%parent == 0) cycle ! unreachable (should not happen)
+       newid = newid + 1
+       kdmap(old) = newid
+    enddo
  enddo
- if (newid /= ncells) call fatal('renumber_tree_dfs','unreachable nodes: cannot renumber')
+ if (newid /= ncells) call fatal('renumber_tree_bfs','unreachable nodes: cannot renumber')
 
  ! 2. rewrite pointers to new ids (in place, map is complete)
  do old = 1,int(ncells)
@@ -1103,7 +1094,7 @@ subroutine renumber_tree_dfs(node,ncells,leaf_is_active)
     kdbkt_list(new) = -abs(kdbkt_list(new))
  enddo
 
-end subroutine renumber_tree_dfs
+end subroutine renumber_tree_bfs
 
 !----------------------------
 !+
