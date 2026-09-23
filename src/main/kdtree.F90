@@ -993,35 +993,66 @@ end subroutine build_old_subtree
 !+
 !--------------------------------------------------------------------
 subroutine bucket_nodes_by_level(node,ncells)
+!$ use omp_lib, only: omp_get_thread_num, omp_get_num_threads
  type(kdnode), intent(in) :: node(:)
  integer,      intent(in) :: ncells
- integer :: id,lev,pos,tmp
+ integer :: nthreads,tid,t,istart,iend
+ integer :: id,lev,pos
+ integer, allocatable :: cnt(:,:),off(:,:)
+ integer :: myoff(0:maxdepth)
 
- kdbkt_start = 0
- do id = 1,ncells
+ ! parallel counting sort by level (static chunks + ordered slices give
+ ! bit-identical bucket contents to the serial version, hence the same
+ ! numbering for any thread count)
+ nthreads = 1
+ !$omp parallel default(none) shared(nthreads)
+ !$ nthreads = omp_get_num_threads()
+ !$omp end parallel
+ allocate(cnt(0:maxdepth,nthreads),off(0:maxdepth,nthreads))
+
+ !$omp parallel default(none) &
+ !$omp shared(node,ncells,nthreads,cnt,off,kdbkt_list) &
+ !$omp private(tid,t,istart,iend,id,lev,myoff,pos)
+ tid = 1
+ !$ tid = omp_get_thread_num() + 1
+ istart = (tid-1)*ncells/nthreads + 1
+ iend   = tid*ncells/nthreads
+ ! count levels in this chunk
+ cnt(:,tid) = 0
+ do id = istart,iend
     lev = node(id)%level
     if (lev < 0) lev = 0
     if (lev > maxdepth) lev = maxdepth
-    kdbkt_start(lev+1) = kdbkt_start(lev+1) + 1
+    cnt(lev,tid) = cnt(lev,tid) + 1
  enddo
+ !$omp barrier
+ ! prefix over levels and threads -> disjoint write slices
+ !$omp single
  pos = 1
  do lev = 0,maxdepth
-    tmp = kdbkt_start(lev+1)
-    kdbkt_start(lev+1) = pos
-    pos = pos + tmp
+    do t = 1,nthreads
+       off(lev,t) = pos
+       pos = pos + cnt(lev,t)
+    enddo
  enddo
- kdbkt_start(maxdepth+2) = pos
- do id = 1,ncells
+ !$omp end single
+ ! fill this thread's slices (order within a level == id order)
+ myoff(:) = off(:,tid)
+ do id = istart,iend
     lev = node(id)%level
     if (lev < 0) lev = 0
     if (lev > maxdepth) lev = maxdepth
-    kdbkt_list(kdbkt_start(lev+1)) = id
-    kdbkt_start(lev+1) = kdbkt_start(lev+1) + 1
+    kdbkt_list(myoff(lev)) = id
+    myoff(lev) = myoff(lev) + 1
  enddo
- do lev = maxdepth,0,-1
-    kdbkt_start(lev+2) = kdbkt_start(lev+1)
+ !$omp end parallel
+
+ ! level starts are the first thread's slice offsets
+ do lev = 0,maxdepth
+    kdbkt_start(lev+1) = off(lev,1)
  enddo
- kdbkt_start(1) = 1
+ kdbkt_start(maxdepth+2) = ncells + 1
+ deallocate(cnt,off)
 
 end subroutine bucket_nodes_by_level
 
@@ -1041,9 +1072,9 @@ subroutine renumber_tree_bfs(node,ncells,leaf_is_active)
  type(kdnode), intent(inout) :: node(:)
  integer(kind=8), intent(in) :: ncells
  integer,         intent(inout) :: leaf_is_active(:)
- integer :: newid,top,old,new,k,j,lev
- type(kdnode) :: ntmp
- integer :: rtmp(2),itmp
+ integer :: newid,top,old,new,k,lev
+ type(kdnode), allocatable :: nodetmp(:)
+ integer, allocatable :: rtmp2(:,:),itmp2(:)
 
  ! 1. level order through the buckets: kdmap(old) = new
  newid = 0
@@ -1058,41 +1089,45 @@ subroutine renumber_tree_bfs(node,ncells,leaf_is_active)
  if (newid /= ncells) call fatal('renumber_tree_bfs','unreachable nodes: cannot renumber')
 
  ! 2. rewrite pointers to new ids (in place, map is complete)
+ !$omp parallel do default(none) schedule(static) shared(node,kdmap,ncells) private(old)
  do old = 1,int(ncells)
     if (node(old)%leftchild /= 0) node(old)%leftchild = kdmap(node(old)%leftchild)
     if (node(old)%rightchild /= 0) node(old)%rightchild = kdmap(node(old)%rightchild)
     if (node(old)%parent /= 0) node(old)%parent = kdmap(node(old)%parent)
  enddo
+ !$omp end parallel do
 
  ! 3. inverse map into bucket scratch: result(new) = arrays(old=inv(new))
+ !$omp parallel do default(none) schedule(static) shared(kdmap,kdbkt_list,ncells) private(old)
  do old = 1,int(ncells)
     kdbkt_list(kdmap(old)) = old
  enddo
+ !$omp end parallel do
 
- ! 4. in-place cycle permutation of node/inoderange/leaf_is_active
- !    (result(new) = arrays(invmap(new)); rotate each cycle)
+ ! 4. parallel permute through temp buffers:
+ !    result(new) = arrays(invmap(new)), then copy back
  top = int(ncells)
+ allocate(nodetmp(top),rtmp2(2,top),itmp2(top))
+ !$omp parallel do default(none) schedule(static) &
+ !$omp shared(node,inoderange,leaf_is_active,kdbkt_list,nodetmp,rtmp2,itmp2,top) &
+ !$omp private(new,old)
  do new = 1,top
-    if (kdbkt_list(new) <= 0) cycle
-    j = new
-    ntmp = node(j)
-    rtmp = inoderange(:,j)
-    itmp = leaf_is_active(j)
-    do
-       k = kdbkt_list(j)
-       if (k == new) exit
-       node(j) = node(k)
-       inoderange(:,j) = inoderange(:,k)
-       leaf_is_active(j) = leaf_is_active(k)
-       kdbkt_list(j) = -k
-       j = k
-    enddo
-    node(j) = ntmp
-    inoderange(:,j) = rtmp
-    leaf_is_active(j) = itmp
-    kdbkt_list(j) = -abs(kdbkt_list(j))
-    kdbkt_list(new) = -abs(kdbkt_list(new))
+    old = kdbkt_list(new)
+    nodetmp(new) = node(old)
+    rtmp2(:,new) = inoderange(:,old)
+    itmp2(new) = leaf_is_active(old)
  enddo
+ !$omp end parallel do
+ !$omp parallel do default(none) schedule(static) &
+ !$omp shared(node,inoderange,leaf_is_active,nodetmp,rtmp2,itmp2,top) &
+ !$omp private(new)
+ do new = 1,top
+    node(new) = nodetmp(new)
+    inoderange(:,new) = rtmp2(:,new)
+    leaf_is_active(new) = itmp2(new)
+ enddo
+ !$omp end parallel do
+ deallocate(nodetmp,rtmp2,itmp2)
 
 end subroutine renumber_tree_bfs
 
