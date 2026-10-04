@@ -435,6 +435,20 @@ OBJDIR=obj
 %.o : %.f
 	$(FC) -c $(FFLAGS) $< -o $@
 #
+# the kdtree submodules need the parent module file first,
+# otherwise a clean parallel build can race (kdtree.mod is
+# generated as a side effect of compiling kdtree.F90)
+#
+kdtree_build.o kdtree_walk.o : kdtree.mod
+kdtree.mod : kdtree.o
+# submodule objects compile with -fno-semantic-interposition: with -fPIC the
+# compiler otherwise treats their local helpers as interposable and refuses
+# to inline them (the parent module hides its own privates via the private
+# statement, so single-file builds never noticed). GNU-only flag.
+ifneq ($(filter %gfortran %mpifort %mpif90,$(FC)),)
+kdtree_build.o kdtree_walk.o : FFLAGS += -fno-semantic-interposition
+endif
+#
 # turbulent driving
 #
 SRCTURB=forcing.f90
@@ -510,7 +524,8 @@ SOURCES= physcon.f90 ${CONFIG} ${SRCKERNEL} io.F90 units.f90 geometry.f90 \
          cons2primsolver.f90 cons2prim.f90 \
          centreofmass.f90 ${SRCPOT} checkconserved.f90 \
          utils_filenames.f90 utils_summary.F90 ${SRCCHEM} ${SRCDUST} \
-         mpi_memory.f90 mpi_derivs.F90 mpi_tree.F90 kdtree.F90 neigh_kdtree.f90 utils_healpix.f90 utils_raytracer.f90 \
+         mpi_memory.f90 mpi_derivs.F90 mpi_tree.F90 kdtree.F90 kdtree_build.F90 kdtree_walk.F90\
+         neigh_kdtree.f90 utils_healpix.f90 utils_raytracer.f90 \
          partinject.f90 utils_inject.f90 dust_formation.f90 ptmass_radiation.f90 ptmass_heating.f90 ptmass_tree.f90 \
          utils_deriv.f90 utils_implicit.f90 radiation_implicit.f90 ${SRCTURB} \
          grids_for_setup.f90\
@@ -593,7 +608,8 @@ edit: checksetup
 SRCDUMP= physcon.f90 ${CONFIG} ${SRCKERNEL} utils_omp.f90 io.F90 units.f90 mpi_utils.F90 \
          utils_timing.f90 utils_infiles.f90 dtype_kdtree.f90 utils_allocate.f90 part.F90 \
          ${DOMAIN} mpi_dens.F90 mpi_force.F90 boundary.f90 boundary_dynamic.f90 \
-         mpi_balance.F90 mpi_memory.f90 mpi_derivs.F90 mpi_tree.F90 kdtree.F90 neigh_kdtree.f90 ptmass_tree.f90\
+         mpi_balance.F90 mpi_memory.f90 mpi_derivs.F90 mpi_tree.F90 \
+         kdtree.F90 kdtree_build.F90 kdtree_walk.F90 neigh_kdtree.f90 ptmass_tree.f90\
          utils_dumpfiles.f90 utils_vectors.f90 utils_mathfunc.f90 cubicsolve.f90 \
          utils_datafiles.f90 utils_filenames.f90 utils_system.f90 utils_tables.f90 datafiles.f90 gitinfo.f90 \
          centreofmass.f90 dynamic_dtmax.f90 \
