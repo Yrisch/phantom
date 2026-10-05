@@ -101,10 +101,10 @@ module procedure maketreeglobal
     ifirstingroup = (id / groupsize) * groupsize
     if (level == 0) then
        if (sinktree) then
-          call construct_root_node(np,npcounter,irootnode,xmini,xmaxi,leaf_is_active,xyzh,&
-                                   xyzmh_ptmass,nptmass)
+          call construct_root_node(np,npcounter,irootnode,xmini,xmaxi,leaf_is_active,.true.,&
+                                   xyzh,xyzmh_ptmass,nptmass)
        else
-          call construct_root_node(np,npcounter,irootnode,xmini,xmaxi,leaf_is_active,xyzh)
+          call construct_root_node(np,npcounter,irootnode,xmini,xmaxi,leaf_is_active,.true.,xyzh)
        endif
     else
        npcounter = npnode
@@ -326,9 +326,10 @@ module procedure maketree
 
  ! construct root node, i.e. find bounds of all particles
  if (sinktree) then
-    call construct_root_node(np,npcounter,irootnode,xmini,xmaxi,leaf_is_active,xyzh,xyzmh_ptmass,nptmass)
+    call construct_root_node(np,npcounter,irootnode,xmini,xmaxi,leaf_is_active,.false.,&
+                             xyzh,xyzmh_ptmass,nptmass)
  else
-    call construct_root_node(np,npcounter,irootnode,xmini,xmaxi,leaf_is_active,xyzh)
+    call construct_root_node(np,npcounter,irootnode,xmini,xmaxi,leaf_is_active,.false.,xyzh)
  endif
 
  if (inoderange(1,irootnode)==0 .or. inoderange(2,irootnode)==0 ) then
@@ -843,24 +844,27 @@ end subroutine build_top_parallel
 ! routine to construct root node
 !+
 !---------------------------------
-subroutine construct_root_node(np,nproot,irootnode,xmini,xmaxi,leaf_is_active,xyzh,xyzmh_ptmass,nptmass)
+subroutine construct_root_node(np,nproot,irootnode,xmini,xmaxi,leaf_is_active,global_build,xyzh,&
+                               xyzmh_ptmass,nptmass)
  use boundary, only:cross_boundary
  use mpidomain,only:isperiodic
- use part, only:iphase,iactive
- use part, only:isdead_or_accreted,ibelong
- use io,   only:fatal,id
- use dim,  only:ind_timesteps,mpi,periodic
- use part, only:isink,massoftype,igas,iamtype,maxphase,maxp,aprmassoftype,apr_level,ihsoft
+ use mpitree,  only:reduce_group
+ use part,     only:iphase,iactive
+ use part,     only:isdead_or_accreted,ibelong
+ use io,       only:fatal,id
+ use dim,      only:ind_timesteps,mpi,periodic,mpi
+ use part,     only:isink,massoftype,igas,iamtype,maxphase,maxp,aprmassoftype,apr_level,ihsoft
 !$ use omp_lib, only:omp_get_max_threads
- integer, intent(in)    :: np,irootnode
- integer, intent(out)   :: nproot
- real,    intent(out)   :: xmini(3), xmaxi(3)
- integer, intent(inout) :: leaf_is_active(:)
- real,    intent(inout) :: xyzh(:,:)
+ integer, intent(in)              :: np,irootnode
+ integer, intent(out)             :: nproot
+ real,    intent(out)             :: xmini(3), xmaxi(3)
+ integer, intent(inout)           :: leaf_is_active(:)
+ real,    intent(inout)           :: xyzh(:,:)
+ logical, intent(in)              :: global_build
  real,    intent(inout), optional :: xyzmh_ptmass(:,:)
  integer, intent(in),    optional :: nptmass
- integer :: i,ncross,ic,nchunk,nl
  integer, allocatable :: nlive(:)
+ integer :: i,ncross,ic,nchunk,nl
  real    :: xminpart,yminpart,zminpart,xmaxpart,ymaxpart,zmaxpart
  real    :: xi, yi, zi
 
@@ -1013,6 +1017,16 @@ subroutine construct_root_node(np,nproot,irootnode,xmini,xmaxi,leaf_is_active,xy
  xmaxi(1) = xmaxpart
  xmaxi(2) = ymaxpart
  xmaxi(3) = zmaxpart
+
+ if (mpi .and. global_build .and. use_geosplit) then
+    xmini(1)  = reduce_group(xmini(1),'min',0)
+    xmini(2)  = reduce_group(xmini(2),'min',0)
+    xmini(3)  = reduce_group(xmini(3),'min',0)
+
+    xmaxi(1)  = reduce_group(xmaxi(1),'max',0)
+    xmaxi(2)  = reduce_group(xmaxi(2),'max',0)
+    xmaxi(3)  = reduce_group(xmaxi(3),'max',0)
+ endif
 
 end subroutine construct_root_node
 
