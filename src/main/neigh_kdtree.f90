@@ -40,8 +40,7 @@ module neighkdtree
  real, public                       :: dcellx = 0.,dcelly = 0.,dcellz = 0.
  logical, public                    :: use_dualtree = .true.
  ! MPI: dual tree walk from the global tree, then in rounds of kslab_mpi levels on
- ! the local tree (remote sources not shipped yet: for development only)
- logical, public                    :: use_dualtree_mpi = .false.
+ ! the local tree, the remote nodes being exchanged between the rounds
  integer, public                    :: kslab_mpi = 3
  ! check at each round that the remote pairs are mirrored (debug, costs 4 collectives)
  logical, public                    :: check_dualtree_mpi = .true.
@@ -363,8 +362,8 @@ subroutine get_neighbour_list(inode,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesi
 
  get_f = (gravity .and. present(f))
 
- if (mpi .and. get_f .and. use_dualtree_mpi) then
-    ! leaves walked in rounds from the global walk
+ if (mpi .and. nprocs > 1 .and. present(f)) then
+    ! force with MPI: leaves walked in rounds from the global walk (local and ghost neighbours)
     call get_leaf_walk(inode,mylistneigh,nneigh,xyzcache,ixyzcachesize,f)
     return
  endif

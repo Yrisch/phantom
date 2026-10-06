@@ -39,7 +39,7 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
                   dustevol,ddustevol,filfac,dustfrac,eos_vars,time,dt,dtnew,pxyzu,&
                   dens,metrics,apr_level)
  use dim,            only:mhd,fast_divcurlB,gr,periodic,do_radiation,driving,&
-                          sink_radiation,use_dustgrowth,ind_timesteps,isothermal,mpi,gravity
+                          sink_radiation,use_dustgrowth,ind_timesteps,isothermal,mpi
  use io,             only:iprint,fatal,error
  use neighkdtree,    only:build_tree
  use densityforce,   only:densityiterate
@@ -55,7 +55,6 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  use ptmass_radiation, only:get_dust_temperature
  use timing,         only:get_timings
  use forces,         only:force,dualwalk_global_force,clear_ghosts
- use neighkdtree,    only:use_dualtree
  use io,             only:nprocs
  use part,           only:mhd,gradh,alphaind,iradxi,ifluxx,ifluxy,ifluxz,ithick
  use derivutils,     only:do_timing
@@ -189,13 +188,13 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  stressmax = 0.
  if (sinks_have_heating(nptmass,xyzmh_ptmass)) call ptmass_calc_enclosed_mass(nptmass,npart,xyzh)
  ! dual tree walk over MPI: remote nodes and ghost particles for force
- if (mpi .and. gravity .and. use_dualtree .and. nprocs > 1) &
+ if (mpi .and. nprocs > 1) &
     call dualwalk_global_force(npart,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dustprop,dustfrac,&
                                eos_vars,dens,metrics,apr_level)
  call force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
             rad,drad,radprop,dustprop,dustgasprop,Vrel_disp,dustfrac,ddustevol,fext,fxyz_drag,&
             ipart_rhomax,dt,stressmax,eos_vars,dens,metrics,apr_level)
- if (mpi .and. gravity .and. use_dualtree .and. nprocs > 1) call clear_ghosts(npart,xyzh)
+ if (mpi .and. nprocs > 1) call clear_ghosts(npart,xyzh)
  call do_timing('force',tlast,tcpulast)
 
  !

@@ -656,7 +656,6 @@ subroutine test_FMM(ntests,npass)
  use testutils,       only:checkval,checkvalbuf_end,update_test_scores
  use sort_particles,  only:sort_part_id
  use dim, only:maxp,maxphase,mpi
- use neighkdtree, only:use_dualtree_mpi
 
  integer, intent(inout) :: ntests,npass
  real :: x0(3),rmin,rmax,nx,psep,totvol,time,fsum(3),tsum(3)
@@ -665,11 +664,6 @@ subroutine test_FMM(ntests,npass)
  integer :: nfail(6),i
 
  if (id==master) write(*,"(/,a)") '--> testing linear and angular momentum conservation with symmetric fmm'
- ! the old MPI path (cells exported to remote tasks) is not a symmetric FMM
- if (mpi .and. .not.use_dualtree_mpi) then
-    if (id==master) write(*,"(/,a)") '--> skipped... No sym FMM with MPI unless use_dualtree_mpi'
-    return
- endif
  npart = 0
  npartoftype = 0
  massoftype = 0.

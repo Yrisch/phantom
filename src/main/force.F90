@@ -411,10 +411,6 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
  rhomax        = 0.
 #endif
 
- if (mpi) then
-    call reset_stacks
-    call reset_cell_counters(cell_counters)
- endif
 
 !
 !-- verification for non-ideal MHD
@@ -510,14 +506,10 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
 !$omp shared(tcpu1) &
 !$omp shared(tcpu2)
 
- call init_cell_exchange(xrecvbuf,irequestrecv,thread_complete,ncomplete_mpi,mpitype)
-
  !$omp single
  call get_timings(t1,tcpu1)
  !$omp end single
 
- !--initialise send requests to null
- call init_send_requests(irequestsend)
 
  !$omp do schedule(runtime)
  over_cells: do ia=1,nactive_leaves
@@ -536,37 +528,14 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
     call get_cell_location(icell,cell%xpos,cell%xsizei,cell%rcuti)
 
     !--get the neighbour list and fill the cell cache
-    call get_neighbour_list(icell,listneigh,nneigh,xyzh,xyzcache,maxcellcache, &
-                           getj=.true.,f=cell%fgrav,remote_export=remote_export)
-
-    cell%owner = id
-    do_export = any(remote_export)
-
-    if (mpi) then
-       call recv_cells(stack_remote,xrecvbuf,irequestrecv,cell_counters)
-       if (do_export) then
-          if (stack_waiting%n > 0) then
-             !--wait for broadcast to complete, continue to receive whilst doing so
-             idone(:) = .false.
-             do while(.not.all(idone))
-                call check_send_finished(irequestsend,idone)
-                call recv_cells(stack_remote,xrecvbuf,irequestrecv,cell_counters)
-             enddo
-          endif
-          call reserve_stack(stack_waiting,cell%waiting_index)
-          call send_cell(cell,remote_export,irequestsend,xsendbuf,cell_counters,mpitype)  ! send to remote
-       endif
-    endif
+    call get_neighbour_list(icell,listneigh,nneigh,xyzh,xyzcache,maxcellcache,getj=.true.,f=cell%fgrav)
 
     call compute_cell(cell,listneigh,nneigh,Bevol,xyzh,vxyzu,fxyzu, &
                       iphase,divcurlv,divcurlB,alphaind,eta_nimhd,eos_vars, &
                       dustfrac,dustprop,fxyz_dragold,gradh,ibinnow_m1,ibin_wake,stressmax,xyzcache,&
                       rad,radprop,dens,metrics,apr_level,dt)
 
-    if (do_export) then
-       call write_cell(stack_waiting,cell)
-    else
-       call finish_cell_and_store_results(icall,cell,fxyzu,xyzh,vxyzu,poten,dt,dvdx,&
+    call finish_cell_and_store_results(icall,cell,fxyzu,xyzh,vxyzu,poten,dt,dvdx,&
                              divBsymm,divcurlB,divcurlv,dBevol,ddustevol,deltav,dustgasprop,Vrel_disp,fxyz_drag,fext,dragreg,&
                              filfac,dtcourant,dtforce,dtvisc,dtohm,dthall,dtambi,dtdiff,dtmini,dtmaxi, &
 #ifdef IND_TIMESTEPS
@@ -583,112 +552,16 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
 #endif
                              ndustres,dustresfacmax,dustresfacmean, &
                              rad,drad,radprop,dtrad)
-    endif
+
 
  enddo over_cells
  !$omp enddo
 
- if (stack_waiting%n > 0) then
-    idone(:) = .false.
-    do while(.not.all(idone))
-       call check_send_finished(irequestsend,idone)
-       call recv_cells(stack_remote,xrecvbuf,irequestrecv,cell_counters)
-    enddo
- endif
-
- if (mpi) then
-    call recv_while_wait(stack_remote,xrecvbuf,irequestrecv,&
-         irequestsend,thread_complete,cell_counters,ncomplete_mpi)
-    call reset_cell_counters(cell_counters)
- endif
-
  !$omp single
  call get_timings(t2,tcpu2)
  call increment_timer(itimer_force_local,t2-t1,tcpu2-tcpu1)
- call get_timings(t1,tcpu1)
  !$omp end single
  !$omp barrier
-
- igot_remote: if (mpi .and. stack_remote%n > 0) then
-    !$omp do schedule(runtime)
-    over_remote: do i = 1,stack_remote%n
-       cell = get_cell(stack_remote,i)
-
-       call get_neighbour_list(-1,listneigh,nneigh,xyzh,xyzcache,maxcellcache, &
-                               getj=.true.,f=cell%fgrav,&
-                               cell_xpos=cell%xpos,cell_xsizei=cell%xsizei,cell_rcuti=cell%rcuti)
-
-       call compute_cell(cell,listneigh,nneigh,Bevol,xyzh,vxyzu,fxyzu, &
-                         iphase,divcurlv,divcurlB,alphaind,eta_nimhd,eos_vars, &
-                         dustfrac,dustprop,fxyz_dragold,gradh,ibinnow_m1,ibin_wake,stressmax,xyzcache,&
-                         rad,radprop,dens,metrics,apr_level,dt)
-
-       remote_export = .false.
-       remote_export(cell%owner+1) = .true. ! use remote_export array to send back to the owner
-
-       idone(:) = .false.
-       do while(.not.all(idone))
-          call check_send_finished(irequestsend,idone)
-          call recv_cells(stack_waiting,xrecvbuf,irequestrecv,cell_counters)
-       enddo
-
-       call send_cell(cell,remote_export,irequestsend,xsendbuf,cell_counters,mpitype) ! send the cell back to owner
-
-    enddo over_remote
-    !$omp enddo
-
-    !$omp single
-    stack_remote%n = 0
-    !$omp end single
-
-    idone(:) = .false.
-    do while(.not.all(idone))
-       call check_send_finished(irequestsend,idone)
-       call recv_cells(stack_waiting,xrecvbuf,irequestrecv,cell_counters)
-    enddo
-
- endif igot_remote
-
- if (mpi) call recv_while_wait(stack_waiting,xrecvbuf,irequestrecv,&
-          irequestsend,thread_complete,cell_counters,ncomplete_mpi)
-
- iam_waiting: if (mpi .and. stack_waiting%n > 0) then
-    !$omp do schedule(runtime)
-    over_waiting: do i = 1, stack_waiting%n
-       cell = get_cell(stack_waiting,i)
-
-       call finish_cell_and_store_results(icall,cell,fxyzu,xyzh,vxyzu,poten,dt,dvdx, &
-                                          divBsymm,divcurlB,divcurlv,dBevol,ddustevol,deltav,dustgasprop,Vrel_disp, &
-                                          fxyz_drag,fext,dragreg, &
-                                          filfac,dtcourant,dtforce,dtvisc,dtohm,dthall,dtambi,dtdiff,dtmini,dtmaxi, &
-#ifdef IND_TIMESTEPS
-                                          nbinmaxnew,ncheckbin, &
-                                          ndtforce,ndtforceng,ndtcool,ndtdrag,ndtdragd, &
-                                          ndtvisc,ndtohm,ndthall,ndtambi,ndtdust,ndtrad,ndtclean, &
-                                          dtitmp,dtrat, &
-                                          dtfrcfacmean ,dtfrcngfacmean,dtdragfacmean,dtdragdfacmean,dtcoolfacmean, &
-                                          dtfrcfacmax  ,dtfrcngfacmax ,dtdragfacmax ,dtdragdfacmax ,dtcoolfacmax, &
-                                          dtviscfacmean,dtohmfacmean  ,dthallfacmean,dtambifacmean ,dtdustfacmean, &
-                                          dtviscfacmax ,dtohmfacmax   ,dthallfacmax ,dtambifacmax  ,dtdustfacmax, &
-                                          dtradfacmean ,dtcleanfacmean, &
-                                          dtradfacmax  ,dtcleanfacmax, &
-#endif
-                                          ndustres,dustresfacmax,dustresfacmean, &
-                                          rad,drad,radprop,dtrad)
-
-    enddo over_waiting
-    !$omp enddo
-
-    stack_waiting%n = 0
-
- endif iam_waiting
-
- call finish_cell_exchange(irequestrecv,xsendbuf,mpitype)
-
-!$omp single
- call get_timings(t2,tcpu2)
- call increment_timer(itimer_force_remote,t2-t1,tcpu2-tcpu1)
-!$omp end single
 
 #ifdef GRAVITY
  if (icreate_sinks > 0) then
@@ -925,7 +798,7 @@ end subroutine force
 !----------------------------------------------------------------
 !+
 !  dual tree walk over MPI, before force: walk of the global (refined)
-!  tree, then (use_dualtree_mpi) walk of the local tree in rounds with
+!  tree, then walk of the local tree in rounds with
 !  the nodes of the remote src exchanged between rounds, and exchange
 !  of the particles of the remote src leaves, as ghost particles after
 !  npart in the particle arrays. Called from derivs, as the ghosts are
@@ -937,7 +810,7 @@ subroutine dualwalk_global_force(npart,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dus
  use io,          only:iprint,iverbose,id,master,fatal
  use mpiutils,    only:reduceall_mpi
  use mpiforce,    only:check_pair_mirror
- use neighkdtree, only:get_global_pairs,use_dualtree_mpi,start_local_rounds,check_dualtree_mpi
+ use neighkdtree, only:get_global_pairs,start_local_rounds,check_dualtree_mpi
  integer,         intent(in)    :: npart
  real,            intent(inout) :: xyzh(:,:),vxyzu(:,:),Bevol(:,:),rad(:,:),radprop(:,:)
  real,            intent(inout) :: dustprop(:,:),dustfrac(:,:),eos_vars(:,:),dens(:),metrics(:,:,:,:)
@@ -958,11 +831,9 @@ subroutine dualwalk_global_force(npart,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dus
     if (nmismatch > 0) call fatal('force','remote pairs of the global dual tree walk are not mirrored')
  endif
 
- if (use_dualtree_mpi) then
-    call start_local_rounds(fnode_leaf,nglobal_pairs,global_pairs)
-    call exchange_ghosts(npart,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dustprop,dustfrac,&
-                         eos_vars,dens,metrics,apr_level)
- endif
+ call start_local_rounds(fnode_leaf,nglobal_pairs,global_pairs)
+ call exchange_ghosts(npart,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dustprop,dustfrac,&
+                      eos_vars,dens,metrics,apr_level)
 
 end subroutine dualwalk_global_force
 
@@ -1213,7 +1084,7 @@ subroutine compute_forces(i,iamgasi,iamdusti,xpartveci,hi,hi1,hi21,hi41,gradhi,g
                           dustfrac,dustprop,fxyz_drag,gradh,divcurlv,alphaind, &
                           alphau,alphaB,bulkvisc,stressmax,&
                           ndrag,nstokes,nsuper,ts_min,ibinnow_m1,ibin_wake,ibin_neighi,&
-                          ignoreself,rad,radprop,dens,metrics,apr_level,dt)
+                          rad,radprop,dens,metrics,apr_level,dt)
  use kernel,      only:grkern,cnormk,cnormk_tilde,radkern2,get_kernel_tilde
  use part,        only:igas,idust,isink,iohm,ihall,iambi,maxphase,iactive,xyzmh_ptmass,&
                        iamtype,iamdust,get_partinfo,mhd,maxvxyzu,maxdvdx,igasP,ics,iradP,itemp,&
@@ -1282,7 +1153,6 @@ subroutine compute_forces(i,iamgasi,iamdusti,xpartveci,hi,hi1,hi21,hi41,gradhi,g
  integer(kind=1), intent(inout) :: ibin_wake(:) ! inout to avoid compiler warning
  integer(kind=1), intent(out)   :: ibin_neighi
  integer(kind=1), intent(in)    :: ibinnow_m1
- logical,         intent(in)    :: ignoreself
  real,            intent(in)    :: rad(:,:),dens(:),metrics(:,:,:,:)
  real,            intent(inout) :: radprop(:,:)
  integer(kind=1), intent(in)    :: apr_level(:)
@@ -1525,7 +1395,7 @@ subroutine compute_forces(i,iamgasi,iamdusti,xpartveci,hi,hi1,hi21,hi41,gradhi,g
  loop_over_neighbours2: do n = 1,nneigh
 
     j = abs(listneigh(n))
-    if ((ignoreself) .and. (i==j)) cycle loop_over_neighbours2
+    if (i==j) cycle loop_over_neighbours2
 
     sinkinpair = .false.
     if (maxphase==maxp) then
@@ -2867,7 +2737,7 @@ subroutine compute_cell(cell,listneigh,nneigh,Bevol,xyzh,vxyzu,fxyzu, &
                         iphase,divcurlv,divcurlB,alphaind,eta_nimhd, eos_vars, &
                         dustfrac,dustprop,fxyz_drag,gradh,ibinnow_m1,ibin_wake,stressmax,xyzcache,&
                         rad,radprop,dens,metrics,apr_level,dt)
- use io,              only:error,id,master
+ use io,              only:error,master
  use dim,             only:maxvxyzu,use_apr,use_sinktree
  use options,         only:implicit_radiation
  use part,            only:get_partinfo,iamgas,mhd,igas,isink,maxphase,massoftype,aprmassoftype
@@ -2980,7 +2850,6 @@ subroutine compute_cell(cell,listneigh,nneigh,Bevol,xyzh,vxyzu,fxyzu, &
     !
     !--loop over current particle's neighbours (includes self)
     !
-    ignoreself = (cell%owner == id)
     call compute_forces(i,iamgasi,iamdusti,cell%xpartvec(:,ip),hi,hi1,hi21,hi41,gradhi,gradsofti, &
                          beta, &
                          pmassi,listneigh,nneigh,xyzcache,cell%fsums(:,ip),cell%vsigmax(ip), &
@@ -2990,7 +2859,7 @@ subroutine compute_cell(cell,listneigh,nneigh,Bevol,xyzh,vxyzu,fxyzu, &
                          dustfrac,dustprop,fxyz_drag,gradh,divcurlv,alphaind, &
                          alphau,alphaB,bulkvisc,stressmax, &
                          cell%ndrag,cell%nstokes,cell%nsuper,cell%tsmin(ip),ibinnow_m1,ibin_wake,cell%ibinneigh(ip), &
-                         ignoreself,rad,radprop,dens,metrics,apr_level,dt)
+                         rad,radprop,dens,metrics,apr_level,dt)
 
  enddo over_parts
 
