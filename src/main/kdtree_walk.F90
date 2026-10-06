@@ -138,14 +138,135 @@ end procedure getneigh
 !+
 !----------------------------------------------------------------
 module procedure getneigh_dual
- integer :: istack,i,iparent,idstbranch,idst,isrc,maxcache,ibase,nodestate
+
+ call dual_walk_branch(node,cachestate,ifakeroot_depth,icell,listneigh,nneigh,xyzcache,ixyzcachesize,&
+                       leaf_is_active,fnode,.false.)
+
+end procedure getneigh_dual
+
+!----------------------------------------------------------------
+!+
+!  Same dual tree walk on the global (refined) tree, for one
+!  refined leaf of this task: walks its branch from the global
+!  root, and stops at the frontier between refined and local
+!  nodes. The refined leaves (src) that are not well separated
+!  from icell are returned in listneigh instead of particles:
+!  this is the restart state of the walk on the local trees
+!+
+!----------------------------------------------------------------
+module procedure getneigh_dual_global
+ real :: xyzcache_dummy(1,1)
+
+ call dual_walk_branch(nodeglobal,cachestate_glob,0,icell,listneigh,nneigh,xyzcache_dummy,0,&
+                       cellatid,fnode,.true.)
+
+end procedure getneigh_dual_global
+
+!----------------------------------------------------------------
+!+
+!  Same dual tree walk on the local tree, stopping at icell
+!  (one round of the walk between two exchanges). If icell is
+!  an internal node, the src nodes not well separated from it
+!  are cached on icell, together with its expansion, so the
+!  walks of its descendants restart from there. If icell is a
+!  leaf, the src leaves it interacts with are returned in
+!  listneigh instead of particles
+!+
+!----------------------------------------------------------------
+module procedure getneigh_dual_frontier
+ real :: xyzcache_dummy(1,1)
+
+ call dual_walk_branch(node,cachestate,ifakeroot_depth,icell,listneigh,nneigh,xyzcache_dummy,0,&
+                       leaf_is_active,fnode,.true.)
+
+end procedure getneigh_dual_frontier
+
+!----------------------------------------------------------------
+!+
+!  reset the cache state of the global dual tree walk
+!+
+!----------------------------------------------------------------
+module procedure reset_cachestate_global
+
+ if (allocated(cachestate_glob)) then
+    if (size(cachestate_glob) < nnodes) deallocate(cachestate_glob)
+ endif
+ if (.not.allocated(cachestate_glob)) allocate(cachestate_glob(nnodes))
+ cachestate_glob(1:nnodes) = 0
+
+end procedure reset_cachestate_global
+
+!----------------------------------------------------------------
+!+
+!  cache a node of the local tree as fully cached: expansion at
+!  its level and src nodes left to open (e.g. a refined leaf
+!  seeded from the global walk, used as a fake root)
+!+
+!----------------------------------------------------------------
+module procedure cache_frontier_node
+
+ call cache_node(cachestate,icell,fnode,listsrc,nsrc)
+
+end procedure cache_frontier_node
+
+subroutine cache_node(cstate,icell,fnode,listsrc,nsrc)
+ integer, intent(inout) :: cstate(:)
+ integer, intent(in)    :: icell,nsrc
+ real,    intent(in)    :: fnode(lenfgrav)
+ integer, intent(in)    :: listsrc(:)
+ integer :: ibase
+
+ fnodecache(1:lenfgrav,icell) = fnode(1:lenfgrav)
+ !$omp atomic capture
+ ibase = itail_neigh
+ itail_neigh = itail_neigh + nsrc
+ !$omp end atomic
+ if (ibase+nsrc > size(neighnodecache)) call fatal('cache_node','frontier overflows the node cache')
+ neighnodecache(ibase+1:ibase+nsrc) = listsrc(1:nsrc)
+ neighnodecache_start(icell) = ibase
+ neighnodecache_count(icell) = nsrc
+ !$omp atomic write
+ cstate(icell) = 3
+ !$omp end atomic
+
+end subroutine cache_node
+
+!----------------------------------------------------------------
+!+
+!  Dual tree walk between the branch of icell and the tree
+!  (SFMM version), shared by the local and global walks.
+!  cstate is the cache state of the tree being walked.
+!  If idepth_root > 0, the branch of icell stops at its ancestor
+!  at this depth (fake root), which must be cached: the walk
+!  restarts from there, ignoring the nodes above it.
+!  If frontier, a leaf-leaf interaction stores the src leaf
+!  in listneigh instead of the particles it contains
+!+
+!----------------------------------------------------------------
+subroutine dual_walk_branch(node,cstate,idepth_root,icell,listneigh,nneigh,xyzcache,ixyzcachesize,&
+                            leaf_is_active,fnode,frontier)
+ type(kdnode), intent(in)    :: node(:)
+ integer,      intent(inout) :: cstate(:)
+ integer,      intent(in)    :: idepth_root
+ integer,      intent(in)    :: icell,ixyzcachesize
+ integer,      intent(out)   :: listneigh(:)
+ integer,      intent(out)   :: nneigh
+ real,         intent(out)   :: xyzcache(:,:)
+ integer,      intent(in)    :: leaf_is_active(:)
+ real,         intent(out)   :: fnode(lenfgrav)
+ logical,      intent(in)    :: frontier
+ integer :: istack,i,iparent,idstbranch,idst,isrc,maxcache,ibase,nodestate,dststate
  integer :: branch(maxdepth),nparents,stack(3,maxstacksize),startwith(2)
  real    :: dx,dy,dz,xoffset,yoffset,zoffset
  real    :: tree_acc2
  real    :: fnode_acc(lenfgrav)
- logical :: stackit
+ logical :: stackit,stop_at_icell
 
  tree_acc2 = tree_accuracy*tree_accuracy
+ !-- frontier on an internal node: the walk stops when dst reaches icell, and the
+ !   src nodes left to open are cached on icell, where the next walk restarts
+ stop_at_icell = frontier .and. (leaf_is_active(icell) == 0)
+ if (stop_at_icell .and. .not.use_cache) call fatal('dual_walk_branch','frontier walk needs use_cache')
 
  if (ixyzcachesize > 0) then
     maxcache = size(xyzcache,1)
@@ -153,7 +274,9 @@ module procedure getneigh_dual
     maxcache = 0
  endif
 
- call get_list_of_parent_nodes(icell,node,branch,nparents,startwith)
+ call get_list_of_parent_nodes(icell,node,cstate,idepth_root,branch,nparents,startwith)
+ if (idepth_root > 0 .and. (startwith(2) == 0 .or. .not.use_cache)) &
+    call fatal('dual_walk_branch','branch cut at a fake root that is not cached')
 
  neighnodecount_branch(1:nparents) = 0
  ! neighnode_branch(:,1:nparents) = 0 ! no need to reset neighnode_branch as neighnodecount_branch act as a switch
@@ -166,11 +289,13 @@ module procedure getneigh_dual
  zoffset = 0.
 
  if (use_cache .and. startwith(2) > 0) then
+    !-- icell is itself the cached (fake) root: restart from its own expansion
+    if (startwith(2) == 1) fnode_branch(1:lenfgrav,1) = fnodecache(1:lenfgrav,icell)
     do i=1,neighnodecache_count(startwith(1))
        isrc = neighnodecache(neighnodecache_start(startwith(1)) + i)
        call open_nodes(stack,istack,node(isrc),isrc,branch,startwith(2),&
                        listneigh,xyzcache,ixyzcachesize,nneigh,leaf_is_active,&
-                       maxcache,xoffset,yoffset,zoffset)
+                       maxcache,xoffset,yoffset,zoffset,frontier)
     enddo
  else
     istack = istack + 1
@@ -194,20 +319,34 @@ module procedure getneigh_dual
        yoffset = 0.
        zoffset = 0.
     else
-       call node_interaction(idst,node(idst),node(isrc),tree_acc2,fnode_branch(:,idstbranch),stackit,xoffset,yoffset,zoffset)
+       !-- skip the M2L if the expansion of a dst ancestor is already cached
+       !   (icell itself may be cached as a fake root, but its M2L is not complete)
+       dststate = 0
+       if (use_cache .and. idstbranch > 1) then
+          !$omp atomic read
+          dststate = cstate(idst)
+          !$omp end atomic
+       endif
+       call node_interaction(node(idst),node(isrc),tree_acc2,fnode_branch(:,idstbranch),stackit,(dststate<2),&
+                             xoffset,yoffset,zoffset)
     endif
 
     if (stackit) then
-       neighnodecount_branch(idstbranch) = neighnodecount_branch(idstbranch) + 1
-       !-- if count overflow, we will not cache it during the downward pass
-       if (neighnodecount_branch(idstbranch) <= maxnodecache_local) then
-          neighnode_branch(neighnodecount_branch(idstbranch),idstbranch) = isrc
+       if (stop_at_icell .and. idstbranch == 1) then
+          !-- dst reached the frontier: keep the src node for the next walk
+          nneigh = nneigh + 1
+          listneigh(nneigh) = isrc
+       else
+          neighnodecount_branch(idstbranch) = neighnodecount_branch(idstbranch) + 1
+          !-- if count overflow, we will not cache it during the downward pass
+          if (neighnodecount_branch(idstbranch) <= maxnodecache_local) then
+             neighnode_branch(neighnodecount_branch(idstbranch),idstbranch) = isrc
+          endif
+
+          call open_nodes(stack,istack,node(isrc),isrc,branch,idstbranch,&
+                          listneigh,xyzcache,ixyzcachesize,nneigh,leaf_is_active,&
+                          maxcache,xoffset,yoffset,zoffset,frontier)
        endif
-
-
-       call open_nodes(stack,istack,node(isrc),isrc,branch,idstbranch,&
-                       listneigh,xyzcache,ixyzcachesize,nneigh,leaf_is_active,&
-                       maxcache,xoffset,yoffset,zoffset)
     endif
  enddo
 
@@ -219,18 +358,18 @@ module procedure getneigh_dual
     ! -- Cache node if first thread to reach it or fetch fnode in memory
     if (use_cache) then
        !$omp atomic read
-       nodestate = cachestate(iparent)
+       nodestate = cstate(iparent)
        !$omp end atomic
        if (nodestate == 0) then ! first fence to avoid capture collision
           !$omp atomic capture
-          nodestate = cachestate(iparent)
-          cachestate(iparent) = max(cachestate(iparent),1)
+          nodestate = cstate(iparent)
+          cstate(iparent) = max(cstate(iparent),1)
           !$omp end atomic
           if (nodestate == 0) then ! if still the winner then cache
              !-- winner: publish fnode first ...
              fnodecache(1:lenfgrav,iparent) = fnode_branch(1:lenfgrav,i)
              !$omp atomic write
-             cachestate(iparent) = 2
+             cstate(iparent) = 2
              !$omp end atomic
 
              !-- then store interaction list in the cache array if it fits
@@ -244,7 +383,7 @@ module procedure getneigh_dual
                    neighnodecache_start(iparent) = ibase
                    neighnodecache_count(iparent) = neighnodecount_branch(i)
                    !$omp atomic write
-                   cachestate(iparent) = 3
+                   cstate(iparent) = 3
                    !$omp end atomic
                 endif
              endif
@@ -262,32 +401,50 @@ module procedure getneigh_dual
 
  fnode = fnode_acc + fnode_branch(:,1)
 
-end procedure getneigh_dual
+ !
+ !-- frontier: cache icell (expansion at its level + src nodes left to open), so that
+ !   the walks of its descendants restart from it (startwith in get_list_of_parent_nodes)
+ !
+ if (stop_at_icell) call cache_node(cstate,icell,fnode_branch(:,1),listneigh,nneigh)
+
+end subroutine dual_walk_branch
 
 !-----------------------------------------------------------
 !+
 !  return list of parents of current node
 !+
 !-----------------------------------------------------------
-subroutine get_list_of_parent_nodes(inode,node,parents,nparents,startwith)
+subroutine get_list_of_parent_nodes(inode,node,cstate,idepth_root,parents,nparents,startwith)
  integer,      intent(in)  :: inode
  type(kdnode), intent(in)  :: node(:)
+ integer,      intent(in)  :: cstate(:)
+ integer,      intent(in)  :: idepth_root
  integer,      intent(out) :: parents(:)
  integer,      intent(out) :: nparents
  integer,      intent(out) :: startwith(2)
- integer :: j,nodestate
+ integer :: j,nodestate,iroot_max
 
+ ! nodes above the fake root have indices < 2**idepth_root (heap indexing)
+ iroot_max = ishft(1,idepth_root+1) - 1
  j = inode
  nparents  = 1
  parents   = 0
  startwith = 0
  parents(nparents) = j ! set first elem to inode to use parents for propagation
+ if (idepth_root > 0 .and. j <= iroot_max) then
+    !-- inode is itself a fake root
+    !$omp atomic read
+    nodestate = cstate(j)
+    !$omp end atomic
+    if (nodestate==3) startwith = (/j,1/)
+    return
+ endif
  do while (node(j)%parent  /=  0)
     j = node(j)%parent
     nparents = nparents + 1
     parents(nparents) = j
     !$omp atomic read
-    nodestate = cachestate(j)
+    nodestate = cstate(j)
     !$omp end atomic
     if (nodestate==3 .and. startwith(2)==0) then
        ! deepest fully-cached ancestor: candidate pruned start
@@ -296,6 +453,11 @@ subroutine get_list_of_parent_nodes(inode,node,parents,nparents,startwith)
     elseif (nodestate<2 .and. startwith(2)/=0) then
        ! if non-cached ancestor node on the pruned branch reset the pruned start
        startwith = 0
+    endif
+    if (idepth_root > 0 .and. j <= iroot_max) then
+       !-- the branch stops at the fake root, the fallback start if none below is usable
+       if (startwith(2)==0 .and. nodestate==3) startwith = (/j,nparents/)
+       exit
     endif
  enddo
 
@@ -365,7 +527,7 @@ end subroutine get_node_size
 !-----------------------------------------------------------
 subroutine open_nodes(stack,istack,srcnode,isrc,branch,idstbranch,&
                            listneigh,xyzcache,ixyzcachesize,nneigh,leaf_is_active,&
-                           maxcache,xoffset,yoffset,zoffset)
+                           maxcache,xoffset,yoffset,zoffset,frontier)
  use io, only:fatal
  type(kdnode), intent(in)    :: srcnode
  integer,      intent(in)    :: isrc,idstbranch
@@ -377,6 +539,7 @@ subroutine open_nodes(stack,istack,srcnode,isrc,branch,idstbranch,&
  integer,      intent(inout) :: stack(:,:),istack
  real,         intent(inout) :: xyzcache(:,:)
  real,         intent(in)    :: xoffset,yoffset,zoffset
+ logical,      intent(in)    :: frontier
  integer :: ir,il,ibranchnext,idstnext
  logical :: isdstleaf
 
@@ -396,7 +559,12 @@ subroutine open_nodes(stack,istack,srcnode,isrc,branch,idstbranch,&
 
  is_src_leaf: if (leaf_is_active(isrc) /= 0) then
     is_P2P: if (isdstleaf) then !-- P2P detected should be cached and tagged as neighbours
-       call cache_neighbours(nneigh,isrc,ixyzcachesize,maxcache,listneigh,xyzcache,xoffset,yoffset,zoffset)
+       if (frontier) then !-- frontier of the global tree: store the src leaf to restart from
+          nneigh = nneigh + 1
+          listneigh(nneigh) = isrc
+       else
+          call cache_neighbours(nneigh,isrc,ixyzcachesize,maxcache,listneigh,xyzcache,xoffset,yoffset,zoffset)
+       endif
     else ! then you're a leaf -> leaf lowering
        if (istack+1 > maxstacksize) call fatal('getneigh','stack overflow in getneigh')
        istack = istack + 1
@@ -425,22 +593,22 @@ end subroutine open_nodes
 
 !-----------------------------------------------------------
 !+
-!  Test the separation between the node pair and compute
-!  the interaction if needed
+!  Opening criterion between two nodes, and M2L on the dst
+!  node if they are well separated. The criterion is
+!  symmetric under the exchange of dst and src
 !+
 !-----------------------------------------------------------
-subroutine node_interaction(idst,node_dst,node_src,tree_acc2,fnode,stackit,xoffset,yoffset,zoffset)
+subroutine node_interaction(node_dst,node_src,tree_acc2,fnode,stackit,do_m2l,xoffset,yoffset,zoffset)
  type(kdnode), intent(in)    :: node_dst,node_src
- integer,      intent(in)    :: idst
  real,         intent(in)    :: tree_acc2
  real,         intent(inout) :: fnode(lenfgrav)
- real,         intent(out)   :: xoffset,yoffset,zoffset
  logical,      intent(out)   :: stackit
+ logical,      intent(in)    :: do_m2l
+ real,         intent(out)   :: xoffset,yoffset,zoffset
  real    :: dx,dy,dz,r2
  real    :: rcut_dst,rcut_src,rcut,rcut2
  real    :: size_dst,size_src
  logical :: wellsep
- integer :: dststate
 #ifdef GRAVITY
  real    :: dr1
 #endif
@@ -448,21 +616,13 @@ subroutine node_interaction(idst,node_dst,node_src,tree_acc2,fnode,stackit,xoffs
  call get_sep(node_dst%xcen,node_src%xcen,dx,dy,dz,xoffset,yoffset,zoffset,r2)
  call get_node_size(node_dst,node_src,size_dst,size_src,rcut_dst,rcut_src)
 
- if (use_cache) then
-    !$omp atomic read
-    dststate = cachestate(idst)
-    !$omp end atomic
- else
-    dststate = 0
- endif
-
  rcut  = max(rcut_dst,rcut_src)
  rcut2 = (size_dst+size_src+rcut)**2
  wellsep = (tree_acc2*r2 > (size_dst+size_src)**2) .and. (r2 > rcut2)
 
  if (wellsep) then
 #ifdef GRAVITY
-    if (dststate<2) then
+    if (do_m2l) then
        dr1 = 1./sqrt(r2)
        call compute_M2L(dx,dy,dz,dr1,node_src%mass,node_src%quads,fnode)
        call add_torque_correction(dx,dy,dz,dr1,node_dst%mass,node_src%mass, &

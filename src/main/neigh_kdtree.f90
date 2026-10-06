@@ -39,6 +39,10 @@ module neighkdtree
  real, public                       :: dxcell
  real, public                       :: dcellx = 0.,dcelly = 0.,dcellz = 0.
  logical, public                    :: use_dualtree = .true.
+ ! MPI: dual tree walk from the global tree, then in rounds of kslab_mpi levels on
+ ! the local tree (remote sources not shipped yet: for development only)
+ logical, public                    :: use_dualtree_mpi = .false.
+ integer, public                    :: kslab_mpi = 3
  integer                            :: globallevel,refinelevels
 
  public :: allocate_neigh, deallocate_neigh
@@ -47,6 +51,7 @@ module neighkdtree
  public :: set_hmaxcell,get_hmaxcell
  public :: get_cell_location
  public :: sync_hmax_mpi
+ public :: get_global_pairs,dualwalk_rounds,start_local_rounds
 
  private
 
@@ -334,7 +339,7 @@ subroutine get_neighbour_list(inode,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesi
 
  get_f = (gravity .and. present(f))
 
- if (mpi .and. global_search) then ! no sym fmm for now...
+ if (mpi .and. global_search .and. .not.(get_f .and. use_dualtree_mpi)) then ! no sym fmm for now...
     ! Find MPI tasks that have neighbours of this cell, output to remote_export
     call getneigh(nodeglobal,xpos,xsizei,rcuti,mylistneigh,nneigh,xyzcache,ixyzcachesize,&
                   cellatid,get_j,get_f,fgrav_global,remote_export)
@@ -344,7 +349,7 @@ subroutine get_neighbour_list(inode,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesi
  endif
 
  ! Find neighbours of this cell on this node
- if (get_f .and. .not.(mpi) .and. use_dualtree) then
+ if (get_f .and. use_dualtree .and. (.not.mpi .or. use_dualtree_mpi)) then
     call getneigh_dual(node,xpos,xsizei,rcuti,mylistneigh,nneigh,xyzcache,ixyzcachesize,&
                           leaf_is_active,get_j,get_f,fgrav,inode)
  else
@@ -355,6 +360,208 @@ subroutine get_neighbour_list(inode,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesi
  if (get_f) f = fgrav + fgrav_global
 
 end subroutine get_neighbour_list
+
+!-----------------------------------------------------------------------
+!+
+!  dual tree walk on the global (refined) tree, one refined leaf of this
+!  task at a time (same walk as getneigh_dual), stopping at the frontier
+!  between refined and local nodes. Returns, for each refined leaf, the
+!  M2L expansion inherited from all its ancestors, and the pairs of
+!  refined leaves that are not well separated: this is the restart state
+!  of the walk on the local trees, with local (owner = id) or remote sources
+!
+!  fnode_leaf(:,j) : expansion at refined leaf j (local node 2**refinelevels+j-1)
+!  pairs(:,i)      : (dst,src) global indices of the refined leaves, owner of src
+!+
+!-----------------------------------------------------------------------
+subroutine get_global_pairs(fnode_leaf,npairs,pairs)
+ use io,     only:id,nprocs,fatal
+ use kdtree, only:getneigh_dual_global,reset_cachestate_global,lenfgrav
+ real,    allocatable, intent(inout) :: fnode_leaf(:,:)
+ integer,              intent(out)   :: npairs
+ integer, allocatable, intent(inout) :: pairs(:,:)
+ integer :: nleaves,nnodes,ifirstleaf,j,k,icell,ibase,nneigh
+
+ if (iand(nprocs,nprocs-1) /= 0) call fatal('get_global_pairs','number of MPI tasks must be a power of 2')
+
+ nleaves    = 2**refinelevels
+ ifirstleaf = 2**(globallevel+refinelevels) + id*nleaves
+ nnodes     = 2**(globallevel+refinelevels+1) - 1
+ ! the node caches of the tree walk are shared with the local tree
+ if (nnodes > ncellsmax+1) call fatal('get_global_pairs','global tree larger than ncellsmax')
+
+ if (allocated(fnode_leaf)) then
+    if (size(fnode_leaf,2) < nleaves) deallocate(fnode_leaf)
+ endif
+ if (.not.allocated(fnode_leaf)) allocate(fnode_leaf(lenfgrav,nleaves))
+ if (.not.allocated(pairs)) allocate(pairs(3,max(16*nleaves,1024)))
+
+ ! each leaf reserves its slots in the pair list with one atomic update. The list
+ ! cannot grow inside the loop: if it is too small, the walk is redone once it has
+ ! been resized to the number of pairs found (the list is kept between calls)
+ do
+    call reset_cachestate_global(nnodes)
+    npairs = 0
+
+    !$omp parallel do default(none) schedule(dynamic) &
+    !$omp shared(nleaves,ifirstleaf,nodeglobal,cellatid,fnode_leaf,npairs,pairs) &
+    !$omp private(j,k,icell,ibase,nneigh)
+    do j=1,nleaves
+       icell = ifirstleaf + j - 1
+       call getneigh_dual_global(nodeglobal,cellatid,icell,listneigh,nneigh,fnode_leaf(:,j))
+
+       !$omp atomic capture
+       ibase  = npairs
+       npairs = npairs + nneigh
+       !$omp end atomic
+
+       if (ibase + nneigh <= size(pairs,2)) then
+          do k=1,nneigh
+             pairs(1,ibase+k) = icell
+             pairs(2,ibase+k) = listneigh(k)
+             pairs(3,ibase+k) = cellatid(listneigh(k)) - 1
+          enddo
+       endif
+    enddo
+    !$omp end parallel do
+
+    if (npairs <= size(pairs,2)) exit
+    deallocate(pairs)
+    allocate(pairs(3,2*npairs))
+ enddo
+
+end subroutine get_global_pairs
+
+!-----------------------------------------------------------------------
+!+
+!  start the walk of the local tree from the global walk: each refined
+!  leaf of this task is cached as a fake root, with its expansion and the
+!  local src refined leaves left to open (the remote ones are not handled
+!  yet), then the local tree is walked in rounds of kslab_mpi levels
+!+
+!-----------------------------------------------------------------------
+subroutine start_local_rounds(fnode_leaf,npairs,pairs)
+ use io,     only:id,fatal
+ use kdtree, only:cache_frontier_node,global_to_local,ifakeroot_depth,maxlevel_indexed
+ real,    intent(in) :: fnode_leaf(:,:)
+ integer, intent(in) :: npairs
+ integer, intent(in) :: pairs(:,:)
+ integer, allocatable :: ioffset(:),ifill(:),listsrc(:)
+ integer :: nleaves,ifirstleaf,i,j,irank,ksrc,nrounds,nfrontier
+
+ if (refinelevels >= maxlevel_indexed) call fatal('start_local_rounds','refined leaves are not heap indexed')
+ nleaves    = 2**refinelevels
+ ifirstleaf = 2**(globallevel+refinelevels) + id*nleaves
+
+ ! local src of each refined leaf: listsrc(ioffset(j)+1:ioffset(j+1))
+ allocate(ioffset(nleaves+1),ifill(nleaves),listsrc(max(npairs,1)))
+ ioffset = 0
+ do i=1,npairs
+    if (pairs(3,i) /= id) cycle
+    j = pairs(1,i) - ifirstleaf + 1
+    ioffset(j+1) = ioffset(j+1) + 1
+ enddo
+ do j=2,nleaves+1
+    ioffset(j) = ioffset(j) + ioffset(j-1)
+ enddo
+ ifill = ioffset(1:nleaves)
+ do i=1,npairs
+    if (pairs(3,i) /= id) cycle
+    j = pairs(1,i) - ifirstleaf + 1
+    call global_to_local(pairs(2,i),globallevel,irank,ksrc)
+    ifill(j) = ifill(j) + 1
+    listsrc(ifill(j)) = ksrc
+ enddo
+
+ ! refined leaf j is the local node nleaves+j-1
+ !$omp parallel do default(none) schedule(static) &
+ !$omp shared(nleaves,ioffset,listsrc,fnode_leaf) private(j)
+ do j=1,nleaves
+    call cache_frontier_node(nleaves+j-1,fnode_leaf(:,j),listsrc(ioffset(j)+1:ioffset(j+1)),&
+                             ioffset(j+1)-ioffset(j))
+ enddo
+ !$omp end parallel do
+
+ ifakeroot_depth = refinelevels
+ call dualwalk_rounds(kslab_mpi,refinelevels,nrounds,nfrontier)
+
+end subroutine start_local_rounds
+
+!-----------------------------------------------------------------------
+!+
+!  dual tree walk on the local tree in rounds of kslab levels: round r
+!  walks every internal node at depth idepth0+r*kslab and stops
+!  there, caching the node with the src nodes left to open and its
+!  expansion. Each round restarts from the frontier cached by the
+!  previous one, and the walks of the leaves (getneigh_dual) restart from
+!  the last frontier. With MPI, the exchange of the remote nodes needed
+!  by the next round takes place between two rounds
+!+
+!-----------------------------------------------------------------------
+subroutine dualwalk_rounds(kslab,idepth0,nrounds,nfrontier)
+ use io,     only:fatal
+ use kdtree, only:getneigh_dual_frontier,lenfgrav,irootnode,use_cache
+ integer, intent(in)  :: kslab,idepth0
+ integer, intent(out) :: nrounds,nfrontier
+ integer, allocatable :: inode(:),iround(:),frontier(:),nfirst(:),ifill(:)
+ integer :: istack,n,idep,i,ir,nneigh
+ integer :: stack(2,128)
+ real    :: fnode(lenfgrav)
+
+ nrounds   = 0
+ nfrontier = 0
+ if (kslab < 1) call fatal('dualwalk_rounds','slab depth must be >= 1')
+ if (.not.use_cache) call fatal('dualwalk_rounds','dual tree walk in rounds needs use_cache')
+
+ ! internal nodes at depths multiple of kslab, found by walking down from the root
+ ! (nodes are not all heap indexed, and unused slots may hold stale nodes)
+ allocate(inode(ncells),iround(ncells))
+ istack = 1
+ stack(:,istack) = (/irootnode,0/)
+ do while(istack > 0)
+    n      = stack(1,istack)
+    idep   = stack(2,istack)
+    istack = istack - 1
+    if (node(n)%leftchild == 0 .or. leaf_is_active(n) /= 0) cycle
+    if (idep > idepth0 .and. mod(idep-idepth0,kslab) == 0) then
+       nfrontier = nfrontier + 1
+       inode(nfrontier)  = n
+       iround(nfrontier) = (idep-idepth0)/kslab
+       nrounds = max(nrounds,iround(nfrontier))
+    endif
+    if (istack+2 > size(stack,2)) call fatal('dualwalk_rounds','stack overflow')
+    stack(:,istack+1) = (/node(n)%leftchild,idep+1/)
+    stack(:,istack+2) = (/node(n)%rightchild,idep+1/)
+    istack = istack + 2
+ enddo
+
+ ! counting sort by round: round r is frontier(nfirst(r):nfirst(r+1)-1)
+ allocate(nfirst(nrounds+1),ifill(nrounds),frontier(max(nfrontier,1)))
+ nfirst = 0
+ do i=1,nfrontier
+    nfirst(iround(i)+1) = nfirst(iround(i)+1) + 1
+ enddo
+ nfirst(1) = 1
+ do ir=2,nrounds+1
+    nfirst(ir) = nfirst(ir) + nfirst(ir-1)
+ enddo
+ ifill = nfirst(1:nrounds)
+ do i=1,nfrontier
+    frontier(ifill(iround(i))) = inode(i)
+    ifill(iround(i)) = ifill(iround(i)) + 1
+ enddo
+
+ do ir=1,nrounds
+    !$omp parallel do default(none) schedule(dynamic) &
+    !$omp shared(ir,nfirst,frontier,node,leaf_is_active) &
+    !$omp private(i,nneigh,fnode)
+    do i=nfirst(ir),nfirst(ir+1)-1
+       call getneigh_dual_frontier(node,leaf_is_active,frontier(i),listneigh,nneigh,fnode)
+    enddo
+    !$omp end parallel do
+ enddo
+
+end subroutine dualwalk_rounds
 
 !-----------------------------------------------------------------------
 !+

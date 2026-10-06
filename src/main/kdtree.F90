@@ -34,6 +34,7 @@ module kdtree
  integer, public,  allocatable :: inodeparts(:)
  type(kdnode),     allocatable :: refinementnode(:)
  integer,          allocatable :: cachestate(:)
+ integer,          allocatable :: cachestate_glob(:) ! cache state of the global (refined) tree walk
  integer,          allocatable :: neighnodecount_branch(:)
  integer,          allocatable :: neighnode_branch(:,:)
  integer,          allocatable :: neighnodecache(:)
@@ -57,6 +58,9 @@ module kdtree
  real,    public  :: tree_accuracy    = 0.5
  logical, public  :: use_geosplit     = .true.
  logical, public  :: use_cache        = .true.
+ ! depth of the fake roots: the walks of the local tree stop at this depth (the
+ ! refined leaves under MPI, seeded from the global walk), 0 = real root
+ integer, public  :: ifakeroot_depth  = 0
  ! scratch space for the parallel partition in build_top_parallel
  real,    allocatable, private :: tcbuf(:,:)
  integer, allocatable, private :: ipbuf(:)
@@ -69,6 +73,9 @@ module kdtree
  public :: allocate_kdtree, deallocate_kdtree
  public :: maketree, revtree, getneigh,getneigh_dual,kdnode,lenfgrav
  public :: maketreeglobal
+ public :: getneigh_dual_global,getneigh_dual_frontier,reset_cachestate_global
+ public :: cache_frontier_node
+ public :: node_depth,global_to_local,local_to_global
  public :: empty_tree
  public :: compute_M2L,expand_fgrav_in_taylor_series
  integer, public :: maxlevel_indexed, maxlevel
@@ -219,6 +226,56 @@ module kdtree
   end subroutine getneigh_dual
  end interface
 
+!----------------------------------------------------------------
+!+
+!  Same dual tree walk on the global (refined) tree, for one
+!  refined leaf of this task, stopping at the frontier between
+!  refined and local nodes. Returns the src refined leaves that
+!  are not well separated from icell in listneigh
+!+
+!----------------------------------------------------------------
+ interface
+  module subroutine getneigh_dual_global(nodeglobal,cellatid,icell,listneigh,nneigh,fnode)
+   type(kdnode), intent(in)  :: nodeglobal(:)
+   integer,      intent(in)  :: cellatid(:)
+   integer,      intent(in)  :: icell
+   integer,      intent(out) :: listneigh(:)
+   integer,      intent(out) :: nneigh
+   real,         intent(out) :: fnode(lenfgrav)
+  end subroutine getneigh_dual_global
+ end interface
+
+!----------------------------------------------------------------
+!+
+!  Same dual tree walk on the local tree, stopping at icell
+!  (one round of the walk between two exchanges)
+!+
+!----------------------------------------------------------------
+ interface
+  module subroutine getneigh_dual_frontier(node,leaf_is_active,icell,listneigh,nneigh,fnode)
+   type(kdnode), intent(in)  :: node(:)
+   integer,      intent(in)  :: leaf_is_active(:)
+   integer,      intent(in)  :: icell
+   integer,      intent(out) :: listneigh(:)
+   integer,      intent(out) :: nneigh
+   real,         intent(out) :: fnode(lenfgrav)
+  end subroutine getneigh_dual_frontier
+ end interface
+
+ interface
+  module subroutine cache_frontier_node(icell,fnode,listsrc,nsrc)
+   integer, intent(in) :: icell,nsrc
+   real,    intent(in) :: fnode(lenfgrav)
+   integer, intent(in) :: listsrc(:)
+  end subroutine cache_frontier_node
+ end interface
+
+ interface
+  module subroutine reset_cachestate_global(nnodes)
+   integer, intent(in) :: nnodes
+  end subroutine reset_cachestate_global
+ end interface
+
 !-----------------------------------------------------------
 !+
 !  Compute the Taylor expansion coeffs between the node
@@ -289,6 +346,7 @@ subroutine deallocate_kdtree
  if (allocated(inodeparts)) deallocate(inodeparts)
  if (mpi .and. allocated(refinementnode)) deallocate(refinementnode)
  if (allocated(cachestate)) deallocate(cachestate)
+ if (allocated(cachestate_glob)) deallocate(cachestate_glob)
  if (allocated(fnodecache)) deallocate(fnodecache)
  if (allocated(neighnodecache)) deallocate(neighnodecache)
  if (allocated(neighnodecache_start)) deallocate(neighnodecache_start)
@@ -330,5 +388,49 @@ subroutine empty_tree(node)
 
 end subroutine empty_tree
 
+!-----------------------------------------------------------------------
+!+
+!  depth of a node in the heap indexed tree (root is depth 0)
+!+
+!-----------------------------------------------------------------------
+pure integer function node_depth(inode)
+ integer, intent(in) :: inode
+
+ node_depth = bit_size(inode) - leadz(inode) - 1
+
+end function node_depth
+
+!-----------------------------------------------------------------------
+!+
+!  map a node of the global tree at depth >= globallevel to the task
+!  that owns it and to its index in the local tree of that task
+!+
+!-----------------------------------------------------------------------
+pure subroutine global_to_local(iglobal,globallevel,irank,ilocal)
+ integer, intent(in)  :: iglobal,globallevel
+ integer, intent(out) :: irank,ilocal
+ integer :: idepth,ioffset
+
+ idepth  = node_depth(iglobal) - globallevel
+ ioffset = iglobal - ishft(1,node_depth(iglobal))
+ irank   = ishft(ioffset,-idepth)
+ ilocal  = ishft(1,idepth) + iand(ioffset,ishft(1,idepth)-1)
+
+end subroutine global_to_local
+
+!-----------------------------------------------------------------------
+!+
+!  map a node of the local tree of task irank to the global tree
+!  (inverse of global_to_local)
+!+
+!-----------------------------------------------------------------------
+pure integer function local_to_global(ilocal,irank,globallevel)
+ integer, intent(in) :: ilocal,irank,globallevel
+ integer :: idepth
+
+ idepth = node_depth(ilocal)
+ local_to_global = ishft(1,globallevel+idepth) + irank*ishft(1,idepth) + (ilocal - ishft(1,idepth))
+
+end function local_to_global
 
 end module kdtree

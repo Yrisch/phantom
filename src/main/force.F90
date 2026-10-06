@@ -64,6 +64,12 @@ module forces
 
  public :: force, reconstruct_dv, get_drag_terms ! latter to avoid compiler warning
 
+ ! global dual tree walk (MPI): expansion at the refined leaves of this task and
+ ! pairs of refined leaves left to open (dst,src,owner of src), local or remote
+ real,    allocatable :: fnode_leaf(:,:)
+ integer, allocatable :: global_pairs(:,:)
+ integer              :: nglobal_pairs = 0
+
  !--indexing for xpartveci array
  integer, parameter :: &
        ixi             = 1,  &
@@ -238,6 +244,8 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
  use mpiderivs,    only:send_cell,recv_cells,check_send_finished,init_cell_exchange,&
                         finish_cell_exchange,recv_while_wait,reset_cell_counters,cell_counters,&
                         init_send_requests
+ use neighkdtree,  only:use_dualtree
+ use kdtree,       only:ifakeroot_depth
  use mpimemory,    only:reserve_stack,reset_stacks,get_cell,write_cell
  use mpimemory,    only:stack_remote  => force_stack_1
  use mpimemory,    only:stack_waiting => force_stack_2
@@ -406,6 +414,8 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
     call reset_stacks
     call reset_cell_counters(cell_counters)
  endif
+
+ if (mpi .and. gravity .and. use_dualtree .and. nprocs > 1) call dualwalk_global_force()
 
 !
 !-- verification for non-ideal MHD
@@ -911,7 +921,40 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
  if ( dtforce < dtcourant ) call summary_variable('dt',iosumdtf,0,0.0,0.0, .true. )
 #endif
 
+ ! the walks of the local tree restart from the real root outside force
+ ifakeroot_depth = 0
+
 end subroutine force
+
+!----------------------------------------------------------------
+!+
+!  symmetric dual tree walk on the global (refined) tree
+!  (step 1 of the dual tree walk over MPI: the pairs are only
+!   checked for now, the force is still computed by the old path)
+!+
+!----------------------------------------------------------------
+subroutine dualwalk_global_force()
+ use io,          only:iprint,iverbose,id,master,fatal
+ use mpiutils,    only:reduceall_mpi
+ use mpiforce,    only:check_pair_mirror
+ use neighkdtree, only:get_global_pairs,use_dualtree_mpi,start_local_rounds
+ integer :: nmismatch,nrem,ntot_loc,ntot_rem
+
+ call get_global_pairs(fnode_leaf,nglobal_pairs,global_pairs)
+ call check_pair_mirror(nglobal_pairs,global_pairs,nmismatch)
+
+ nrem      = count(global_pairs(3,1:nglobal_pairs) /= id)
+ nmismatch = int(reduceall_mpi('+',nmismatch))
+ ntot_loc  = int(reduceall_mpi('+',nglobal_pairs-nrem))
+ ntot_rem  = int(reduceall_mpi('+',nrem))
+ if (id==master .and. iverbose >= 1) write(iprint,"(a,i10,a,i10,a)") &
+    ' global dual walk: ',ntot_loc,' local pairs, ',ntot_rem,' remote pairs'
+ if (nmismatch > 0) call fatal('force','remote pairs of the global dual tree walk are not mirrored')
+
+ ! walk the local tree in rounds from the refined leaves (remote sources not shipped yet)
+ if (use_dualtree_mpi) call start_local_rounds(fnode_leaf,nglobal_pairs,global_pairs)
+
+end subroutine dualwalk_global_force
 
 !----------------------------------------------------------------
 !+
