@@ -27,6 +27,7 @@ module mpiforce
  public :: get_mpitype_of_cellforce
  public :: free_mpitype_of_cellforce
  public :: check_pair_mirror
+ public :: exchange_slabs
 
  integer, parameter :: ndata = 20 ! number of elements in the cell (including padding)
  integer, parameter :: nbytes_cellforce = 8 * maxxpartveciforce * minpart + &  !  xpartvec(maxxpartveciforce,minpart)
@@ -335,5 +336,52 @@ subroutine check_pair_mirror(npairs,pairs,nmismatch)
 #endif
 
 end subroutine check_pair_mirror
+
+!----------------------------------------------------------------
+!+
+!  exchange of the nodes received between two rounds of the walk:
+!  nsend(r) reals of sendbuf (grouped by destination task) go to
+!  task r-1, and nrecv(r) reals are received from it in recvbuf.
+!  The sizes carry a flag: anyactive if one task is active
+!+
+!----------------------------------------------------------------
+subroutine exchange_slabs(sendbuf,nsend,recvbuf,nrecv,active,anyactive)
+#ifdef MPI
+ use mpi
+ use mpiutils, only:mpierr
+#endif
+ real,              intent(in)    :: sendbuf(:)
+ integer,           intent(in)    :: nsend(nprocs)
+ real, allocatable, intent(inout) :: recvbuf(:)
+ integer,           intent(out)   :: nrecv(nprocs)
+ logical,           intent(in)    :: active
+ logical,           intent(out)   :: anyactive
+#ifdef MPI
+ integer :: isdispl(nprocs),irdispl(nprocs),irank,isize(2,nprocs),irsize(2,nprocs)
+
+ isize(1,:) = nsend
+ isize(2,:) = merge(1,0,active)
+ call MPI_ALLTOALL(isize,2,MPI_INTEGER,irsize,2,MPI_INTEGER,MPI_COMM_WORLD,mpierr)
+ nrecv     = irsize(1,:)
+ anyactive = any(irsize(2,:) > 0)
+ isdispl(1) = 0
+ irdispl(1) = 0
+ do irank=2,nprocs
+    isdispl(irank) = isdispl(irank-1) + nsend(irank-1)
+    irdispl(irank) = irdispl(irank-1) + nrecv(irank-1)
+ enddo
+ if (allocated(recvbuf)) deallocate(recvbuf)
+ allocate(recvbuf(max(sum(nrecv),1)))
+ call MPI_ALLTOALLV(sendbuf,nsend,isdispl,MPI_REAL8,recvbuf,nrecv,irdispl,MPI_REAL8,&
+                    MPI_COMM_WORLD,mpierr)
+#else
+ nrecv = nsend
+ anyactive = active
+ if (allocated(recvbuf)) deallocate(recvbuf)
+ allocate(recvbuf(max(sum(nrecv),1)))
+ recvbuf(1:sum(nrecv)) = sendbuf(1:sum(nsend))
+#endif
+
+end subroutine exchange_slabs
 
 end module mpiforce

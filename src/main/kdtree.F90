@@ -47,6 +47,8 @@ module kdtree
 !--tree parameters
 !
  integer,          parameter, public :: irootnode    = 1
+ ! leaf flag of a src node received from a remote task without its children
+ integer,          parameter, public :: isrc_truncated = -huge(1)
  character(len=1), parameter, public :: labelax(3)   = (/'x','y','z'/)
  integer,          parameter         :: maxdepth     = 64
  integer,          parameter         :: maxnodecache_local = 512
@@ -58,9 +60,6 @@ module kdtree
  real,    public  :: tree_accuracy    = 0.5
  logical, public  :: use_geosplit     = .true.
  logical, public  :: use_cache        = .true.
- ! depth of the fake roots: the walks of the local tree stop at this depth (the
- ! refined leaves under MPI, seeded from the global walk), 0 = real root
- integer, public  :: ifakeroot_depth  = 0
  ! scratch space for the parallel partition in build_top_parallel
  real,    allocatable, private :: tcbuf(:,:)
  integer, allocatable, private :: ipbuf(:)
@@ -73,8 +72,7 @@ module kdtree
  public :: allocate_kdtree, deallocate_kdtree
  public :: maketree, revtree, getneigh,getneigh_dual,kdnode,lenfgrav
  public :: maketreeglobal
- public :: getneigh_dual_global,getneigh_dual_frontier,reset_cachestate_global
- public :: cache_frontier_node
+ public :: getneigh_dual_global,getneigh_dual_from,getneigh_srcleaves,reset_cachestate_global
  public :: node_depth,global_to_local,local_to_global
  public :: empty_tree
  public :: compute_M2L,expand_fgrav_in_taylor_series
@@ -247,27 +245,42 @@ module kdtree
 
 !----------------------------------------------------------------
 !+
-!  Same dual tree walk on the local tree, stopping at icell
-!  (one round of the walk between two exchanges)
+!  Same dual tree walk, restarting from a fake root iroot (an
+!  ancestor of icell) with the src nodes left to open from it
+!  and its expansion, without the node cache
 !+
 !----------------------------------------------------------------
  interface
-  module subroutine getneigh_dual_frontier(node,leaf_is_active,icell,listneigh,nneigh,fnode)
-   type(kdnode), intent(in)  :: node(:)
-   integer,      intent(in)  :: leaf_is_active(:)
+  module subroutine getneigh_dual_from(node,leaf_is_active,srcnode,srcleaf,same_tree,iroot,srcstart,fnode_root,&
+                                       icell,listneigh,nneigh,listpend,npend,fnode)
+   type(kdnode), intent(in)  :: node(:),srcnode(:)
+   integer,      intent(in)  :: leaf_is_active(:),srcleaf(:)
+   logical,      intent(in)  :: same_tree
+   integer,      intent(in)  :: iroot
+   integer,      intent(in)  :: srcstart(:)
+   real,         intent(in)  :: fnode_root(lenfgrav)
    integer,      intent(in)  :: icell
-   integer,      intent(out) :: listneigh(:)
-   integer,      intent(out) :: nneigh
+   integer,      intent(out) :: listneigh(:),listpend(:)
+   integer,      intent(out) :: nneigh,npend
    real,         intent(out) :: fnode(lenfgrav)
-  end subroutine getneigh_dual_frontier
+  end subroutine getneigh_dual_from
  end interface
 
+!----------------------------------------------------------------
+!+
+!  particles of a list of src leaves, as neighbours of icell
+!+
+!----------------------------------------------------------------
  interface
-  module subroutine cache_frontier_node(icell,fnode,listsrc,nsrc)
-   integer, intent(in) :: icell,nsrc
-   real,    intent(in) :: fnode(lenfgrav)
-   integer, intent(in) :: listsrc(:)
-  end subroutine cache_frontier_node
+  module subroutine getneigh_srcleaves(node,icell,srcleaves,nsrc,listneigh,nneigh,xyzcache,ixyzcachesize)
+   type(kdnode), intent(in)  :: node(:)
+   integer,      intent(in)  :: icell,nsrc
+   integer,      intent(in)  :: srcleaves(:)
+   integer,      intent(out) :: listneigh(:)
+   integer,      intent(out) :: nneigh
+   real,         intent(out) :: xyzcache(:,:)
+   integer,      intent(in)  :: ixyzcachesize
+  end subroutine getneigh_srcleaves
  end interface
 
  interface

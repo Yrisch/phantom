@@ -656,6 +656,7 @@ subroutine test_FMM(ntests,npass)
  use testutils,       only:checkval,checkvalbuf_end,update_test_scores
  use sort_particles,  only:sort_part_id
  use dim, only:maxp,maxphase,mpi
+ use neighkdtree, only:use_dualtree_mpi
 
  integer, intent(inout) :: ntests,npass
  real :: x0(3),rmin,rmax,nx,psep,totvol,time,fsum(3),tsum(3)
@@ -664,8 +665,9 @@ subroutine test_FMM(ntests,npass)
  integer :: nfail(6),i
 
  if (id==master) write(*,"(/,a)") '--> testing linear and angular momentum conservation with symmetric fmm'
- if (mpi) then
-    if (id==master) write(*,"(/,a)") '--> skipped... No sym FMM with MPI'
+ ! the old MPI path (cells exported to remote tasks) is not a symmetric FMM
+ if (mpi .and. .not.use_dualtree_mpi) then
+    if (id==master) write(*,"(/,a)") '--> skipped... No sym FMM with MPI unless use_dualtree_mpi'
     return
  endif
  npart = 0
@@ -701,10 +703,10 @@ subroutine test_FMM(ntests,npass)
  ! do this test twice, to check the second star relaxes...
  do i=1,2
     if (i==2) x0 = [20.,0.,0.]
-    ! only set up particles on master, otherwise we will end up with n duplicates
-    if (id==master) then
-       call set_sphere('random',id,master,rmin,rmax,psep,hfact,npart,xyzh,npart_total,np_requested=np,xyz_origin=x0)
-    endif
+    ! each task keeps its share of the particles (all on one task would leave
+    ! some domains of the global tree empty with more than 2 tasks)
+    call set_sphere('random',id,master,rmin,rmax,psep,hfact,npart,xyzh,npart_total,np_requested=np,&
+                    xyz_origin=x0,mask=i_belong)
  enddo
  npartoftype(:) = 0
  npartoftype(istar) = int(reduceall_mpi('+',npart),kind=kind(npartoftype))

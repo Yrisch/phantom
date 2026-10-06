@@ -63,12 +63,15 @@ module forces
 #endif
 
  public :: force, reconstruct_dv, get_drag_terms ! latter to avoid compiler warning
+ public :: dualwalk_global_force,clear_ghosts
 
  ! global dual tree walk (MPI): expansion at the refined leaves of this task and
  ! pairs of refined leaves left to open (dst,src,owner of src), local or remote
  real,    allocatable :: fnode_leaf(:,:)
  integer, allocatable :: global_pairs(:,:)
  integer              :: nglobal_pairs = 0
+ ! ghost particles received for force (particles npart+1 to npart+nghost_force)
+ integer              :: nghost_force = 0
 
  !--indexing for xpartveci array
  integer, parameter :: &
@@ -244,8 +247,6 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
  use mpiderivs,    only:send_cell,recv_cells,check_send_finished,init_cell_exchange,&
                         finish_cell_exchange,recv_while_wait,reset_cell_counters,cell_counters,&
                         init_send_requests
- use neighkdtree,  only:use_dualtree
- use kdtree,       only:ifakeroot_depth
  use mpimemory,    only:reserve_stack,reset_stacks,get_cell,write_cell
  use mpimemory,    only:stack_remote  => force_stack_1
  use mpimemory,    only:stack_waiting => force_stack_2
@@ -414,8 +415,6 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
     call reset_stacks
     call reset_cell_counters(cell_counters)
  endif
-
- if (mpi .and. gravity .and. use_dualtree .and. nprocs > 1) call dualwalk_global_force()
 
 !
 !-- verification for non-ideal MHD
@@ -921,40 +920,282 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
  if ( dtforce < dtcourant ) call summary_variable('dt',iosumdtf,0,0.0,0.0, .true. )
 #endif
 
- ! the walks of the local tree restart from the real root outside force
- ifakeroot_depth = 0
-
 end subroutine force
 
 !----------------------------------------------------------------
 !+
-!  symmetric dual tree walk on the global (refined) tree
-!  (step 1 of the dual tree walk over MPI: the pairs are only
-!   checked for now, the force is still computed by the old path)
+!  dual tree walk over MPI, before force: walk of the global (refined)
+!  tree, then (use_dualtree_mpi) walk of the local tree in rounds with
+!  the nodes of the remote src exchanged between rounds, and exchange
+!  of the particles of the remote src leaves, as ghost particles after
+!  npart in the particle arrays. Called from derivs, as the ghosts are
+!  written in the arrays that force reads
 !+
 !----------------------------------------------------------------
-subroutine dualwalk_global_force()
+subroutine dualwalk_global_force(npart,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dustprop,dustfrac,&
+                                 eos_vars,dens,metrics,apr_level)
  use io,          only:iprint,iverbose,id,master,fatal
  use mpiutils,    only:reduceall_mpi
  use mpiforce,    only:check_pair_mirror
- use neighkdtree, only:get_global_pairs,use_dualtree_mpi,start_local_rounds
+ use neighkdtree, only:get_global_pairs,use_dualtree_mpi,start_local_rounds,check_dualtree_mpi
+ integer,         intent(in)    :: npart
+ real,            intent(inout) :: xyzh(:,:),vxyzu(:,:),Bevol(:,:),rad(:,:),radprop(:,:)
+ real,            intent(inout) :: dustprop(:,:),dustfrac(:,:),eos_vars(:,:),dens(:),metrics(:,:,:,:)
+ real(kind=4),    intent(inout) :: divcurlv(:,:)
+ integer(kind=1), intent(inout) :: apr_level(:)
  integer :: nmismatch,nrem,ntot_loc,ntot_rem
 
  call get_global_pairs(fnode_leaf,nglobal_pairs,global_pairs)
- call check_pair_mirror(nglobal_pairs,global_pairs,nmismatch)
 
- nrem      = count(global_pairs(3,1:nglobal_pairs) /= id)
- nmismatch = int(reduceall_mpi('+',nmismatch))
- ntot_loc  = int(reduceall_mpi('+',nglobal_pairs-nrem))
- ntot_rem  = int(reduceall_mpi('+',nrem))
- if (id==master .and. iverbose >= 1) write(iprint,"(a,i10,a,i10,a)") &
-    ' global dual walk: ',ntot_loc,' local pairs, ',ntot_rem,' remote pairs'
- if (nmismatch > 0) call fatal('force','remote pairs of the global dual tree walk are not mirrored')
+ if (check_dualtree_mpi) then
+    call check_pair_mirror(nglobal_pairs,global_pairs,nmismatch)
+    nrem      = count(global_pairs(3,1:nglobal_pairs) /= id)
+    nmismatch = int(reduceall_mpi('+',nmismatch))
+    ntot_loc  = int(reduceall_mpi('+',nglobal_pairs-nrem))
+    ntot_rem  = int(reduceall_mpi('+',nrem))
+    if (id==master .and. iverbose >= 1) write(iprint,"(a,i10,a,i10,a)") &
+       ' global dual walk: ',ntot_loc,' local pairs, ',ntot_rem,' remote pairs'
+    if (nmismatch > 0) call fatal('force','remote pairs of the global dual tree walk are not mirrored')
+ endif
 
- ! walk the local tree in rounds from the refined leaves (remote sources not shipped yet)
- if (use_dualtree_mpi) call start_local_rounds(fnode_leaf,nglobal_pairs,global_pairs)
+ if (use_dualtree_mpi) then
+    call start_local_rounds(fnode_leaf,nglobal_pairs,global_pairs)
+    call exchange_ghosts(npart,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dustprop,dustfrac,&
+                         eos_vars,dens,metrics,apr_level)
+ endif
 
 end subroutine dualwalk_global_force
+
+!----------------------------------------------------------------
+!+
+!  exchange of the particles of the remote src leaves of the walk in
+!  rounds: each task sends the particles of its leaves that are in a
+!  remote leaf-leaf pair to the owner of the remote leaf (by symmetry,
+!  the other task requests exactly these), and receives the particles
+!  of its remote src leaves, put as ghost particles after npart. For
+!  each leaf: its id, its number of particles and its centre, then for
+!  each particle its mass and the fields read for a neighbour in force
+!+
+!----------------------------------------------------------------
+subroutine exchange_ghosts(npart,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dustprop,dustfrac,&
+                           eos_vars,dens,metrics,apr_level)
+ use io,          only:nprocs,fatal
+ use mpiforce,    only:exchange_slabs
+ use neighkdtree, only:get_remote_leaves,set_ghost_leaves,node
+ use part,        only:treecache
+ integer,         intent(in)    :: npart
+ real,            intent(inout) :: xyzh(:,:),vxyzu(:,:),Bevol(:,:),rad(:,:),radprop(:,:)
+ real,            intent(inout) :: dustprop(:,:),dustfrac(:,:),eos_vars(:,:),dens(:),metrics(:,:,:,:)
+ real(kind=4),    intent(inout) :: divcurlv(:,:)
+ integer(kind=1), intent(inout) :: apr_level(:)
+ integer(kind=8), allocatable :: keysend(:),keyreq(:)
+ integer,         allocatable :: ifirst(:),icount(:)
+ real,            allocatable :: sendbuf(:),recvbuf(:),xcen(:,:),mass(:)
+ integer :: nsendkey,nreq,i,k,ileaf,irank,ip,ipos,nfield,n,nghost,ireq
+ integer :: nsend(nprocs),nrecv(nprocs)
+ logical :: anyflag
+ real    :: buf1(4096)
+
+ call get_remote_leaves(nsendkey,keysend,nreq,keyreq)
+
+ ! number of fields of a particle (its mass, then the fields read in force)
+ ipos = 0
+ call copy_ghost(.true.,1,buf1,ipos,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dustprop,dustfrac,&
+                 eos_vars,dens,metrics,apr_level)
+ nfield = ipos + 1
+
+ ! pack the leaves for each task, in increasing (task,leaf) order
+ nsend = 0
+ do i=1,nsendkey
+    irank = int(keysend(i)/2_8**32)
+    ileaf = int(mod(keysend(i),2_8**32))
+    n = inoderange(2,ileaf) - inoderange(1,ileaf) + 1
+    nsend(irank+1) = nsend(irank+1) + 5 + n*nfield
+ enddo
+ allocate(sendbuf(max(sum(nsend),1)))
+ ipos = 0
+ do i=1,nsendkey
+    ileaf = int(mod(keysend(i),2_8**32))
+    n = inoderange(2,ileaf) - inoderange(1,ileaf) + 1
+    sendbuf(ipos+1) = real(ileaf)
+    sendbuf(ipos+2) = real(n)
+    sendbuf(ipos+3:ipos+5) = node(ileaf)%xcen
+    ipos = ipos + 5
+    do k=inoderange(1,ileaf),inoderange(2,ileaf)
+       ip = abs(inodeparts(k))
+       if (ip > maxpsph) call fatal('exchange_ghosts','sink particles in the tree are not handled')
+       sendbuf(ipos+1) = treecache(5,k)
+       ipos = ipos + 1
+       call copy_ghost(.true.,ip,sendbuf,ipos,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dustprop,dustfrac,&
+                       eos_vars,dens,metrics,apr_level)
+    enddo
+ enddo
+
+ call exchange_slabs(sendbuf,nsend,recvbuf,nrecv,.true.,anyflag)
+
+ ! unpack: the leaves from each task come in the order of the requested leaves
+ allocate(ifirst(max(nreq,1)),icount(max(nreq,1)),xcen(3,max(nreq,1)),mass(max(sum(nrecv)/nfield,1)))
+ nghost = 0
+ ireq   = 0
+ ipos   = 0
+ do irank=0,nprocs-1
+    do while(ipos < sum(nrecv(1:irank+1)))
+       ireq = ireq + 1
+       if (ireq > nreq) call fatal('exchange_ghosts','more leaves received than requested')
+       if (keyreq(ireq) /= int(irank,8)*2_8**32 + nint(recvbuf(ipos+1),8)) &
+          call fatal('exchange_ghosts','leaf received is not the one requested')
+       n = nint(recvbuf(ipos+2))
+       xcen(:,ireq) = recvbuf(ipos+3:ipos+5)
+       ipos = ipos + 5
+       ifirst(ireq) = npart + nghost + 1
+       icount(ireq) = n
+       do k=1,n
+          nghost = nghost + 1
+          if (npart + nghost > size(xyzh,2)) &
+             call fatal('exchange_ghosts','no room for the ghost particles: increase maxp')
+          mass(nghost) = recvbuf(ipos+1)
+          ipos = ipos + 1
+          call copy_ghost(.false.,npart+nghost,recvbuf,ipos,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,&
+                          dustprop,dustfrac,eos_vars,dens,metrics,apr_level)
+       enddo
+    enddo
+ enddo
+ if (ireq /= nreq) call fatal('exchange_ghosts','fewer leaves received than requested')
+
+ call set_ghost_leaves(nreq,keyreq,ifirst,icount,xcen,npart,nghost,mass)
+ nghost_force = nghost
+
+end subroutine exchange_ghosts
+
+!----------------------------------------------------------------
+!+
+!  remove the ghost particles after force: their slots after npart
+!  are marked as dead so they are never taken as particles
+!+
+!----------------------------------------------------------------
+subroutine clear_ghosts(npart,xyzh)
+ use part, only:iphase,maxphase,maxp
+ integer, intent(in)    :: npart
+ real,    intent(inout) :: xyzh(:,:)
+
+ if (nghost_force > 0) then
+    xyzh(:,npart+1:npart+nghost_force) = 0.
+    if (maxphase==maxp) iphase(npart+1:npart+nghost_force) = 0
+ endif
+ nghost_force = 0
+
+end subroutine clear_ghosts
+
+!----------------------------------------------------------------
+!+
+!  copy the fields of particle i read for a neighbour in force to
+!  buf (pack) or from buf (unpack), from position ipos. Only the
+!  arrays allocated for all the particles are copied (the others
+!  are not used with this setup). Same order for both, by design
+!+
+!----------------------------------------------------------------
+subroutine copy_ghost(pack,i,buf,ipos,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dustprop,dustfrac,&
+                      eos_vars,dens,metrics,apr_level)
+ use part, only:gradh,alphaind,rho,dvdx,iphase,eta_nimhd,filfac,fxyz_dragold,ibin_old
+ logical,         intent(in)    :: pack
+ integer,         intent(in)    :: i
+ real,            intent(inout) :: buf(:)
+ integer,         intent(inout) :: ipos
+ real,            intent(inout) :: xyzh(:,:),vxyzu(:,:),Bevol(:,:),rad(:,:),radprop(:,:)
+ real,            intent(inout) :: dustprop(:,:),dustfrac(:,:),eos_vars(:,:),dens(:),metrics(:,:,:,:)
+ real(kind=4),    intent(inout) :: divcurlv(:,:)
+ integer(kind=1), intent(inout) :: apr_level(:)
+ integer :: nfull
+
+ nfull = size(xyzh,2)
+ call copy_r8(xyzh)
+ call copy_r8(vxyzu)
+ call copy_r4(divcurlv)
+ call copy_r8(Bevol)
+ call copy_r8(rad)
+ call copy_r8(radprop)
+ call copy_r8(dustprop)
+ call copy_r8(dustfrac)
+ call copy_r8(eos_vars)
+ call copy_r8_1(dens)
+ if (size(metrics,4) == nfull) then
+    if (pack) then
+       buf(ipos+1:ipos+size(metrics(:,:,:,i))) = reshape(metrics(:,:,:,i),(/size(metrics(:,:,:,i))/))
+    else
+       metrics(:,:,:,i) = reshape(buf(ipos+1:ipos+size(metrics(:,:,:,i))),shape(metrics(:,:,:,i)))
+    endif
+    ipos = ipos + size(metrics(:,:,:,i))
+ endif
+ call copy_i1(apr_level)
+ call copy_r4(gradh)
+ call copy_r4(alphaind)
+ call copy_r8_1(rho)
+ call copy_r4(dvdx)
+ call copy_i1(iphase)
+ call copy_r8(eta_nimhd)
+ call copy_r8_1(filfac)
+ call copy_r8(fxyz_dragold)
+ call copy_i1(ibin_old)
+
+contains
+
+subroutine copy_r8(a)
+ real, intent(inout) :: a(:,:)
+ integer :: nf
+
+ if (size(a,2) /= nfull) return
+ nf = size(a,1)
+ if (pack) then
+    buf(ipos+1:ipos+nf) = a(:,i)
+ else
+    a(:,i) = buf(ipos+1:ipos+nf)
+ endif
+ ipos = ipos + nf
+
+end subroutine copy_r8
+
+subroutine copy_r4(a)
+ real(kind=4), intent(inout) :: a(:,:)
+ integer :: nf
+
+ if (size(a,2) /= nfull) return
+ nf = size(a,1)
+ if (pack) then
+    buf(ipos+1:ipos+nf) = real(a(:,i))
+ else
+    a(:,i) = real(buf(ipos+1:ipos+nf),kind=4)
+ endif
+ ipos = ipos + nf
+
+end subroutine copy_r4
+
+subroutine copy_r8_1(a)
+ real, intent(inout) :: a(:)
+
+ if (size(a) /= nfull) return
+ if (pack) then
+    buf(ipos+1) = a(i)
+ else
+    a(i) = buf(ipos+1)
+ endif
+ ipos = ipos + 1
+
+end subroutine copy_r8_1
+
+subroutine copy_i1(a)
+ integer(kind=1), intent(inout) :: a(:)
+
+ if (size(a) /= nfull) return
+ if (pack) then
+    buf(ipos+1) = real(a(i))
+ else
+    a(i) = int(nint(buf(ipos+1)),kind=1)
+ endif
+ ipos = ipos + 1
+
+end subroutine copy_i1
+
+end subroutine copy_ghost
 
 !----------------------------------------------------------------
 !+

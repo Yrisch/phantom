@@ -205,12 +205,11 @@ end subroutine test_kdtree
 
 !-----------------------------------------------------------------------
 !+
-!   Test of the dual tree walk in rounds (dualwalk_rounds): the walk of
-!   each leaf restarting from the frontier cached by the last round must
-!   give the same neighbours and expansion as a full walk from the root.
-!   Done from the root, and from fake roots at depth R seeded by the walk
-!   of the global tree (emulated on the local tree, flagging the nodes at
-!   depth R as leaves), as with MPI
+!   Test of the dual tree walk in rounds (dualwalk_rounds): the src
+!   leaves and expansion of each leaf after the rounds must give the same
+!   neighbours and expansion as a full walk from the root. Done from the
+!   root, and from fake roots at depth R given by the walk of the tree
+!   truncated at depth R (as the walk of the global tree under MPI)
 !+
 !-----------------------------------------------------------------------
 subroutine test_dual_rounds(ntests,npass)
@@ -219,17 +218,17 @@ subroutine test_dual_rounds(ntests,npass)
  use neighkdtree, only:leaf_is_active,ncells,node,dualwalk_rounds
  use part,        only:npart,xyzh,hfact,massoftype,igas,maxphase,iphase,isetphase
  use kernel,      only:hfact_default
- use kdtree,      only:maketree,empty_tree,use_cache,lenfgrav,irootnode,ifakeroot_depth,&
-                       getneigh_dual_global,reset_cachestate_global,cache_frontier_node,maxlevel_indexed
+ use kdtree,      only:maketree,empty_tree,lenfgrav,irootnode,getneigh_dual_global,reset_cachestate_global
  use unifdis,     only:set_unifdis
  use testutils,   only:checkval,update_test_scores
  use mpidomain,   only:i_belong
  integer, intent(inout) :: ntests,npass
  integer, allocatable :: list(:),leaves(:),idepth_leaf(:),iflag(:)
- integer :: kslab,nrounds,nfrontier,nleaves,irootdepth,nneigh,iroots,k
+ integer, allocatable :: roots(:),istart(:),icount(:),srclist(:),rstart(:),rcount(:),srcrem(:,:)
+ real,    allocatable :: fnode_root(:,:)
+ integer :: kslab,nrounds,nleaves,irootdepth,nneigh,iroots,k,nroots,nsrc
  integer :: nfailed(4)
- real    :: fnode(lenfgrav),psep
- logical :: use_cache_saved
+ real    :: psep
 
  if (id==master) write(*,"(/,a)") '--> testing dual tree walk in rounds'
  psep  = 1./32.
@@ -241,49 +240,63 @@ subroutine test_dual_rounds(ntests,npass)
  if (maxphase==maxp) iphase(:) = isetphase(igas,iactive=.true.)
 
  allocate(list(maxp),leaves(maxp),idepth_leaf(maxp))
- use_cache_saved = use_cache
 
  do iroots=1,2
     do kslab=1,3
-       use_cache = .true.
-       ifakeroot_depth = 0
        call empty_tree(node)
        call maketree(node,xyzh,npart,leaf_is_active,ncells,apr_tree=.false.)
        call get_leaves(nleaves,leaves,idepth_leaf)
 
        if (iroots==1) then
-          ! rounds from the real root
+          ! from the real root, which has itself left to open
           irootdepth = 0
+          nroots = 1
+          allocate(roots(1),istart(1),icount(1),srclist(1),fnode_root(lenfgrav,1))
+          roots = irootnode
+          istart = 0
+          icount = 1
+          srclist = irootnode
+          fnode_root = 0.
        else
-          ! fake roots at the minimum leaf depth, seeded by the walk of the
-          ! tree truncated at that depth (the global walk under MPI)
-          irootdepth = min(minval(idepth_leaf(1:nleaves)),maxlevel_indexed-1)
+          ! fake roots at the minimum leaf depth, from the walk of the tree truncated
+          ! at that depth (the global walk under MPI)
+          irootdepth = minval(idepth_leaf(1:nleaves))
           allocate(iflag(ncells))
           iflag = 0
           call flag_depth(irootdepth,iflag)
+          nroots = count(iflag /= 0)
+          allocate(roots(nroots),istart(nroots),icount(nroots),srclist(nroots*nroots),fnode_root(lenfgrav,nroots))
           call reset_cachestate_global(int(ncells))
+          nroots = 0
+          nsrc   = 0
           do k=1,int(ncells)
              if (iflag(k) == 0) cycle
-             call getneigh_dual_global(node,iflag,k,list,nneigh,fnode)
-             call cache_frontier_node(k,fnode,list(1:nneigh),nneigh)
+             nroots = nroots + 1
+             call getneigh_dual_global(node,iflag,k,list,nneigh,fnode_root(:,nroots))
+             roots(nroots)  = k
+             istart(nroots) = nsrc
+             icount(nroots) = nneigh
+             srclist(nsrc+1:nsrc+nneigh) = list(1:nneigh)
+             nsrc = nsrc + nneigh
           enddo
           deallocate(iflag)
-          ifakeroot_depth = irootdepth
        endif
 
-       call dualwalk_rounds(kslab,irootdepth,nrounds,nfrontier)
-       if (id==master) write(*,"(a,i2,a,i2,a,i3,a,i8,a)") ' root depth ',irootdepth,', slab depth ',kslab,': ',&
-                                                         nrounds,' rounds, ',nfrontier,' frontier nodes'
+       ! no remote src: the remote lists are empty
+       allocate(rstart(nroots),rcount(nroots),srcrem(2,1))
+       rstart = 0
+       rcount = 0
+       call dualwalk_rounds(kslab,nroots,roots,istart,icount,srclist,rstart,rcount,srcrem,fnode_root,nrounds)
+       if (id==master) write(*,"(a,i2,a,i5,a,i2,a,i3,a)") ' root depth ',irootdepth,' (',nroots,&
+                                                         ' roots), slab depth ',kslab,': ',nrounds,' rounds'
        nfailed = 0
-       ! (from fake roots close to the leaves there may be nothing left to do in rounds)
-       if (iroots==1) call checkval(nrounds > 0,.true.,nfailed(1),'rounds done')
-       call check_leaf_walks(nleaves,leaves,irootdepth,nfailed(2:4))
+       call checkval(nrounds > 0,.true.,nfailed(1),'rounds done')
+       call check_leaf_walks(nleaves,leaves,nfailed(2:4))
        call update_test_scores(ntests,nfailed,npass)
+       deallocate(roots,istart,icount,srclist,fnode_root,rstart,rcount,srcrem)
     enddo
  enddo
 
- ifakeroot_depth = 0
- use_cache = use_cache_saved
  deallocate(list,leaves,idepth_leaf)
 
 end subroutine test_dual_rounds
@@ -352,37 +365,33 @@ end subroutine flag_depth
 
 !-----------------------------------------------------------------------
 !+
-!   compare, for every leaf, the walk restarting from the cache (with
-!   fake roots at depth irootdepth) with a full walk from the real root
+!   compare, for every leaf, the result of the walk in rounds with a full
+!   walk from the root
 !+
 !-----------------------------------------------------------------------
-subroutine check_leaf_walks(nleaves,leaves,irootdepth,nfailed)
+subroutine check_leaf_walks(nleaves,leaves,nfailed)
  use dim,         only:maxp
- use neighkdtree, only:leaf_is_active,node
- use kdtree,      only:getneigh_dual,use_cache,lenfgrav,ifakeroot_depth
+ use neighkdtree, only:leaf_is_active,node,get_leaf_walk
+ use kdtree,      only:getneigh_dual,use_cache,lenfgrav
  use testutils,   only:checkvalbuf,checkvalbuf_end
- integer, intent(in)    :: nleaves,leaves(:),irootdepth
+ integer, intent(in)    :: nleaves,leaves(:)
  integer, intent(inout) :: nfailed(3)
  integer, allocatable :: list(:),list_ref(:)
  integer :: i,j,icell,nneigh,nneigh_ref,nchecked(3),ierrmax(2)
  real    :: fnode(lenfgrav),fnode_ref(lenfgrav),errmax,xpos(3),xyzcache(1,1)
  real, parameter :: tol = 1.e-10
+ logical :: use_cache_saved
 
  allocate(list(maxp),list_ref(maxp))
+ use_cache_saved = use_cache
+ use_cache = .false.
  xpos     = 0.
  nchecked = 0
  ierrmax  = 0
  errmax   = 0.
  do i=1,nleaves
     icell = leaves(i)
-    ! walk restarting from the cache
-    use_cache = .true.
-    ifakeroot_depth = irootdepth
-    call getneigh_dual(node,xpos,0.,0.,list,nneigh,xyzcache,0,leaf_is_active,&
-                       .true.,.true.,fnode,icell)
-    ! full walk from the real root, ignoring the cache
-    use_cache = .false.
-    ifakeroot_depth = 0
+    call get_leaf_walk(icell,list,nneigh,xyzcache,0,fnode)
     call getneigh_dual(node,xpos,0.,0.,list_ref,nneigh_ref,xyzcache,0,leaf_is_active,&
                        .true.,.true.,fnode_ref,icell)
     call checkvalbuf(nneigh,nneigh_ref,0,'nneigh',nfailed(1),nchecked(1),ierrmax(1))
@@ -397,7 +406,7 @@ subroutine check_leaf_walks(nleaves,leaves,irootdepth,nfailed)
        call checkvalbuf(fnode(j),fnode_ref(j),tol,'fnode',nfailed(3),nchecked(3),errmax)
     enddo
  enddo
- use_cache = .true.
+ use_cache = use_cache_saved
  call checkvalbuf_end('nneigh',nchecked(1),nfailed(1),ierrmax(1),0)
  call checkvalbuf_end('neighbours',nchecked(2),nfailed(2),ierrmax(2),0)
  call checkvalbuf_end('fnode',nchecked(3),nfailed(3),errmax,tol)

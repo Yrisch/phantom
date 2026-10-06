@@ -43,6 +43,24 @@ module neighkdtree
  ! the local tree (remote sources not shipped yet: for development only)
  logical, public                    :: use_dualtree_mpi = .false.
  integer, public                    :: kslab_mpi = 3
+ ! check at each round that the remote pairs are mirrored (debug, costs 4 collectives)
+ logical, public                    :: check_dualtree_mpi = .true.
+ ! result of the walk in rounds for the leaves, as records (a leaf with remote src
+ ! left to open is walked again in the next round, adding a record): latest record of
+ ! each leaf (0 if not walked), previous record of the same leaf, its local src leaves
+ ! leafsrc(leafsrc_start+1:leafsrc_start+leafsrc_count), its remote src leaves (owner,id)
+ ! leafrem(:,leafrem_start+1:leafrem_start+leafrem_count), and the expansion
+ integer, allocatable :: leafslot(:),leafrec_prev(:),leafrec_cell(:)
+ integer, allocatable :: leafsrc(:),leafsrc_start(:),leafsrc_count(:)
+ integer, allocatable :: leafrem(:,:),leafrem_start(:),leafrem_count(:)
+ real,    allocatable :: fnode_leafcell(:,:)
+ integer              :: nleafslots = 0, nleafsrc = 0, nleafrem = 0
+ ! remote leaves received as ghost particles (after npart in the particle arrays):
+ ! (owner,leaf) sorted, first ghost particle, number of particles, centre of the leaf
+ integer(kind=8), allocatable :: ghostkey(:)
+ integer,         allocatable :: ghostfirst(:),ghostcount(:)
+ real,            allocatable :: ghostxcen(:,:),ghostmass(:)
+ integer                      :: nghostleaves = 0, ighostbase = 0
  integer                            :: globallevel,refinelevels
 
  public :: allocate_neigh, deallocate_neigh
@@ -51,7 +69,8 @@ module neighkdtree
  public :: set_hmaxcell,get_hmaxcell
  public :: get_cell_location
  public :: sync_hmax_mpi
- public :: get_global_pairs,dualwalk_rounds,start_local_rounds
+ public :: get_global_pairs,dualwalk_rounds,start_local_rounds,get_leaf_walk
+ public :: get_remote_leaves,set_ghost_leaves
 
  private
 
@@ -95,6 +114,11 @@ subroutine deallocate_neigh
  if (allocated(nodeglobal)) deallocate(nodeglobal)
  if (allocated(node)) deallocate(node)
  if (allocated(nodemap)) deallocate(nodemap)
+ if (allocated(leafslot)) deallocate(leafslot)
+ if (allocated(ghostkey)) deallocate(ghostkey,ghostfirst,ghostcount,ghostxcen)
+ if (allocated(ghostmass)) deallocate(ghostmass)
+ if (allocated(leafsrc)) deallocate(leafsrc,leafsrc_start,leafsrc_count,leafrec_prev,leafrec_cell,fnode_leafcell,&
+                                    leafrem,leafrem_start,leafrem_count)
 !$omp parallel
  if (allocated(listneigh)) deallocate(listneigh)
 !$omp end parallel
@@ -339,7 +363,13 @@ subroutine get_neighbour_list(inode,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesi
 
  get_f = (gravity .and. present(f))
 
- if (mpi .and. global_search .and. .not.(get_f .and. use_dualtree_mpi)) then ! no sym fmm for now...
+ if (mpi .and. get_f .and. use_dualtree_mpi) then
+    ! leaves walked in rounds from the global walk
+    call get_leaf_walk(inode,mylistneigh,nneigh,xyzcache,ixyzcachesize,f)
+    return
+ endif
+
+ if (mpi .and. global_search) then ! no sym fmm for now...
     ! Find MPI tasks that have neighbours of this cell, output to remote_export
     call getneigh(nodeglobal,xpos,xsizei,rcuti,mylistneigh,nneigh,xyzcache,ixyzcachesize,&
                   cellatid,get_j,get_f,fgrav_global,remote_export)
@@ -349,7 +379,7 @@ subroutine get_neighbour_list(inode,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesi
  endif
 
  ! Find neighbours of this cell on this node
- if (get_f .and. use_dualtree .and. (.not.mpi .or. use_dualtree_mpi)) then
+ if (get_f .and. .not.(mpi) .and. use_dualtree) then
     call getneigh_dual(node,xpos,xsizei,rcuti,mylistneigh,nneigh,xyzcache,ixyzcachesize,&
                           leaf_is_active,get_j,get_f,fgrav,inode)
  else
@@ -381,6 +411,7 @@ subroutine get_global_pairs(fnode_leaf,npairs,pairs)
  integer,              intent(out)   :: npairs
  integer, allocatable, intent(inout) :: pairs(:,:)
  integer :: nleaves,nnodes,ifirstleaf,j,k,icell,ibase,nneigh
+ logical :: allpairs
 
  if (iand(nprocs,nprocs-1) /= 0) call fatal('get_global_pairs','number of MPI tasks must be a power of 2')
 
@@ -390,16 +421,27 @@ subroutine get_global_pairs(fnode_leaf,npairs,pairs)
  ! the node caches of the tree walk are shared with the local tree
  if (nnodes > ncellsmax+1) call fatal('get_global_pairs','global tree larger than ncellsmax')
 
+ ! nleaves = 2**refinelevels is the number of refined leaves of each task, not of the
+ ! whole global level: this task only walks its own block of refined leaves
+ if (any(cellatid(ifirstleaf:ifirstleaf+nleaves-1) /= id+1)) &
+    call fatal('get_global_pairs','refined leaves walked are not all owned by this task')
+
+
  if (allocated(fnode_leaf)) then
     if (size(fnode_leaf,2) < nleaves) deallocate(fnode_leaf)
  endif
  if (.not.allocated(fnode_leaf)) allocate(fnode_leaf(lenfgrav,nleaves))
- if (.not.allocated(pairs)) allocate(pairs(3,max(16*nleaves,1024)))
 
+ npairs   = max(8*nleaves,512)
+ allpairs = .false.
  ! each leaf reserves its slots in the pair list with one atomic update. The list
  ! cannot grow inside the loop: if it is too small, the walk is redone once it has
  ! been resized to the number of pairs found (the list is kept between calls)
- do
+ do while(.not.allpairs)
+
+    if (allocated(pairs)) deallocate(pairs)
+    allocate(pairs(3,2*npairs))
+
     call reset_cachestate_global(nnodes)
     npairs = 0
 
@@ -424,144 +466,830 @@ subroutine get_global_pairs(fnode_leaf,npairs,pairs)
        endif
     enddo
     !$omp end parallel do
-
-    if (npairs <= size(pairs,2)) exit
-    deallocate(pairs)
-    allocate(pairs(3,2*npairs))
+    allpairs = (npairs <= size(pairs,2))
  enddo
 
 end subroutine get_global_pairs
 
 !-----------------------------------------------------------------------
 !+
-!  start the walk of the local tree from the global walk: each refined
-!  leaf of this task is cached as a fake root, with its expansion and the
-!  local src refined leaves left to open (the remote ones are not handled
-!  yet), then the local tree is walked in rounds of kslab_mpi levels
+!  walk of the local tree from the pairs of the global walk: for each
+!  refined leaf (dst), the local src as local nodes, and the remote src
+!  as (owner, node of the owner), then the walk in rounds of kslab_mpi
 !+
 !-----------------------------------------------------------------------
 subroutine start_local_rounds(fnode_leaf,npairs,pairs)
- use io,     only:id,fatal
- use kdtree, only:cache_frontier_node,global_to_local,ifakeroot_depth,maxlevel_indexed
+ use io,     only:id
+ use kdtree, only:global_to_local
  real,    intent(in) :: fnode_leaf(:,:)
  integer, intent(in) :: npairs
  integer, intent(in) :: pairs(:,:)
- integer, allocatable :: ioffset(:),ifill(:),listsrc(:)
- integer :: nleaves,ifirstleaf,i,j,irank,ksrc,nrounds,nfrontier
+ integer, allocatable :: roots(:),istart(:),icount(:),srclist(:),rstart(:),rcount(:),srcrem(:,:)
+ integer :: nleaves,ifirstleaf,i,j,irank,ksrc,nrounds
 
- if (refinelevels >= maxlevel_indexed) call fatal('start_local_rounds','refined leaves are not heap indexed')
  nleaves    = 2**refinelevels
  ifirstleaf = 2**(globallevel+refinelevels) + id*nleaves
 
- ! local src of each refined leaf: listsrc(ioffset(j)+1:ioffset(j+1))
- allocate(ioffset(nleaves+1),ifill(nleaves),listsrc(max(npairs,1)))
- ioffset = 0
+ allocate(roots(nleaves),istart(nleaves),icount(nleaves),rstart(nleaves),rcount(nleaves))
+ allocate(srclist(max(npairs,1)),srcrem(2,max(npairs,1)))
+ icount = 0
+ rcount = 0
  do i=1,npairs
-    if (pairs(3,i) /= id) cycle
     j = pairs(1,i) - ifirstleaf + 1
-    ioffset(j+1) = ioffset(j+1) + 1
+    if (pairs(3,i) == id) then
+       icount(j) = icount(j) + 1
+    else
+       rcount(j) = rcount(j) + 1
+    endif
  enddo
- do j=2,nleaves+1
-    ioffset(j) = ioffset(j) + ioffset(j-1)
+ istart(1) = 0
+ rstart(1) = 0
+ do j=2,nleaves
+    istart(j) = istart(j-1) + icount(j-1)
+    rstart(j) = rstart(j-1) + rcount(j-1)
  enddo
- ifill = ioffset(1:nleaves)
+ icount = 0
+ rcount = 0
  do i=1,npairs
-    if (pairs(3,i) /= id) cycle
     j = pairs(1,i) - ifirstleaf + 1
     call global_to_local(pairs(2,i),globallevel,irank,ksrc)
-    ifill(j) = ifill(j) + 1
-    listsrc(ifill(j)) = ksrc
+    if (irank == id) then
+       icount(j) = icount(j) + 1
+       srclist(istart(j)+icount(j)) = ksrc
+    else
+       rcount(j) = rcount(j) + 1
+       srcrem(:,rstart(j)+rcount(j)) = (/irank,ksrc/)
+    endif
  enddo
-
  ! refined leaf j is the local node nleaves+j-1
- !$omp parallel do default(none) schedule(static) &
- !$omp shared(nleaves,ioffset,listsrc,fnode_leaf) private(j)
  do j=1,nleaves
-    call cache_frontier_node(nleaves+j-1,fnode_leaf(:,j),listsrc(ioffset(j)+1:ioffset(j+1)),&
-                             ioffset(j+1)-ioffset(j))
+    roots(j) = nleaves + j - 1
  enddo
- !$omp end parallel do
 
- ifakeroot_depth = refinelevels
- call dualwalk_rounds(kslab_mpi,refinelevels,nrounds,nfrontier)
+ call dualwalk_rounds(kslab_mpi,nleaves,roots,istart,icount,srclist,rstart,rcount,srcrem,fnode_leaf,nrounds)
 
 end subroutine start_local_rounds
 
 !-----------------------------------------------------------------------
 !+
-!  dual tree walk on the local tree in rounds of kslab levels: round r
-!  walks every internal node at depth idepth0+r*kslab and stops
-!  there, caching the node with the src nodes left to open and its
-!  expansion. Each round restarts from the frontier cached by the
-!  previous one, and the walks of the leaves (getneigh_dual) restart from
-!  the last frontier. With MPI, the exchange of the remote nodes needed
-!  by the next round takes place between two rounds
+!  dual tree walk of the local tree in rounds, from a list of fake roots,
+!  each with its expansion and the src nodes it still has to open, local
+!  (srclist) or remote ((owner,node) in srcrem).
+!  Before each round, each task sends the subtree (kslab levels) of its
+!  fake roots with remote src to their owners, and receives the subtrees
+!  of its remote src (as the pairs are mirrored, no request is needed).
+!  In each round, the cells are the nodes kslab levels below each fake
+!  root (or the leaves above): each cell is walked from its fake root,
+!  over its local src then its remote src, and stops there. Its output
+!  makes the fake roots of the next round. The output of the leaves (src
+!  leaves + expansion) is kept for get_leaf_walk; a leaf with remote src
+!  left to open (truncated) is also a fake root of the next round
 !+
 !-----------------------------------------------------------------------
-subroutine dualwalk_rounds(kslab,idepth0,nrounds,nfrontier)
- use io,     only:fatal
- use kdtree, only:getneigh_dual_frontier,lenfgrav,irootnode,use_cache
- integer, intent(in)  :: kslab,idepth0
- integer, intent(out) :: nrounds,nfrontier
- integer, allocatable :: inode(:),iround(:),frontier(:),nfirst(:),ifill(:)
- integer :: istack,n,idep,i,ir,nneigh
- integer :: stack(2,128)
- real    :: fnode(lenfgrav)
+subroutine dualwalk_rounds(kslab,nroots_in,roots_in,istart_in,icount_in,srclist_in,&
+                           rstart_in,rcount_in,srcrem_in,fnode_in,nrounds)
+ use io,       only:fatal
+ use mpiutils, only:reduceall_mpi
+ use mpiforce, only:check_pair_mirror
+ use kdtree,   only:getneigh_dual_from,lenfgrav,kdnode
+ integer, intent(in)  :: kslab,nroots_in
+ integer, intent(in)  :: roots_in(:),istart_in(:),icount_in(:),srclist_in(:)
+ integer, intent(in)  :: rstart_in(:),rcount_in(:),srcrem_in(:,:)
+ real,    intent(in)  :: fnode_in(:,:)
+ integer, intent(out) :: nrounds
+ integer, allocatable :: roots(:),istart(:),icount(:),srclist(:),rstart(:),rcount(:),srcrem(:,:)
+ integer, allocatable :: roots_new(:),istart_new(:),icount_new(:),srclist_new(:)
+ integer, allocatable :: rstart_new(:),rcount_new(:),srcrem_new(:,:)
+ integer, allocatable :: cells(:),cellroot(:),rslot(:),rleaf(:),rowner(:),rid(:),lrem(:),lpend(:)
+ integer, allocatable :: pairs_chk(:,:)
+ real,    allocatable :: fnode_root(:,:),fnode_new(:,:)
+ type(kdnode), allocatable :: rnode(:)
+ integer :: nroots,ncell,nslab,nrnode,ir,ic,ibase,icell,nneigh,nrem,npend,islot,i0,j
+ integer :: nnew,nnewl,nnewr,nrec0,nleafsrc0,nleafrem0,nmismatch,nchk
+ logical :: allfit,anyroots
+ real    :: fnode(lenfgrav),fnode2(lenfgrav),fzero(lenfgrav)
 
- nrounds   = 0
- nfrontier = 0
  if (kslab < 1) call fatal('dualwalk_rounds','slab depth must be >= 1')
- if (.not.use_cache) call fatal('dualwalk_rounds','dual tree walk in rounds needs use_cache')
+ nslab = 2**kslab
+ fzero = 0.
 
- ! internal nodes at depths multiple of kslab, found by walking down from the root
- ! (nodes are not all heap indexed, and unused slots may hold stale nodes)
- allocate(inode(ncells),iround(ncells))
- istack = 1
- stack(:,istack) = (/irootnode,0/)
- do while(istack > 0)
-    n      = stack(1,istack)
-    idep   = stack(2,istack)
-    istack = istack - 1
-    if (node(n)%leftchild == 0 .or. leaf_is_active(n) /= 0) cycle
-    if (idep > idepth0 .and. mod(idep-idepth0,kslab) == 0) then
-       nfrontier = nfrontier + 1
-       inode(nfrontier)  = n
-       iround(nfrontier) = (idep-idepth0)/kslab
-       nrounds = max(nrounds,iround(nfrontier))
-    endif
-    if (istack+2 > size(stack,2)) call fatal('dualwalk_rounds','stack overflow')
-    stack(:,istack+1) = (/node(n)%leftchild,idep+1/)
-    stack(:,istack+2) = (/node(n)%rightchild,idep+1/)
-    istack = istack + 2
- enddo
+ nroots = nroots_in
+ allocate(roots(nroots),istart(nroots),icount(nroots),rstart(nroots),rcount(nroots),fnode_root(lenfgrav,nroots))
+ roots      = roots_in(1:nroots)
+ istart     = istart_in(1:nroots)
+ icount     = icount_in(1:nroots)
+ rstart     = rstart_in(1:nroots)
+ rcount     = rcount_in(1:nroots)
+ fnode_root = fnode_in(:,1:nroots)
+ allocate(srclist(max(size(srclist_in),1)),srcrem(2,max(size(srcrem_in,2),1)))
+ srclist(1:size(srclist_in)) = srclist_in
+ srcrem(:,1:size(srcrem_in,2)) = srcrem_in
 
- ! counting sort by round: round r is frontier(nfirst(r):nfirst(r+1)-1)
- allocate(nfirst(nrounds+1),ifill(nrounds),frontier(max(nfrontier,1)))
- nfirst = 0
- do i=1,nfrontier
-    nfirst(iround(i)+1) = nfirst(iround(i)+1) + 1
- enddo
- nfirst(1) = 1
- do ir=2,nrounds+1
-    nfirst(ir) = nfirst(ir) + nfirst(ir-1)
- enddo
- ifill = nfirst(1:nrounds)
- do i=1,nfrontier
-    frontier(ifill(iround(i))) = inode(i)
-    ifill(iround(i)) = ifill(iround(i)) + 1
- enddo
+ ! records of the leaves
+ if (.not.allocated(leafslot)) allocate(leafslot(size(node)))
+ leafslot(1:ncells) = 0
+ if (.not.allocated(leafsrc)) then
+    allocate(leafsrc(1024),leafsrc_start(1024),leafsrc_count(1024),leafrec_prev(1024),leafrec_cell(1024),&
+             fnode_leafcell(lenfgrav,1024))
+    allocate(leafrem(2,1024),leafrem_start(1024),leafrem_count(1024))
+ endif
+ nleafslots = 0
+ nleafsrc   = 0
+ nleafrem   = 0
 
- do ir=1,nrounds
+ ! nodes of the remote src of the first round (rnode(rslot(i)) is the remote src i), and
+ ! whether a task still has fake roots: the rounds go on as long as one has
+ nrounds = 0
+ call exchange_round(kslab,nroots,roots,rstart,rcount,srcrem,rnode,rleaf,rowner,rid,nrnode,rslot,anyroots)
+ do while(anyroots)
+    nrounds = nrounds + 1
+
+    ! cells of the round: each fake root reserves 2**kslab slots for its fake leaves
+    allocate(cells(max(nroots*nslab,1)),cellroot(max(nroots*nslab,1)))
+    ncell = 0
     !$omp parallel do default(none) schedule(dynamic) &
-    !$omp shared(ir,nfirst,frontier,node,leaf_is_active) &
-    !$omp private(i,nneigh,fnode)
-    do i=nfirst(ir),nfirst(ir+1)-1
-       call getneigh_dual_frontier(node,leaf_is_active,frontier(i),listneigh,nneigh,fnode)
+    !$omp shared(nroots,roots,cells,cellroot,ncell,nslab,kslab) private(ir,ibase)
+    do ir=1,nroots
+       !$omp atomic capture
+       ibase = ncell
+       ncell = ncell + nslab
+       !$omp end atomic
+       call get_fake_leaves(roots(ir),kslab,cells(ibase+1:ibase+nslab))
+       cellroot(ibase+1:ibase+nslab) = ir
     enddo
     !$omp end parallel do
+
+    ! walk each cell from its fake root; output reserved with one atomic per cell. The
+    ! lists cannot grow inside the loop: if they are too small, grow them and redo
+    allocate(roots_new(max(ncell,1)),istart_new(max(ncell,1)),icount_new(max(ncell,1)),&
+             rstart_new(max(ncell,1)),rcount_new(max(ncell,1)),fnode_new(lenfgrav,max(ncell,1)))
+    if (.not.allocated(srclist_new)) allocate(srclist_new(max(size(srclist),1024)))
+    if (.not.allocated(srcrem_new))  allocate(srcrem_new(2,max(size(srcrem,2),1024)))
+    nrec0     = nleafslots
+    nleafsrc0 = nleafsrc
+    nleafrem0 = nleafrem
+    allfit    = .false.
+    do while(.not.allfit)
+       nnew       = 0
+       nnewl      = 0
+       nnewr      = 0
+       nleafslots = nrec0
+       nleafsrc   = nleafsrc0
+       nleafrem   = nleafrem0
+       !$omp parallel default(none) &
+       !$omp shared(ncell,cells,cellroot,roots,istart,icount,srclist,rstart,rcount,rslot,fnode_root,fzero) &
+       !$omp shared(node,leaf_is_active,rnode,rleaf,rowner,rid,nrnode) &
+       !$omp shared(nnew,nnewl,nnewr,roots_new,istart_new,icount_new,srclist_new,rstart_new,rcount_new,srcrem_new) &
+       !$omp shared(fnode_new,nleafslots,nleafsrc,nleafrem,leafslot,leafrec_prev,leafrec_cell) &
+       !$omp shared(leafsrc,leafsrc_start,leafsrc_count) &
+       !$omp shared(leafrem,leafrem_start,leafrem_count,fnode_leafcell) &
+       !$omp private(ic,ir,icell,nneigh,nrem,npend,fnode,fnode2,islot,i0,j,lrem,lpend)
+       allocate(lrem(max(nrnode,1)),lpend(max(nrnode,1)))
+       !$omp do schedule(dynamic)
+       do ic=1,ncell
+          icell = cells(ic)
+          if (icell == 0) cycle
+          ir = cellroot(ic)
+          !-- local src, then remote src
+          call getneigh_dual_from(node,leaf_is_active,node,leaf_is_active,.true.,roots(ir),&
+                                  srclist(istart(ir)+1:istart(ir)+icount(ir)),fnode_root(:,ir),&
+                                  icell,listneigh,nneigh,lpend,npend,fnode)
+          if (npend /= 0) call fatal('dualwalk_rounds','truncated src in the local tree')
+          nrem  = 0
+          if (rcount(ir) > 0) then
+             call getneigh_dual_from(node,leaf_is_active,rnode,rleaf,.false.,roots(ir),&
+                                     rslot(rstart(ir)+1:rstart(ir)+rcount(ir)),fzero,&
+                                     icell,lrem,nrem,lpend,npend,fnode2)
+             fnode = fnode + fnode2
+          endif
+
+          if (leaf_is_active(icell) /= 0) then
+             !-- leaf: record its src leaves and expansion
+             !$omp atomic capture
+             islot = nleafslots
+             nleafslots = nleafslots + 1
+             !$omp end atomic
+             !$omp atomic capture
+             i0 = nleafsrc
+             nleafsrc = nleafsrc + nneigh
+             !$omp end atomic
+             if (islot < size(leafsrc_start) .and. i0+nneigh <= size(leafsrc)) then
+                leafrec_prev(islot+1)  = leafslot(icell)
+                leafrec_cell(islot+1)  = icell
+                leafslot(icell)        = islot + 1
+                leafsrc_start(islot+1) = i0
+                leafsrc_count(islot+1) = nneigh
+                fnode_leafcell(:,islot+1) = fnode
+                leafsrc(i0+1:i0+nneigh) = listneigh(1:nneigh)
+             endif
+             !$omp atomic capture
+             i0 = nleafrem
+             nleafrem = nleafrem + nrem
+             !$omp end atomic
+             if (islot < size(leafrem_start) .and. i0+nrem <= size(leafrem,2)) then
+                leafrem_start(islot+1) = i0
+                leafrem_count(islot+1) = nrem
+                do j=1,nrem
+                   leafrem(:,i0+j) = (/rowner(lrem(j)),rid(lrem(j))/)
+                enddo
+             endif
+             !-- remote src left to open: the leaf is a fake root of the next round
+             nneigh = 0
+             nrem   = npend
+             lrem(1:npend) = lpend(1:npend)
+          elseif (npend > 0) then
+             call fatal('dualwalk_rounds','truncated src left to open by an internal node')
+          endif
+
+          if (leaf_is_active(icell) == 0 .or. nrem > 0) then
+             !$omp atomic capture
+             islot = nnew
+             nnew = nnew + 1
+             !$omp end atomic
+             roots_new(islot+1)   = icell
+             fnode_new(:,islot+1) = fnode
+             !$omp atomic capture
+             i0 = nnewl
+             nnewl = nnewl + nneigh
+             !$omp end atomic
+             istart_new(islot+1) = i0
+             icount_new(islot+1) = nneigh
+             if (i0+nneigh <= size(srclist_new)) srclist_new(i0+1:i0+nneigh) = listneigh(1:nneigh)
+             !$omp atomic capture
+             i0 = nnewr
+             nnewr = nnewr + nrem
+             !$omp end atomic
+             rstart_new(islot+1) = i0
+             rcount_new(islot+1) = nrem
+             if (i0+nrem <= size(srcrem_new,2)) then
+                do j=1,nrem
+                   srcrem_new(:,i0+j) = (/rowner(lrem(j)),rid(lrem(j))/)
+                enddo
+             endif
+          endif
+       enddo
+       !$omp end do
+       deallocate(lrem,lpend)
+       !$omp end parallel
+
+       allfit = (nnewl <= size(srclist_new) .and. nnewr <= size(srcrem_new,2) .and. &
+                 nleafslots <= size(leafsrc_start) .and. nleafsrc <= size(leafsrc) .and. &
+                 nleafrem <= size(leafrem,2))
+       ! a leaf walked in this round goes back to its previous record before the redo
+       ! (and before the record arrays are grown, keeping only the previous rounds)
+       if (.not.allfit) then
+          do ic=1,ncell
+             if (cells(ic) > 0) then
+                if (leafslot(cells(ic)) > nrec0) leafslot(cells(ic)) = leafrec_prev(leafslot(cells(ic)))
+             endif
+          enddo
+       endif
+       if (nnewl > size(srclist_new)) then
+          deallocate(srclist_new)
+          allocate(srclist_new(2*nnewl))
+       endif
+       if (nnewr > size(srcrem_new,2)) then
+          deallocate(srcrem_new)
+          allocate(srcrem_new(2,2*nnewr))
+       endif
+       if (nleafslots > size(leafsrc_start)) then
+          call grow_int(leafsrc_start,2*nleafslots,nrec0)
+          call grow_int(leafsrc_count,2*nleafslots,nrec0)
+          call grow_int(leafrec_prev,2*nleafslots,nrec0)
+          call grow_int(leafrec_cell,2*nleafslots,nrec0)
+          call grow_int(leafrem_start,2*nleafslots,nrec0)
+          call grow_int(leafrem_count,2*nleafslots,nrec0)
+          call grow_real2(fnode_leafcell,2*nleafslots,nrec0)
+       endif
+       if (nleafsrc > size(leafsrc)) call grow_int(leafsrc,2*nleafsrc,nleafsrc0)
+       if (nleafrem > size(leafrem,2)) call grow_int2(leafrem,2*nleafrem,nleafrem0)
+    enddo
+
+    ! the remote pairs left to open and the remote leaf-leaf pairs must be mirrored
+    if (check_dualtree_mpi) then
+    nchk = max(nnewr,nleafrem-nleafrem0,1)
+    allocate(pairs_chk(3,nchk))
+    do ir=1,nnew
+       do j=1,rcount_new(ir)
+          pairs_chk(:,rstart_new(ir)+j) = (/roots_new(ir),srcrem_new(2,rstart_new(ir)+j),srcrem_new(1,rstart_new(ir)+j)/)
+       enddo
+    enddo
+    call check_pair_mirror(nnewr,pairs_chk,nmismatch)
+    if (reduceall_mpi('+',nmismatch) > 0) call fatal('dualwalk_rounds','remote pairs left to open are not mirrored')
+    nchk = 0
+    do islot=nrec0+1,nleafslots
+       do j=1,leafrem_count(islot)
+          nchk = nchk + 1
+          pairs_chk(:,nchk) = (/leafrec_cell(islot),leafrem(2,leafrem_start(islot)+j),leafrem(1,leafrem_start(islot)+j)/)
+       enddo
+    enddo
+    call check_pair_mirror(nchk,pairs_chk,nmismatch)
+    if (reduceall_mpi('+',nmismatch) > 0) call fatal('dualwalk_rounds','remote leaf-leaf pairs are not mirrored')
+    deallocate(pairs_chk)
+    endif
+    ! the output of this round is the input of the next one
+    nroots = nnew
+    call move_alloc(roots_new,roots)
+    call move_alloc(istart_new,istart)
+    call move_alloc(icount_new,icount)
+    call move_alloc(rstart_new,rstart)
+    call move_alloc(rcount_new,rcount)
+    call move_alloc(fnode_new,fnode_root)
+    call move_alloc(srclist_new,srclist)
+    call move_alloc(srcrem_new,srcrem)
+    deallocate(cells,cellroot)
+
+    ! nodes of the remote src of the next round
+    call exchange_round(kslab,nroots,roots,rstart,rcount,srcrem,rnode,rleaf,rowner,rid,nrnode,rslot,anyroots)
  enddo
 
 end subroutine dualwalk_rounds
+
+!-----------------------------------------------------------------------
+!+
+!  exchange of the nodes for a round: the subtree (kslab levels) of the
+!  fake roots with remote src goes to the owners of these src, and the
+!  subtrees of the remote src are received, in increasing node order for
+!  each pair of tasks (by symmetry, both sides know what the other needs).
+!  rnode(rslot(i)) is the received node of the remote src i of srcrem
+!+
+!-----------------------------------------------------------------------
+subroutine exchange_round(kslab,nroots,roots,rstart,rcount,srcrem,rnode,rleaf,rowner,rid,nrnode,rslot,anyroots)
+ use io,        only:fatal,nprocs
+ use mpiforce,  only:exchange_slabs
+ use kdtree,    only:kdnode
+ integer, intent(in) :: kslab,nroots
+ integer, intent(in) :: roots(:),rstart(:),rcount(:),srcrem(:,:)
+ type(kdnode), allocatable, intent(inout) :: rnode(:)
+ integer,      allocatable, intent(inout) :: rleaf(:),rowner(:),rid(:),rslot(:)
+ integer,                   intent(out)   :: nrnode
+ logical,                   intent(out)   :: anyroots
+ integer(kind=8), allocatable :: keysend(:),keyreq(:)
+ integer, allocatable :: indx(:),reqslot(:)
+ real,    allocatable :: sendbuf(:),recvbuf(:)
+ integer :: nremtot,nsendkey,nreq,ir,j,i,n,irank,ipos,nfield,nkd,nn,ireq
+ integer :: nsend(nprocs),nrecv(nprocs),slab(2**(kslab+1)),slabflag(2**(kslab+1)),slabchild(2**(kslab+1))
+ type(kdnode) :: dummy
+
+ nkd    = size(transfer(node(1),(/0./)))
+ nfield = nkd + 5
+ ! the lists of the fake roots are reserved in any order: the total is the end of the last one
+ nremtot = 0
+ if (nroots > 0) nremtot = maxval(rstart(1:nroots) + rcount(1:nroots))
+
+ ! subtrees to send: (owner of the remote src, fake root), and to receive: (owner, remote src)
+ allocate(keysend(max(nremtot,1)),keyreq(max(nremtot,1)),indx(max(nremtot,1)))
+ do ir=1,nroots
+    do j=rstart(ir)+1,rstart(ir)+rcount(ir)
+       keysend(j) = int(srcrem(1,j),8)*2_8**32 + int(roots(ir),8)
+       keyreq(j)  = int(srcrem(1,j),8)*2_8**32 + int(srcrem(2,j),8)
+    enddo
+ enddo
+ call sort_unique(nremtot,keysend,nsendkey,indx)
+ call sort_unique(nremtot,keyreq,nreq,indx)
+
+ ! pack: the slabs for each task are contiguous, in increasing (task,node) order
+ nsend = 0
+ do i=1,nsendkey
+    irank = int(keysend(i)/2_8**32)
+    nsend(irank+1) = nsend(irank+1) + count_slab(int(mod(keysend(i),2_8**32)),kslab)*nfield
+ enddo
+ allocate(sendbuf(max(sum(nsend),1)))
+ ipos = 0
+ do i=1,nsendkey
+    call get_slab(int(mod(keysend(i),2_8**32)),kslab,slab,slabflag,slabchild,nn)
+    call pack_slab(slab,slabflag,slabchild,nn,nkd,sendbuf(ipos+1:ipos+nn*nfield))
+    ipos = ipos + nn*nfield
+ enddo
+
+ call exchange_slabs(sendbuf,nsend,recvbuf,nrecv,(nroots > 0),anyroots)
+
+ ! unpack: the slabs from each task come in the order of the requested src
+ nrnode = sum(nrecv)/nfield
+ if (allocated(rnode)) deallocate(rnode,rleaf,rowner,rid)
+ allocate(rnode(max(nrnode,1)),rleaf(max(nrnode,1)),rowner(max(nrnode,1)),rid(max(nrnode,1)),reqslot(max(nreq,1)))
+ n     = 0
+ ireq  = 0
+ ipos  = 0
+ do irank=0,nprocs-1
+    do while(ipos < sum(nrecv(1:irank+1)))
+       ireq = ireq + 1
+       nn = nint(recvbuf(ipos+nkd+5))
+       if (ireq > nreq) call fatal('exchange_round','more subtrees received than requested')
+       if (keyreq(ireq) /= int(irank,8)*2_8**32 + nint(recvbuf(ipos+nkd+1),8)) &
+          call fatal('exchange_round','subtree received is not the one requested')
+       reqslot(ireq) = n + 1
+       do j=1,nn
+          rnode(n+j)  = transfer(recvbuf(ipos+1:ipos+nkd),dummy)
+          rid(n+j)    = nint(recvbuf(ipos+nkd+1))
+          rnode(n+j)%leftchild  = slot_of(nint(recvbuf(ipos+nkd+2)),n)
+          rnode(n+j)%rightchild = slot_of(nint(recvbuf(ipos+nkd+3)),n)
+          rleaf(n+j)  = nint(recvbuf(ipos+nkd+4))
+          rowner(n+j) = irank
+          ipos = ipos + nfield
+       enddo
+       n = n + nn
+    enddo
+ enddo
+ if (ireq /= nreq) call fatal('exchange_round','fewer subtrees received than requested')
+
+ ! slot of each remote src
+ if (allocated(rslot)) deallocate(rslot)
+ allocate(rslot(max(nremtot,1)))
+ do j=1,nremtot
+    rslot(j) = reqslot(find_key(nreq,keyreq,int(srcrem(1,j),8)*2_8**32 + int(srcrem(2,j),8)))
+ enddo
+
+contains
+
+integer function slot_of(irel,nbase)
+ integer, intent(in) :: irel,nbase
+
+ slot_of = 0
+ if (irel > 0) slot_of = nbase + irel
+
+end function slot_of
+
+end subroutine exchange_round
+
+!-----------------------------------------------------------------------
+!+
+!  nodes of the subtree of iroot down to kslab levels below, in breadth
+!  first order (slab(1) = iroot), with their leaf flag (isrc_truncated
+!  for the internal nodes at the bottom, whose children are not in it)
+!  and the position of their left child in the slab (0 if not in it)
+!+
+!-----------------------------------------------------------------------
+subroutine get_slab(iroot,kslab,slab,slabflag,slabchild,nn)
+ use kdtree, only:isrc_truncated
+ integer, intent(in)  :: iroot,kslab
+ integer, intent(out) :: slab(:),slabflag(:),slabchild(:),nn
+ integer :: i,n
+
+ nn = 1
+ slab(1) = iroot
+ i = 0
+ do while(i < nn)
+    i = i + 1
+    n = slab(i)
+    slabchild(i) = 0
+    if (node(n)%leftchild == 0 .or. leaf_is_active(n) /= 0) then
+       slabflag(i) = leaf_is_active(n)
+    elseif (node(n)%level - node(iroot)%level >= kslab) then
+       slabflag(i) = isrc_truncated
+    else
+       slabflag(i)  = 0
+       slabchild(i) = nn + 1
+       slab(nn+1) = node(n)%leftchild
+       slab(nn+2) = node(n)%rightchild
+       nn = nn + 2
+    endif
+ enddo
+
+end subroutine get_slab
+
+!-----------------------------------------------------------------------
+!+
+!  number of nodes of the slab of iroot
+!+
+!-----------------------------------------------------------------------
+integer function count_slab(iroot,kslab)
+ integer, intent(in) :: iroot,kslab
+ integer :: slab(2**(kslab+1)),slabflag(2**(kslab+1)),slabchild(2**(kslab+1))
+
+ call get_slab(iroot,kslab,slab,slabflag,slabchild,count_slab)
+
+end function count_slab
+
+!-----------------------------------------------------------------------
+!+
+!  pack the nodes of a slab: the node, its id, its children (position
+!  in the slab, 0 if not in it), its leaf flag and the number of nodes
+!  of the slab
+!+
+!-----------------------------------------------------------------------
+subroutine pack_slab(slab,slabflag,slabchild,nn,nkd,buf)
+ integer, intent(in)  :: slab(:),slabflag(:),slabchild(:),nn,nkd
+ real,    intent(out) :: buf(:)
+ integer :: i,ipos,nfield
+
+ nfield = nkd + 5
+ do i=1,nn
+    ipos = (i-1)*nfield
+    buf(ipos+1:ipos+nkd) = transfer(node(slab(i)),buf(1:nkd))
+    buf(ipos+nkd+1) = real(slab(i))
+    if (slabchild(i) > 0) then
+       buf(ipos+nkd+2) = real(slabchild(i))
+       buf(ipos+nkd+3) = real(slabchild(i)+1)
+    else
+       buf(ipos+nkd+2:ipos+nkd+3) = 0.
+    endif
+    buf(ipos+nkd+4) = real(slabflag(i))
+    buf(ipos+nkd+5) = real(nn)
+ enddo
+
+end subroutine pack_slab
+
+!-----------------------------------------------------------------------
+!+
+!  sort keys and remove the duplicates
+!+
+!-----------------------------------------------------------------------
+subroutine sort_unique(n,key,nunique,indx)
+ use sortutils, only:indexx
+ integer,         intent(in)    :: n
+ integer(kind=8), intent(inout) :: key(:)
+ integer,         intent(out)   :: nunique
+ integer,         intent(inout) :: indx(:)
+ integer(kind=8), allocatable :: tmp(:)
+ integer :: i
+
+ nunique = 0
+ if (n == 0) return
+ call indexx(n,key,indx)
+ allocate(tmp(n))
+ tmp = key(indx(1:n))
+ do i=1,n
+    if (nunique > 0) then
+       if (tmp(i) == key(nunique)) cycle
+    endif
+    nunique = nunique + 1
+    key(nunique) = tmp(i)
+ enddo
+
+end subroutine sort_unique
+
+!-----------------------------------------------------------------------
+!+
+!  position of a key in a sorted list (binary search)
+!+
+!-----------------------------------------------------------------------
+integer function find_key(n,key,k)
+ use io, only:fatal
+ integer,         intent(in) :: n
+ integer(kind=8), intent(in) :: key(:),k
+ integer :: ilo,ihi,imid
+
+ ilo = 1
+ ihi = n
+ find_key = 0
+ do while(ilo <= ihi)
+    imid = (ilo+ihi)/2
+    if (key(imid) == k) then
+       find_key = imid
+       return
+    elseif (key(imid) < k) then
+       ilo = imid + 1
+    else
+       ihi = imid - 1
+    endif
+ enddo
+ call fatal('find_key','remote src not received')
+
+end function find_key
+
+!-----------------------------------------------------------------------
+!+
+!  fake leaves of a fake root: its descendants kslab levels below, or the
+!  active leaves above (unused slots are set to 0)
+!+
+!-----------------------------------------------------------------------
+subroutine get_fake_leaves(iroot,kslab,cells)
+ integer, intent(in)  :: iroot,kslab
+ integer, intent(out) :: cells(:)
+ integer :: stack(128),istack,n,ideproot,idep,ncell
+
+ ideproot = node(iroot)%level
+ cells  = 0
+ ncell  = 0
+ istack = 1
+ stack(1) = iroot
+ do while(istack > 0)
+    n      = stack(istack)
+    istack = istack - 1
+    idep   = node(n)%level - ideproot
+    if (node(n)%leftchild == 0 .or. leaf_is_active(n) /= 0) then
+       if (leaf_is_active(n) > 0) then
+          ncell = ncell + 1
+          cells(ncell) = n
+       endif
+    elseif (idep == kslab) then
+       ncell = ncell + 1
+       cells(ncell) = n
+    else
+       stack(istack+1) = node(n)%leftchild
+       stack(istack+2) = node(n)%rightchild
+       istack = istack + 2
+    endif
+ enddo
+
+end subroutine get_fake_leaves
+
+!-----------------------------------------------------------------------
+!+
+!  neighbours and expansion of a leaf from the walk in rounds: the
+!  particles of its src leaves, and its expansion
+!+
+!-----------------------------------------------------------------------
+subroutine get_leaf_walk(inode,mylistneigh,nneigh,xyzcache,ixyzcachesize,fnode)
+ use io,     only:fatal
+ use kdtree, only:getneigh_srcleaves,lenfgrav
+ integer, intent(in)  :: inode,ixyzcachesize
+ integer, intent(out) :: mylistneigh(:)
+ integer, intent(out) :: nneigh
+ real,    intent(out) :: fnode(lenfgrav)
+ real,    intent(out) :: xyzcache(:,:)
+ integer, allocatable :: srcleaves(:)
+ integer :: irec,nsrc,j,ighost
+
+ irec = leafslot(inode)
+ if (irec == 0) call fatal('get_leaf_walk','leaf not walked in rounds')
+ ! the expansion of the last record is complete
+ fnode = fnode_leafcell(:,irec)
+ ! local src leaves of all the records of this leaf
+ nsrc = 0
+ do while(irec > 0)
+    nsrc = nsrc + leafsrc_count(irec)
+    irec = leafrec_prev(irec)
+ enddo
+ allocate(srcleaves(max(nsrc,1)))
+ nsrc = 0
+ irec = leafslot(inode)
+ do while(irec > 0)
+    srcleaves(nsrc+1:nsrc+leafsrc_count(irec)) = leafsrc(leafsrc_start(irec)+1:leafsrc_start(irec)+leafsrc_count(irec))
+    nsrc = nsrc + leafsrc_count(irec)
+    irec = leafrec_prev(irec)
+ enddo
+ call getneigh_srcleaves(node,inode,srcleaves,nsrc,mylistneigh,nneigh,xyzcache,ixyzcachesize)
+
+ ! then the ghost particles of the remote src leaves
+ irec = leafslot(inode)
+ do while(irec > 0)
+    do j=leafrem_start(irec)+1,leafrem_start(irec)+leafrem_count(irec)
+       ighost = find_ghost(int(leafrem(1,j),8)*2_8**32 + int(leafrem(2,j),8))
+       call cache_ghosts(inode,ighost,mylistneigh,nneigh,xyzcache,ixyzcachesize)
+    enddo
+    irec = leafrec_prev(irec)
+ enddo
+
+end subroutine get_leaf_walk
+
+!-----------------------------------------------------------------------
+!+
+!  remote leaves to exchange as ghost particles, from the remote leaf-leaf
+!  pairs of the walk in rounds: to send, (owner of the remote leaf, local
+!  leaf), and to receive, (owner, remote leaf), sorted (as for the nodes,
+!  the pairs being mirrored, both sides agree on what to exchange)
+!+
+!-----------------------------------------------------------------------
+subroutine get_remote_leaves(nsend,keysend,nreq,keyreq)
+ integer,                      intent(out) :: nsend,nreq
+ integer(kind=8), allocatable, intent(out) :: keysend(:),keyreq(:)
+ integer, allocatable :: indx(:)
+ integer :: irec,j,n
+
+ allocate(keysend(max(nleafrem,1)),keyreq(max(nleafrem,1)),indx(max(nleafrem,1)))
+ n = 0
+ do irec=1,nleafslots
+    do j=leafrem_start(irec)+1,leafrem_start(irec)+leafrem_count(irec)
+       n = n + 1
+       keysend(n) = int(leafrem(1,j),8)*2_8**32 + int(leafrec_cell(irec),8)
+       keyreq(n)  = int(leafrem(1,j),8)*2_8**32 + int(leafrem(2,j),8)
+    enddo
+ enddo
+ call sort_unique(n,keysend,nsend,indx)
+ call sort_unique(n,keyreq,nreq,indx)
+
+end subroutine get_remote_leaves
+
+!-----------------------------------------------------------------------
+!+
+!  store the table of the ghost leaves: for the remote leaf keyreq(i), its
+!  first ghost particle, its number of particles and its centre, and the
+!  mass of each ghost particle (ghost k is particle ibase+k)
+!+
+!-----------------------------------------------------------------------
+subroutine set_ghost_leaves(nreq,keyreq,ifirst,icount,xcen,ibase,nghost,mass)
+ integer,         intent(in) :: nreq,ibase,nghost
+ integer(kind=8), intent(in) :: keyreq(:)
+ integer,         intent(in) :: ifirst(:),icount(:)
+ real,            intent(in) :: xcen(:,:),mass(:)
+
+ if (allocated(ghostkey)) deallocate(ghostkey,ghostfirst,ghostcount,ghostxcen)
+ if (allocated(ghostmass)) deallocate(ghostmass)
+ allocate(ghostkey(max(nreq,1)),ghostfirst(max(nreq,1)),ghostcount(max(nreq,1)),ghostxcen(3,max(nreq,1)))
+ allocate(ghostmass(max(nghost,1)))
+ nghostleaves = nreq
+ ighostbase   = ibase
+ ghostkey(1:nreq)    = keyreq(1:nreq)
+ ghostfirst(1:nreq)  = ifirst(1:nreq)
+ ghostcount(1:nreq)  = icount(1:nreq)
+ ghostxcen(:,1:nreq) = xcen(:,1:nreq)
+ ghostmass(1:nghost) = mass(1:nghost)
+
+end subroutine set_ghost_leaves
+
+!-----------------------------------------------------------------------
+!+
+!  position of a remote leaf in the table of the ghost leaves
+!+
+!-----------------------------------------------------------------------
+integer function find_ghost(k)
+ integer(kind=8), intent(in) :: k
+
+ find_ghost = find_key(nghostleaves,ghostkey,k)
+
+end function find_ghost
+
+!-----------------------------------------------------------------------
+!+
+!  add the ghost particles of a ghost leaf to the neighbours of inode,
+!  as cache_neighbours does for a local leaf
+!+
+!-----------------------------------------------------------------------
+subroutine cache_ghosts(inode,ighost,mylistneigh,nneigh,xyzcache,ixyzcachesize)
+ use part,     only:xyzh,rho,gradh,periodic
+ use dim,      only:igradomega,igradzeta,igradsoft
+ use kdtree,   only:ih1,im,irho,izetaomega,isoftomega
+ use boundary, only:dxbound,dybound,dzbound
+ integer, intent(in)    :: inode,ighost,ixyzcachesize
+ integer, intent(inout) :: mylistneigh(:),nneigh
+ real,    intent(inout) :: xyzcache(:,:)
+ integer :: k,ip,maxcache
+ real    :: offset(3),dx(3)
+
+ maxcache = 0
+ if (ixyzcachesize > 0) maxcache = size(xyzcache,1)
+ ! periodic offset between the two leaves, as get_sep
+ offset = 0.
+ if (periodic) then
+    dx = ghostxcen(:,ighost) - node(inode)%xcen
+    if (abs(dx(1)) > 0.5*dxbound) offset(1) = -dxbound*sign(1.0,dx(1))
+    if (abs(dx(2)) > 0.5*dybound) offset(2) = -dybound*sign(1.0,dx(2))
+    if (abs(dx(3)) > 0.5*dzbound) offset(3) = -dzbound*sign(1.0,dx(3))
+ endif
+ do k=1,ghostcount(ighost)
+    ip = ghostfirst(ighost) + k - 1
+    nneigh = nneigh + 1
+    mylistneigh(nneigh) = ip
+    if (nneigh <= ixyzcachesize) then
+       xyzcache(1:3,nneigh) = xyzh(1:3,ip) + offset
+       if (maxcache >= 4) xyzcache(ih1,nneigh) = 1./xyzh(4,ip)
+       if (maxcache >= 5) xyzcache(im,nneigh)  = ghostmass(ip - ighostbase)
+       if (maxcache >= 7) then
+          xyzcache(irho,nneigh)       = rho(ip)
+          xyzcache(izetaomega,nneigh) = real(gradh(igradzeta,ip))*real(gradh(igradomega,ip))
+       endif
+       if (maxcache >= 8) then
+          if (size(gradh,1) >= igradsoft) then
+             xyzcache(isoftomega,nneigh) = real(gradh(igradsoft,ip))*real(gradh(igradomega,ip))
+          else
+             xyzcache(isoftomega,nneigh) = 0.
+          endif
+       endif
+    endif
+ enddo
+
+
+end subroutine cache_ghosts
+
+!-----------------------------------------------------------------------
+!+
+!  grow an array, keeping its first nkeep elements
+!+
+!-----------------------------------------------------------------------
+subroutine grow_int(a,n,nkeep)
+ integer, allocatable, intent(inout) :: a(:)
+ integer,              intent(in)    :: n,nkeep
+ integer, allocatable :: tmp(:)
+
+ allocate(tmp(n))
+ tmp(1:nkeep) = a(1:nkeep)
+ call move_alloc(tmp,a)
+
+end subroutine grow_int
+
+subroutine grow_int2(a,n,nkeep)
+ integer, allocatable, intent(inout) :: a(:,:)
+ integer,              intent(in)    :: n,nkeep
+ integer, allocatable :: tmp(:,:)
+
+ allocate(tmp(size(a,1),n))
+ tmp(:,1:nkeep) = a(:,1:nkeep)
+ call move_alloc(tmp,a)
+
+end subroutine grow_int2
+
+subroutine grow_real2(a,n,nkeep)
+ real, allocatable, intent(inout) :: a(:,:)
+ integer,           intent(in)    :: n,nkeep
+ real, allocatable :: tmp(:,:)
+
+ allocate(tmp(size(a,1),n))
+ tmp(:,1:nkeep) = a(:,1:nkeep)
+ call move_alloc(tmp,a)
+
+end subroutine grow_real2
 
 !-----------------------------------------------------------------------
 !+
