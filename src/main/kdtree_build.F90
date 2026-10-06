@@ -1699,7 +1699,7 @@ subroutine set_nodes_properties(npnode,nnode,x0,totmass_node,mymum,nodeentry,xmi
     xmaxi(2)  = reduce_group(xmaxi(2),'max',level)
     xmaxi(3)  = reduce_group(xmaxi(3),'max',level)
 #ifdef GRAVITY
-    totmass_node = reduce_group(totmass_node, "+", level)
+    ! totmass_node is already the mass of the whole group (get_group_cofm in construct_node)
     quads(1)  = reduce_group(quads(1),'+',level)
     quads(2)  = reduce_group(quads(2),'+',level)
     quads(3)  = reduce_group(quads(3),'+',level)
