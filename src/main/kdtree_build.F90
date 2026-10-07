@@ -76,10 +76,9 @@ module procedure maketreeglobal
  integer      :: nl, nr
  integer      :: il, ir, iself, parent
  integer      :: level
- integer      :: nnodestart, nnodeend,locstart,locend
+ integer      :: nnodestart, nnodeend
  integer      :: npcounter
- integer      :: i, k, offset, roffset, roffset_prev, coffset
- integer      :: inode
+ integer      :: i
  integer      :: npnode
  logical      :: wassplit,sinktree
  real(kind=4) :: t1,t2,tcpu1,tcpu2
@@ -239,6 +238,24 @@ module procedure maketreeglobal
     endif
  endif
 
+ if (sinktree) then
+    call refinetreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,np,cellatid,&
+                          leaf_is_active,ncells,apr_tree,nptmass,xyzmh_ptmass)
+ else
+    call refinetreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,np,cellatid,&
+                          leaf_is_active,ncells,apr_tree)
+ endif
+
+end procedure maketreeglobal
+
+module procedure refinetreeglobal
+ integer :: i,k,offset,roffset,roffset_prev,coffset,inode
+ integer :: nnodestart,nnodeend,locstart,locend
+ logical :: sinktree
+
+ sinktree = .false.
+ if (present(nptmass).and.present(xyzmh_ptmass)) sinktree=.true.
+
  ! local tree
  if (sinktree) then
     call maketree(node,xyzh,np,leaf_is_active,ncells,apr_tree,refinelevels,nptmass,xyzmh_ptmass)
@@ -304,7 +321,7 @@ module procedure maketreeglobal
     enddo
  enddo
 
-end procedure maketreeglobal
+end procedure refinetreeglobal
 
 module procedure maketree
  integer :: i,npnode,il,ir,istack,nl,nr,mymum
@@ -1221,14 +1238,12 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
           nr = npnode - nl
        endif
 
-       ! compute min/max with explicit loops for better cache behavior
-       xminl(1) = treecache(1,inoderange(1,il))
-       xminl(2) = treecache(2,inoderange(1,il))
-       xminl(3) = treecache(3,inoderange(1,il))
-       xmaxl(1) = xminl(1)
-       xmaxl(2) = xminl(2)
-       xmaxl(3) = xminl(3)
-       do ipart=inoderange(1,il)+1,inoderange(2,il)
+       ! compute min/max with explicit loops for better cache behavior. The bounds
+       ! start from +/-huge: a child with no particles (on this task, in a global
+       ! build) must not change the bounds reduced across the MPI tasks
+       xminl =  huge(1.)
+       xmaxl = -huge(1.)
+       do ipart=inoderange(1,il),inoderange(2,il)
           xminl(1) = min(xminl(1),treecache(1,ipart))
           xminl(2) = min(xminl(2),treecache(2,ipart))
           xminl(3) = min(xminl(3),treecache(3,ipart))
@@ -1237,13 +1252,9 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
           xmaxl(3) = max(xmaxl(3),treecache(3,ipart))
        enddo
 
-       xminr(1) = treecache(1,inoderange(1,ir))
-       xminr(2) = treecache(2,inoderange(1,ir))
-       xminr(3) = treecache(3,inoderange(1,ir))
-       xmaxr(1) = xminr(1)
-       xmaxr(2) = xminr(2)
-       xmaxr(3) = xminr(3)
-       do ipart=inoderange(1,ir)+1,inoderange(2,ir)
+       xminr =  huge(1.)
+       xmaxr = -huge(1.)
+       do ipart=inoderange(1,ir),inoderange(2,ir)
           xminr(1) = min(xminr(1),treecache(1,ipart))
           xminr(2) = min(xminr(2),treecache(2,ipart))
           xminr(3) = min(xminr(3),treecache(3,ipart))
@@ -1252,12 +1263,13 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
           xmaxr(3) = max(xmaxr(3),treecache(3,ipart))
        enddo
     else
+       ! no particles on this task (global build): neutral for the reduction
        nl = 0
        nr = 0
-       xminl = 0.0
-       xmaxl = 0.0
-       xminr = 0.0
-       xmaxr = 0.0
+       xminl =  huge(1.)
+       xmaxl = -huge(1.)
+       xminr =  huge(1.)
+       xmaxr = -huge(1.)
     endif
 
     ! Reduce node limits of children across MPI tasks belonging to this group.

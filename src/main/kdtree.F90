@@ -71,7 +71,7 @@ module kdtree
 
  public :: allocate_kdtree, deallocate_kdtree
  public :: maketree, revtree, getneigh,getneigh_dual,kdnode,lenfgrav
- public :: maketreeglobal
+ public :: maketreeglobal,refinetreeglobal
  public :: getneigh_dual_global,getneigh_dual_from,getneigh_srcleaves,reset_cachestate_global
  public :: node_depth,global_to_local,local_to_global
  public :: empty_tree
@@ -148,6 +148,35 @@ module kdtree
    real,            intent(inout), optional :: xyzmh_ptmass(:,:)
    logical,         intent(in),    optional :: global_only ! stop after the levels of the domains
   end subroutine maketreeglobal
+ end interface
+
+!--------------------------------------------------------------------------------
+!+
+!  Routine to build the local tree below the domain of this task, and the
+!  levels of the global tree refined from it (after maketreeglobal)
+!+
+!-------------------------------------------------------------------------------
+ interface
+  module subroutine refinetreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,&
+                          np,cellatid,leaf_is_active,ncells,apr_tree,nptmass,xyzmh_ptmass)
+   use io,           only:fatal,id,nprocs
+   use mpiutils,     only:reduceall_mpi
+   use mpitree,      only:tree_sync
+
+   type(kdnode),    intent(inout) :: nodeglobal(:)    ! ncellsmax+1
+   type(kdnode),    intent(out)   :: node(:)          ! ncellsmax+1
+   integer,         intent(out)   :: nodemap(:)       ! ncellsmax+1
+   integer,         intent(in)    :: globallevel
+   integer,         intent(out)   :: refinelevels
+   integer,         intent(in)    :: np
+   real,            intent(inout) :: xyzh(:,:)
+   integer,         intent(out)   :: cellatid(:)      ! ncellsmax+1
+   integer,         intent(out)   :: leaf_is_active(:)  ! ncellsmax+1)
+   integer(kind=8), intent(out)   :: ncells
+   logical,         intent(in)    :: apr_tree
+   integer,         intent(in),    optional :: nptmass
+   real,            intent(inout), optional :: xyzmh_ptmass(:,:)
+  end subroutine refinetreeglobal
  end interface
 !-----------------------------------------------
 !+

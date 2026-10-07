@@ -41,8 +41,8 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  use dim,            only:mhd,fast_divcurlB,gr,periodic,do_radiation,driving,&
                           sink_radiation,use_dustgrowth,ind_timesteps,isothermal,mpi,gravity
  use io,             only:iprint,fatal,error
- use neighkdtree,    only:build_tree,rebuild_ghost_tree
- use mpighosts,      only:refresh_tree_ghosts
+ use neighkdtree,    only:build_tree,refine_local_tree
+ use mpighosts,      only:refresh_tree_ghosts,ighost_dens,ighost_force
  use densityforce,   only:densityiterate
  use ptmass,         only:ipart_rhomax,ptmass_calc_enclosed_mass,ptmass_boundary_crossing,get_pressure_on_sinks
  use externalforces, only:externalforce
@@ -70,7 +70,7 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  real,            intent(inout) :: xyzh(:,:)
  real,            intent(inout) :: vxyzu(:,:)
  real,            intent(inout) :: fxyzu(:,:)
- real,            intent(in)    :: fext(:,:)
+ real,            intent(inout) :: fext(:,:)       ! inout: ghost particles written after npart (MPI)
  real(kind=4),    intent(out)   :: divcurlv(:,:)
  real(kind=4),    intent(out)   :: divcurlB(:,:)
  real,            intent(inout) :: Bevol(:,:)     ! inout: ghost particles written after npart (MPI)
@@ -91,6 +91,7 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  integer(kind=1), intent(inout) :: apr_level(:)   ! inout: ghost particles written after npart (MPI)
  integer                     :: ierr,i
  real(kind=4)                :: t1,tcpu1,tlast,tcpulast
+ logical                     :: redo_ghosts
 
  t1    = 0.
  tcpu1 = 0.
@@ -113,7 +114,11 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
 ! build tree to prepare neighbour finding
 !
  if (icall==1 .or. icall==0) then
-    call build_tree(npart,nactive,xyzh,vxyzu)
+    ! with MPI: the domains, then the local tree with the ghost particles read in density
+    call build_tree(npart,nactive,xyzh,vxyzu,domains_only=.true.)
+    if (mpi .and. nprocs > 1) &
+       call build_ghosts_tree(ighost_dens,npart,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,Bevol,&
+                              rad,radprop,dustprop,dustfrac,filfac,eos_vars,dens,metrics,apr_level)
 
     if (gr) then
        ! update time-dependent metric (e.g. binary BH) and repack at particle positions
@@ -134,12 +139,22 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
 !
 
  if (icall==1) then
-    call densityiterate(1,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol,&
-                        stressmax,fxyzu,fext,alphaind,gradh,rad,radprop,dvdx,apr_level)
+    redo_ghosts = .true.
+    do while(redo_ghosts)
+       call densityiterate(1,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol,&
+                           stressmax,fxyzu,fext,alphaind,gradh,rad,radprop,dvdx,apr_level,redo_ghosts)
+       ! MPI: h grew beyond the ghost particles, choose them again with the new h
+       if (redo_ghosts) call build_ghosts_tree(ighost_dens,npart,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,Bevol,&
+                                         rad,radprop,dustprop,dustfrac,filfac,eos_vars,dens,metrics,apr_level)
+    enddo
     if (.not. fast_divcurlB) then
        ! Repeat the call to calculate all the non-density-related quantities in densityiterate.
        ! This needs to be separate for an accurate calculation of divcurlB which requires an up-to-date rho.
        ! if fast_divcurlB = .false., then all additional quantities are calculated during the previous call
+       ! (MPI: the ghost particles with their new rho)
+       if (mpi .and. nprocs > 1) &
+          call refresh_tree_ghosts(ighost_dens,npart,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,Bevol,&
+                                   rad,radprop,dustprop,dustfrac,filfac,eos_vars,dens,metrics,apr_level)
        call densityiterate(3,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol,&
                            stressmax,fxyzu,fext,alphaind,gradh,rad,radprop,dvdx,apr_level)
        ! put a similar flag for pressure calculation from dens: call cons2primall/everyhting and densityiterate(3. Import pressure from eos_vars in dens and use it to calculate delta_v
@@ -189,19 +204,23 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  stressmax = 0.
  if (sinks_have_heating(nptmass,xyzmh_ptmass)) call ptmass_calc_enclosed_mass(nptmass,npart,xyzh)
  if (mpi .and. nprocs > 1) then
-    if (gravity) then
-       ! dual tree walk over MPI: remote nodes and ghost particles for force
-       call dualwalk_global_force(npart,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dustprop,dustfrac,&
-                                  eos_vars,dens,metrics,apr_level)
-    else
-       ! ghost particles with the new h and the local tree with them, or
-       ! only their new values if neither the tree nor density were computed
-       if (icall==0 .or. icall==1) then
-          call rebuild_ghost_tree(npart,xyzh)
+    if (icall==0 .or. icall==1) then
+       if (gravity) then
+          ! local tree without the ghost particles, refined in the global tree
+          call refine_local_tree(npart,xyzh)
        else
-          call refresh_tree_ghosts(npart)
+          ! ghost particles read in force, chosen with the new h, in the local tree
+          call build_ghosts_tree(ighost_force,npart,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,Bevol,&
+                                 rad,radprop,dustprop,dustfrac,filfac,eos_vars,dens,metrics,apr_level)
        endif
+    elseif (.not.gravity) then
+       ! same ghost particles (neither positions nor h have changed): only their values
+       call refresh_tree_ghosts(ighost_force,npart,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,Bevol,&
+                                rad,radprop,dustprop,dustfrac,filfac,eos_vars,dens,metrics,apr_level)
     endif
+    ! dual tree walk over MPI: remote nodes and ghost particles for force
+    if (gravity) call dualwalk_global_force(npart,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,Bevol,&
+                                            rad,radprop,dustprop,dustfrac,filfac,eos_vars,dens,metrics,apr_level)
  endif
  call force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
             rad,drad,radprop,dustprop,dustgasprop,Vrel_disp,dustfrac,ddustevol,fext,fxyz_drag,&
@@ -248,6 +267,30 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  call do_timing('total',t1,tcpu1,lunit=iprint)
 
 end subroutine derivs
+
+!-------------------------------------------------------------
+!+
+!  MPI: choose the ghost particles of the other tasks (the fields
+!  read for a neighbour in density or in force, iset) and build
+!  the local tree with them
+!+
+!-------------------------------------------------------------
+subroutine build_ghosts_tree(iset,npart,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,Bevol,&
+                             rad,radprop,dustprop,dustfrac,filfac,eos_vars,dens,metrics,apr_level)
+ use neighkdtree, only:build_ghost_tree
+ use mpighosts,   only:exchange_tree_ghosts,nghost_tree
+ integer,         intent(in)    :: iset,npart
+ real,            intent(inout) :: xyzh(:,:),vxyzu(:,:),fxyzu(:,:),fext(:,:),Bevol(:,:),rad(:,:)
+ real,            intent(inout) :: radprop(:,:),dustprop(:,:),dustfrac(:,:),filfac(:),eos_vars(:,:)
+ real,            intent(inout) :: dens(:),metrics(:,:,:,:)
+ real(kind=4),    intent(inout) :: divcurlv(:,:),divcurlB(:,:)
+ integer(kind=1), intent(inout) :: apr_level(:)
+
+ call exchange_tree_ghosts(iset,npart,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,Bevol,&
+                           rad,radprop,dustprop,dustfrac,filfac,eos_vars,dens,metrics,apr_level)
+ call build_ghost_tree(npart,xyzh,nghost_tree)
+
+end subroutine build_ghosts_tree
 
 !--------------------------------------
 !+
@@ -315,15 +358,19 @@ end subroutine get_derivs_global
 !--------------------------------------
 subroutine get_density_global(icall,nactive,zero_fxyzu,make_tree)
  use part,         only:npart,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
-                        Bevol,alphaind,gradh,rad,radprop,dvdx,apr_level
+                        Bevol,alphaind,gradh,rad,radprop,dvdx,apr_level,&
+                        dustprop,dustfrac,filfac,eos_vars,dens,metrics
+ use dim,          only:mpi
+ use io,           only:nprocs
  use densityforce, only:densityiterate
  use neighkdtree,  only:build_tree
+ use mpighosts,    only:ighost_dens
  integer, intent(in) :: icall
  integer, intent(in), optional :: nactive
  logical, intent(in), optional :: zero_fxyzu
  logical, intent(in), optional :: make_tree
  integer :: nactivei
- logical :: do_tree
+ logical :: do_tree,redo_ghosts
  real    :: stressmax
 
  nactivei = npart
@@ -333,17 +380,28 @@ subroutine get_density_global(icall,nactive,zero_fxyzu,make_tree)
  if (present(make_tree)) do_tree = make_tree
 
  ! build tree to prepare neighbour finding (if requested)
- if (do_tree) call build_tree(npart,nactivei,xyzh,vxyzu)
+ ! with MPI: the domains, then the local tree with the ghost particles read in density
+ if (do_tree) then
+    call build_tree(npart,nactivei,xyzh,vxyzu,domains_only=.true.)
+    if (mpi .and. nprocs > 1) &
+       call build_ghosts_tree(ighost_dens,npart,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,Bevol,&
+                              rad,radprop,dustprop,dustfrac,filfac,eos_vars,dens,metrics,apr_level)
+ endif
 
  ! optionally zero fxyzu (useful for initialization)
  if (present(zero_fxyzu)) then
     if (zero_fxyzu) fxyzu = 0.
  endif
 
- ! evaluate density
- stressmax = 0.
- call densityiterate(icall,npart,nactivei,xyzh,vxyzu,divcurlv,divcurlB,Bevol,stressmax,&
-                     fxyzu,fext,alphaind,gradh,rad,radprop,dvdx,apr_level)
+ ! evaluate density (MPI: again with new ghost particles if h grew beyond them)
+ stressmax   = 0.
+ redo_ghosts = .true.
+ do while(redo_ghosts)
+    call densityiterate(icall,npart,nactivei,xyzh,vxyzu,divcurlv,divcurlB,Bevol,stressmax,&
+                        fxyzu,fext,alphaind,gradh,rad,radprop,dvdx,apr_level,redo_ghosts)
+    if (redo_ghosts) call build_ghosts_tree(ighost_dens,npart,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,Bevol,&
+                                        rad,radprop,dustprop,dustfrac,filfac,eos_vars,dens,metrics,apr_level)
+ enddo
 
 end subroutine get_density_global
 

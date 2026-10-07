@@ -70,7 +70,7 @@ module neighkdtree
  public :: sync_hmax_mpi
  public :: get_global_pairs,dualwalk_rounds,start_local_rounds,get_leaf_walk
  public :: get_remote_leaves,set_ghost_leaves
- public :: rebuild_ghost_tree
+ public :: build_ghost_tree,refine_local_tree
 
  private
 
@@ -196,11 +196,11 @@ end subroutine get_distance_from_centre_of_mass
 !  build the tree
 !+
 !-----------------------------------------------------------------------
-subroutine build_tree(npart,nactive,xyzh,vxyzu,for_apr)
- use io,           only:nprocs,fatal
+subroutine build_tree(npart,nactive,xyzh,vxyzu,for_apr,domains_only)
+ use io,           only:nprocs
  use kdtree,       only:maketree,maketreeglobal!,revtree
- use dim,          only:mpi,use_sinktree,gravity
- use mpighosts,    only:clear_tree_ghosts,exchange_tree_ghosts,nghost_tree
+ use dim,          only:mpi,use_sinktree
+ use mpighosts,    only:clear_tree_ghosts
  use part,         only:nptmass,xyzmh_ptmass,maxp
  use allocutils,   only:allocate_array
  integer, intent(inout) :: npart
@@ -208,10 +208,13 @@ subroutine build_tree(npart,nactive,xyzh,vxyzu,for_apr)
  real,    intent(inout) :: xyzh(:,:)
  real,    intent(in)    :: vxyzu(:,:)
  logical, intent(in), optional :: for_apr
- logical :: apr_tree
+ logical, intent(in), optional :: domains_only ! MPI: only the domains, the local tree is built later
+ logical :: apr_tree,domains
 
  apr_tree = .false.
  if (present(for_apr)) apr_tree = for_apr
+ domains = .false.
+ if (present(domains_only)) domains = domains_only .and. mpi .and. nprocs > 1
 
  !
  ! the listneigh array is threadprivate, but if the thread numbers or ids are changed
@@ -222,14 +225,17 @@ subroutine build_tree(npart,nactive,xyzh,vxyzu,for_apr)
  if (.not. allocated(listneigh)) call allocate_array('listneigh',listneigh,maxp)
  !$omp end parallel
 
- if (mpi .and. nprocs > 1 .and. .not.gravity) then
-    ! domains, then the local tree with the ghost particles of the other domains
-    if (use_sinktree) call fatal('build_tree','sink particles in the tree need gravity with MPI')
+ if (domains) then
+    ! the ghost particles of the last tree are removed before particles move between the tasks
     call clear_tree_ghosts(npart)
-    call maketreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,npart,cellatid,leaf_is_active,ncells,&
-                        apr_tree,global_only=.true.)
-    call exchange_tree_ghosts(npart)
-    call maketree(node,xyzh,npart+nghost_tree,leaf_is_active,ncells,apr_tree,nghost=nghost_tree)
+    if (use_sinktree) then
+       call maketreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,npart,cellatid,leaf_is_active,ncells,&
+                           apr_tree,nptmass,xyzmh_ptmass,global_only=.true.)
+    else
+       call maketreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,npart,cellatid,leaf_is_active,ncells,&
+                           apr_tree,global_only=.true.)
+    endif
+    return
  elseif (mpi .and. nprocs > 1) then
     if (use_sinktree) then
        call maketreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,npart,cellatid,leaf_is_active,ncells,&
@@ -319,7 +325,7 @@ end subroutine list_active_leaves
 !+
 !-----------------------------------------------------------------------
 subroutine get_neighbour_list(inode,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesize, &
-                              getj,f,remote_export,cell_xpos,cell_xsizei,cell_rcuti)
+                              getj,f,cell_xpos,cell_xsizei,cell_rcuti)
  use io,       only:nprocs,warning
  use dim,      only:mpi
  use kdtree,   only:getneigh,getneigh_dual,lenfgrav
@@ -333,12 +339,11 @@ subroutine get_neighbour_list(inode,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesi
  real,    intent(out) :: xyzcache(:,:)
  logical, intent(in),  optional :: getj
  real,    intent(out), optional :: f(lenfgrav)
- logical, intent(out), optional :: remote_export(:)
  real,    intent(in),  optional :: cell_xpos(3),cell_xsizei,cell_rcuti
  real :: xpos(3)
- real :: fgrav(lenfgrav),fgrav_global(lenfgrav)
+ real :: fgrav(lenfgrav)
  real :: xsizei,rcuti
- logical :: get_j,global_search,get_f
+ logical :: get_j,get_f
 !
 !--retrieve geometric centre of the node and the search radius (e.g. 2*hmax)
 !
@@ -348,14 +353,6 @@ subroutine get_neighbour_list(inode,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesi
     rcuti = cell_rcuti
  else
     call get_cell_location(inode,xpos,xsizei,rcuti)
- endif
-
- if (present(remote_export)) then
-    ! without gravity the neighbours on the other tasks are ghost particles in the local tree
-    if (nprocs > 1 .and. gravity) global_search = .true.
-    remote_export = .false.
- else
-    global_search = .false.
  endif
 
  if (periodic) then
@@ -379,16 +376,8 @@ subroutine get_neighbour_list(inode,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesi
     return
  endif
 
- if (mpi .and. global_search) then ! no sym fmm for now...
-    ! Find MPI tasks that have neighbours of this cell, output to remote_export
-    call getneigh(nodeglobal,xpos,xsizei,rcuti,mylistneigh,nneigh,xyzcache,ixyzcachesize,&
-                  cellatid,get_j,get_f,fgrav_global,remote_export)
- elseif (get_f) then
-    ! Set fgrav to zero, which matters if gravity is enabled but global search is not
-    fgrav_global = 0.0
- endif
-
- ! Find neighbours of this cell on this node
+ ! Find neighbours of this cell on this node (with MPI, the neighbours
+ ! on the other tasks are ghost particles in the local tree)
  if (get_f .and. .not.(mpi) .and. use_dualtree) then
     call getneigh_dual(node,xpos,xsizei,rcuti,mylistneigh,nneigh,xyzcache,ixyzcachesize,&
                           leaf_is_active,get_j,get_f,fgrav,inode)
@@ -397,7 +386,7 @@ subroutine get_neighbour_list(inode,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesi
                      leaf_is_active,get_j,get_f,fgrav)
  endif
 
- if (get_f) f = fgrav + fgrav_global
+ if (get_f) f = fgrav
 
 end subroutine get_neighbour_list
 
@@ -560,7 +549,7 @@ subroutine dualwalk_rounds(kslab,nroots_in,roots_in,istart_in,icount_in,srclist_
                            rstart_in,rcount_in,srcrem_in,fnode_in,nrounds)
  use io,       only:fatal
  use mpiutils, only:reduceall_mpi
- use mpiforce, only:check_pair_mirror
+ use mpighosts, only:check_pair_mirror
  use kdtree,   only:getneigh_dual_from,lenfgrav,kdnode
  integer, intent(in)  :: kslab,nroots_in
  integer, intent(in)  :: roots_in(:),istart_in(:),icount_in(:),srclist_in(:)
@@ -826,7 +815,7 @@ end subroutine dualwalk_rounds
 !-----------------------------------------------------------------------
 subroutine exchange_round(kslab,nroots,roots,rstart,rcount,srcrem,rnode,rleaf,rowner,rid,nrnode,rslot,anyroots)
  use io,        only:fatal,nprocs
- use mpiforce,  only:exchange_slabs
+ use mpighosts, only:exchange_slabs
  use kdtree,    only:kdnode
  integer, intent(in) :: kslab,nroots
  integer, intent(in) :: roots(:),rstart(:),rcount(:),srcrem(:,:)
@@ -1264,22 +1253,48 @@ end subroutine cache_ghosts
 
 !-----------------------------------------------------------------------
 !+
-!  MPI without gravity: after density, the ghost particles are chosen and
-!  sent again with the new h, and the local tree is rebuilt with them
-!  (the domains are kept)
+!  MPI: local tree of the particles of this task and of the nghost
+!  ghost particles written after them (after build_tree with domains_only)
 !+
 !-----------------------------------------------------------------------
-subroutine rebuild_ghost_tree(npart,xyzh)
- use kdtree,    only:maketree
- use mpighosts, only:exchange_tree_ghosts,nghost_tree
+subroutine build_ghost_tree(npart,xyzh,nghost)
+ use kdtree, only:maketree
+ integer, intent(in)    :: npart,nghost
+ real,    intent(inout) :: xyzh(:,:)
+
+ call maketree(node,xyzh,npart+nghost,leaf_is_active,ncells,.false.,nghost=nghost)
+ call list_active_leaves()
+
+end subroutine build_ghost_tree
+
+!-----------------------------------------------------------------------
+!+
+!  MPI with gravity: local tree of the particles of this task only, and
+!  the levels of the global tree refined from it, with the hmax of the
+!  global tree from the new h (for the tree walk over the tasks in force)
+!+
+!-----------------------------------------------------------------------
+subroutine refine_local_tree(npart,xyzh)
+ use kdtree,    only:refinetreeglobal
+ use dim,       only:use_sinktree
+ use part,      only:nptmass,xyzmh_ptmass
+ use mpighosts, only:nghost_tree
  integer, intent(in)    :: npart
  real,    intent(inout) :: xyzh(:,:)
 
- call exchange_tree_ghosts(npart)
- call maketree(node,xyzh,npart+nghost_tree,leaf_is_active,ncells,.false.,nghost=nghost_tree)
+ if (use_sinktree) then
+    call refinetreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,npart,cellatid,&
+                          leaf_is_active,ncells,.false.,nptmass,xyzmh_ptmass)
+ else
+    call refinetreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,npart,cellatid,&
+                          leaf_is_active,ncells,.false.)
+ endif
  call list_active_leaves()
+ call sync_hmax_mpi
+ ! the ghost particles are no longer in the tree
+ nghost_tree = 0
 
-end subroutine rebuild_ghost_tree
+end subroutine refine_local_tree
 
 !-----------------------------------------------------------------------
 !+

@@ -805,16 +805,17 @@ end subroutine force
 !  written in the arrays that force reads
 !+
 !----------------------------------------------------------------
-subroutine dualwalk_global_force(npart,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dustprop,dustfrac,&
-                                 eos_vars,dens,metrics,apr_level)
+subroutine dualwalk_global_force(npart,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,Bevol,&
+                                 rad,radprop,dustprop,dustfrac,filfac,eos_vars,dens,metrics,apr_level)
  use io,          only:iprint,iverbose,id,master,fatal
  use mpiutils,    only:reduceall_mpi
- use mpiforce,    only:check_pair_mirror
+ use mpighosts,   only:check_pair_mirror
  use neighkdtree, only:get_global_pairs,start_local_rounds,check_dualtree_mpi
  integer,         intent(in)    :: npart
- real,            intent(inout) :: xyzh(:,:),vxyzu(:,:),Bevol(:,:),rad(:,:),radprop(:,:)
- real,            intent(inout) :: dustprop(:,:),dustfrac(:,:),eos_vars(:,:),dens(:),metrics(:,:,:,:)
- real(kind=4),    intent(inout) :: divcurlv(:,:)
+ real,            intent(inout) :: xyzh(:,:),vxyzu(:,:),fxyzu(:,:),fext(:,:),Bevol(:,:),rad(:,:)
+ real,            intent(inout) :: radprop(:,:),dustprop(:,:),dustfrac(:,:),filfac(:),eos_vars(:,:)
+ real,            intent(inout) :: dens(:),metrics(:,:,:,:)
+ real(kind=4),    intent(inout) :: divcurlv(:,:),divcurlB(:,:)
  integer(kind=1), intent(inout) :: apr_level(:)
  integer :: nmismatch,nrem,ntot_loc,ntot_rem
 
@@ -832,8 +833,8 @@ subroutine dualwalk_global_force(npart,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dus
  endif
 
  call start_local_rounds(fnode_leaf,nglobal_pairs,global_pairs)
- call exchange_ghosts(npart,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dustprop,dustfrac,&
-                      eos_vars,dens,metrics,apr_level)
+ call exchange_ghosts(npart,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,Bevol,&
+                      rad,radprop,dustprop,dustfrac,filfac,eos_vars,dens,metrics,apr_level)
 
 end subroutine dualwalk_global_force
 
@@ -848,17 +849,17 @@ end subroutine dualwalk_global_force
 !  each particle its mass and the fields read for a neighbour in force
 !+
 !----------------------------------------------------------------
-subroutine exchange_ghosts(npart,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dustprop,dustfrac,&
-                           eos_vars,dens,metrics,apr_level)
+subroutine exchange_ghosts(npart,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,Bevol,&
+                           rad,radprop,dustprop,dustfrac,filfac,eos_vars,dens,metrics,apr_level)
  use io,          only:nprocs,fatal
- use mpiforce,    only:exchange_slabs
- use mpighosts,   only:copy_ghost
+ use mpighosts,   only:exchange_slabs,copy_ghost,ighost_force
  use neighkdtree, only:get_remote_leaves,set_ghost_leaves,node
  use part,        only:treecache
  integer,         intent(in)    :: npart
- real,            intent(inout) :: xyzh(:,:),vxyzu(:,:),Bevol(:,:),rad(:,:),radprop(:,:)
- real,            intent(inout) :: dustprop(:,:),dustfrac(:,:),eos_vars(:,:),dens(:),metrics(:,:,:,:)
- real(kind=4),    intent(inout) :: divcurlv(:,:)
+ real,            intent(inout) :: xyzh(:,:),vxyzu(:,:),fxyzu(:,:),fext(:,:),Bevol(:,:),rad(:,:)
+ real,            intent(inout) :: radprop(:,:),dustprop(:,:),dustfrac(:,:),filfac(:),eos_vars(:,:)
+ real,            intent(inout) :: dens(:),metrics(:,:,:,:)
+ real(kind=4),    intent(inout) :: divcurlv(:,:),divcurlB(:,:)
  integer(kind=1), intent(inout) :: apr_level(:)
  integer(kind=8), allocatable :: keysend(:),keyreq(:)
  integer,         allocatable :: ifirst(:),icount(:)
@@ -875,8 +876,8 @@ subroutine exchange_ghosts(npart,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dustprop,
 
  ! number of fields of a particle (its mass, then the fields read in force)
  ipos = 0
- call copy_ghost(.true.,1,buf1,ipos,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dustprop,dustfrac,&
-                 eos_vars,dens,metrics,apr_level)
+ call copy_ghost(ighost_force,.true.,1,buf1,ipos,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,Bevol,&
+                 rad,radprop,dustprop,dustfrac,filfac,eos_vars,dens,metrics,apr_level)
  nfield = ipos + 1
 
  ! pack the leaves for each task, in increasing (task,leaf) order
@@ -901,8 +902,8 @@ subroutine exchange_ghosts(npart,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dustprop,
        if (ip > maxpsph) call fatal('exchange_ghosts','sink particles in the tree are not handled')
        sendbuf(ipos+1) = treecache(5,k)
        ipos = ipos + 1
-       call copy_ghost(.true.,ip,sendbuf,ipos,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dustprop,dustfrac,&
-                       eos_vars,dens,metrics,apr_level)
+       call copy_ghost(ighost_force,.true.,ip,sendbuf,ipos,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,Bevol,&
+                       rad,radprop,dustprop,dustfrac,filfac,eos_vars,dens,metrics,apr_level)
     enddo
  enddo
 
@@ -930,8 +931,8 @@ subroutine exchange_ghosts(npart,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dustprop,
              call fatal('exchange_ghosts','no room for the ghost particles: increase maxp')
           mass(nghost) = recvbuf(ipos+1)
           ipos = ipos + 1
-          call copy_ghost(.false.,npart+nghost,recvbuf,ipos,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,&
-                          dustprop,dustfrac,eos_vars,dens,metrics,apr_level)
+          call copy_ghost(ighost_force,.false.,npart+nghost,recvbuf,ipos,xyzh,vxyzu,fxyzu,fext,divcurlv,&
+                          divcurlB,Bevol,rad,radprop,dustprop,dustfrac,filfac,eos_vars,dens,metrics,apr_level)
        enddo
     enddo
  enddo
