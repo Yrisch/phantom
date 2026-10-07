@@ -9,7 +9,8 @@ checksys:
 	@echo ""
         ifneq ($(SYSTEM),$(LASTSYSTEM))
 	    @echo system changed from ${LASTSYSTEM} to ${SYSTEM}
-	    @${MAKE} clean
+	    @# NOTE: the clean itself happens in .configstamp (see build/Makefile);
+	    @# a recipe-time clean here would race with "make -j"
         endif
 	@echo $(SYSTEM) > .make_lastsystem
    else
@@ -33,7 +34,7 @@ checksetup:
 	@echo ""
         ifneq ($(SETUP),$(LASTSETUP))
 	    @echo setup changed from ${LASTSETUP} to ${SETUP}
-	    @${MAKE} clean
+	    @# NOTE: the clean itself happens in .configstamp (see build/Makefile)
         endif
 	@echo $(SETUP) > .make_lastsetup
    else
@@ -81,14 +82,14 @@ checkparams:
    endif
    ifneq ($(FPPFLAGS),$(LASTFPPFLAGS))
 	@echo 'pre-processor flags changed from "'${LASTFPPFLAGS}'" to "'${FPPFLAGS}'"'
-	@${MAKE} clean;
+	@# NOTE: the clean itself happens in .configstamp (see build/Makefile)
 	#for x in ../src/*/*.F90; do y=`basename $$x`; rm -f $${y/.F90/.o}; done
    endif
 	@echo "Preprocessor flags are "${FPPFLAGS}
 	@echo "${FPPFLAGS}" > .make_lastfppflags
    ifneq ($(FFLAGS),$(LASTFFLAGS))
 	@echo 'Fortran flags changed from "'${LASTFFLAGS}'" to "'${FFLAGS}'"'
-	@${MAKE} clean;
+	@# NOTE: the clean itself happens in .configstamp (see build/Makefile)
    endif
 	@echo "Fortran flags are "${FFLAGS}
 	@echo "${FFLAGS}" > .make_lastfflags

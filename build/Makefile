@@ -1413,6 +1413,114 @@ depends: clean checksetup
 
 include .depends
 
+#----------------------------------------------------
+# Automatic Fortran module dependencies (parallel-safe "make -j")
+#
+# Fortran units read each other's .mod files at compile time, so without
+# module edges any "make -j" build races (historically the .depends
+# mechanism above is dead code, and serial builds only worked by link
+# order luck). Each object therefore gets a .d file produced by a fast,
+# order-free scan (preprocess with the current FPPFLAGS, then extract
+# "use MOD" / "submodule (PARENT)" relations in scripts/fortran-deps.sh):
+#
+#   %.d : %.F90 / %.f90 / %.f   (pattern rules below; VPATH finds sources)
+#   $(FDEP_OBJS): %.o : %.d     (every object waits for its own .d file)
+#   include $(FDEP_DEPS)         (hard include: missing .d files are built
+#                                 first -- in parallel, safely -- then make
+#                                 re-execs with the complete DAG)
+#
+# Module->object mapping: same-name by default, fixed renames plus the
+# per-SETUP families below (only one variant is compiled at a time, so
+# the mapping must follow the current variables, not the disk). Modules
+# with no findable source (mpi, omp_lib, hdf5, ...) are external and get
+# no edge. Unknown modules warn on stderr (add a mapping if project code).
+#
+# Delete a stale .d by hand if you hand-edit use statements and make
+# misbehaves; otherwise .d files are refreshed automatically and wiped
+# by "make clean" (hence also on SYSTEM/SETUP/flag changes).
+#
+empty :=
+space := $(empty) $(empty)
+comma := ,
+FDEP_MAP = setup=$(subst $(space),$(comma),$(basename $(SETUPFILE))) \
+           bondiexact=$(basename $(filter bondiexact%,$(SETUPFILE))) \
+           analysis=$(basename $(ANALYSIS)) \
+           moddump=$(basename $(MODFILE)) \
+           kernel=$(basename $(SRCKERNEL)) \
+           metric=$(basename $(SRCMETRIC)) \
+           inject=$(subst $(space),$(comma),$(basename $(SRCINJECT))) \
+           externalforces=$(basename $(filter externalforces%,$(SRCPOT))) \
+           extern_binary=$(basename $(filter extern_binary%,$(SRCPOT))) \
+           testexternf=$(basename $(filter test_externf%,$(SRCTEST)))
+FDEP_OBJS = $(sort $(OBJECTS) $(OBJDUMP) $(OBJLIBSETUP) $(OBJSETUP) \
+                   $(OBJTEST) $(OBJA) $(OBJMOD) $(OBJLIBA) phantom.o)
+FDEP_DEPS = $(FDEP_OBJS:.o=.d)
+
+# every object waits for its own .d file (static pattern: prerequisites only)
+$(FDEP_OBJS): %.o: %.d
+
+%.d: %.F90
+	@if grep -q '^[[:space:]]*#' $<; then \
+	    ($(FC) -E $(FPPFLAGS) $< 2>/dev/null || { echo "fortran-deps: warning: preprocessing $< failed, falling back to raw scan" >&2; cat $<; }); \
+	else cat $<; fi | ../scripts/fortran-deps.sh $* $@ "$(VPATH)" "$(FDEP_MAP)"
+%.d: %.f90
+	@../scripts/fortran-deps.sh $* $@ "$(VPATH)" "$(FDEP_MAP)" < $<
+%.d: %.f
+	@../scripts/fortran-deps.sh $* $@ "$(VPATH)" "$(FDEP_MAP)" < $<
+
+# NOTE: config.d must NOT depend on phantom-version.h, even order-only:
+# anything (re)made during the makefile-remake phase is not remade again in
+# the goal phase, so a config-change clean in between would leave config.o
+# compiling against a deleted header. The fallback raw scan of config.F90
+# is exact (it has no conditional "use" lines), and config.o itself keeps
+# its normal prerequisite on the header, which is race-free.
+
+# Config-change handling that is safe under "make -j".
+#
+# Every object below depends NORMALLY on .configstamp: make must finish the
+# stamp -- including its conditional clean -- before even stat()ing any
+# object, which is race-free by construction. (The previous recipe-time
+# "make clean" inside checksystem/checkparams raced: object freshness was
+# snapshotted while the concurrent rm ran, so archivers saw half-deleted
+# trees. Order-only prerequisites do NOT order those snapshots, only recipe
+# execution, so they could not fix it.) The stamp is touched only when the
+# configuration actually changed, so steady state stays incremental.
+.configstamp: FORCE
+	@if [ "$(SYSTEM)" != "$$(cat .make_lastsystem 2>/dev/null)" ] || \
+	    [ "$(SETUP)" != "$$(cat .make_lastsetup 2>/dev/null)" ] || \
+	    [ "$(FPPFLAGS)" != "$$(cat .make_lastfppflags 2>/dev/null)" ] || \
+	    [ "$(FFLAGS)" != "$$(cat .make_lastfflags 2>/dev/null)" ]; then \
+	    echo "configuration changed, cleaning build directory..."; \
+	    $(MAKE) clean; touch $@; fi
+# the stamp clean above also wipes the generated version header, so make
+# sure it exists again before any compilation can start (same recipe =
+# atomic with the clean; a prerequisite edge would race with it instead)
+	@test -f phantom-version.h || $(MAKE) --no-print-directory phantom-version.h
+FORCE:
+$(FDEP_OBJS): .configstamp
+# the flag checks only write their .make_last* records, so they must run
+# after the stamp has read the previous records
+checksystem checkparams: | .configstamp
+
+# manual pre-pass / debugging aid (also useful to warm the cache)
+.PHONY: depend
+depend: $(FDEP_DEPS)
+	@echo "dependency files up to date"
+
+# remove partial outputs if a recipe fails (matters for .d pipelines)
+.DELETE_ON_ERROR:
+
+# skip dep tracking for housekeeping goals (avoids generating .d just to clean)
+_FDEP_SKIP := clean% cleandist depends compilers err get_setup_opts get_setup_file
+ifneq ($(MAKECMDGOALS),)
+ifeq ($(filter $(_FDEP_SKIP),$(MAKECMDGOALS)),$(MAKECMDGOALS))
+FDEP_OFF := yes
+endif
+endif
+ifndef FDEP_OFF
+include $(FDEP_DEPS)
+endif
+
 # only emit DISPLAY when VAR is yes (avoids printing "no" in setup opts)
 yesopt = $(if $(filter yes,$($1)),$2,)
 get_setup_opts:
@@ -1425,7 +1533,7 @@ err:
 	$(error aborting);
 
 clean: cleanlibphantom
-	rm -f *.o *.mod phantom-version.h
+	rm -f *.o *.mod *.smod *.d phantom-version.h
 	cd $(BINDIR); rm -f phantom phantomsetup
 ifeq ($(KROME),yes)
 	rm -f ${KROMEPATH}/build/*.o ${KROMEPATH}/build/*.mod ${KROMEPATH}/build/libkrome.so

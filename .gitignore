@@ -1,5 +1,8 @@
 *.mod
 *.o
+*.smod
+*.d
+build/.configstamp
 *.make*
 .directory
 build/.directory
