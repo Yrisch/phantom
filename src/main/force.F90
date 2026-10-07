@@ -852,6 +852,7 @@ subroutine exchange_ghosts(npart,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dustprop,
                            eos_vars,dens,metrics,apr_level)
  use io,          only:nprocs,fatal
  use mpiforce,    only:exchange_slabs
+ use mpighosts,   only:copy_ghost
  use neighkdtree, only:get_remote_leaves,set_ghost_leaves,node
  use part,        only:treecache
  integer,         intent(in)    :: npart
@@ -862,11 +863,14 @@ subroutine exchange_ghosts(npart,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dustprop,
  integer(kind=8), allocatable :: keysend(:),keyreq(:)
  integer,         allocatable :: ifirst(:),icount(:)
  real,            allocatable :: sendbuf(:),recvbuf(:),xcen(:,:),mass(:)
+ integer, parameter :: nhead = 5
  integer :: nsendkey,nreq,i,k,ileaf,irank,ip,ipos,nfield,n,nghost,ireq
  integer :: nsend(nprocs),nrecv(nprocs)
  logical :: anyflag
  real    :: buf1(4096)
 
+ ! the leaves requested by the walk in rounds (the pairs are mirrored, so the
+ ! leaves to send are known on both sides)
  call get_remote_leaves(nsendkey,keysend,nreq,keyreq)
 
  ! number of fields of a particle (its mass, then the fields read in force)
@@ -881,7 +885,7 @@ subroutine exchange_ghosts(npart,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dustprop,
     irank = int(keysend(i)/2_8**32)
     ileaf = int(mod(keysend(i),2_8**32))
     n = inoderange(2,ileaf) - inoderange(1,ileaf) + 1
-    nsend(irank+1) = nsend(irank+1) + 5 + n*nfield
+    nsend(irank+1) = nsend(irank+1) + nhead + n*nfield
  enddo
  allocate(sendbuf(max(sum(nsend),1)))
  ipos = 0
@@ -891,7 +895,7 @@ subroutine exchange_ghosts(npart,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dustprop,
     sendbuf(ipos+1) = real(ileaf)
     sendbuf(ipos+2) = real(n)
     sendbuf(ipos+3:ipos+5) = node(ileaf)%xcen
-    ipos = ipos + 5
+    ipos = ipos + nhead
     do k=inoderange(1,ileaf),inoderange(2,ileaf)
        ip = abs(inodeparts(k))
        if (ip > maxpsph) call fatal('exchange_ghosts','sink particles in the tree are not handled')
@@ -917,7 +921,7 @@ subroutine exchange_ghosts(npart,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dustprop,
           call fatal('exchange_ghosts','leaf received is not the one requested')
        n = nint(recvbuf(ipos+2))
        xcen(:,ireq) = recvbuf(ipos+3:ipos+5)
-       ipos = ipos + 5
+       ipos = ipos + nhead
        ifirst(ireq) = npart + nghost + 1
        icount(ireq) = n
        do k=1,n
@@ -945,128 +949,14 @@ end subroutine exchange_ghosts
 !+
 !----------------------------------------------------------------
 subroutine clear_ghosts(npart,xyzh)
- use part, only:iphase,maxphase,maxp
  integer, intent(in)    :: npart
  real,    intent(inout) :: xyzh(:,:)
 
- if (nghost_force > 0) then
-    xyzh(:,npart+1:npart+nghost_force) = 0.
-    if (maxphase==maxp) iphase(npart+1:npart+nghost_force) = 0
- endif
+ ! iphase is left as it is: particles set later in these slots may rely on it
+ if (nghost_force > 0) xyzh(:,npart+1:npart+nghost_force) = 0.
  nghost_force = 0
 
 end subroutine clear_ghosts
-
-!----------------------------------------------------------------
-!+
-!  copy the fields of particle i read for a neighbour in force to
-!  buf (pack) or from buf (unpack), from position ipos. Only the
-!  arrays allocated for all the particles are copied (the others
-!  are not used with this setup). Same order for both, by design
-!+
-!----------------------------------------------------------------
-subroutine copy_ghost(pack,i,buf,ipos,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dustprop,dustfrac,&
-                      eos_vars,dens,metrics,apr_level)
- use part, only:gradh,alphaind,rho,dvdx,iphase,eta_nimhd,filfac,fxyz_dragold,ibin_old
- logical,         intent(in)    :: pack
- integer,         intent(in)    :: i
- real,            intent(inout) :: buf(:)
- integer,         intent(inout) :: ipos
- real,            intent(inout) :: xyzh(:,:),vxyzu(:,:),Bevol(:,:),rad(:,:),radprop(:,:)
- real,            intent(inout) :: dustprop(:,:),dustfrac(:,:),eos_vars(:,:),dens(:),metrics(:,:,:,:)
- real(kind=4),    intent(inout) :: divcurlv(:,:)
- integer(kind=1), intent(inout) :: apr_level(:)
- integer :: nfull
-
- nfull = size(xyzh,2)
- call copy_r8(xyzh)
- call copy_r8(vxyzu)
- call copy_r4(divcurlv)
- call copy_r8(Bevol)
- call copy_r8(rad)
- call copy_r8(radprop)
- call copy_r8(dustprop)
- call copy_r8(dustfrac)
- call copy_r8(eos_vars)
- call copy_r8_1(dens)
- if (size(metrics,4) == nfull) then
-    if (pack) then
-       buf(ipos+1:ipos+size(metrics(:,:,:,i))) = reshape(metrics(:,:,:,i),(/size(metrics(:,:,:,i))/))
-    else
-       metrics(:,:,:,i) = reshape(buf(ipos+1:ipos+size(metrics(:,:,:,i))),shape(metrics(:,:,:,i)))
-    endif
-    ipos = ipos + size(metrics(:,:,:,i))
- endif
- call copy_i1(apr_level)
- call copy_r4(gradh)
- call copy_r4(alphaind)
- call copy_r8_1(rho)
- call copy_r4(dvdx)
- call copy_i1(iphase)
- call copy_r8(eta_nimhd)
- call copy_r8_1(filfac)
- call copy_r8(fxyz_dragold)
- call copy_i1(ibin_old)
-
-contains
-
-subroutine copy_r8(a)
- real, intent(inout) :: a(:,:)
- integer :: nf
-
- if (size(a,2) /= nfull) return
- nf = size(a,1)
- if (pack) then
-    buf(ipos+1:ipos+nf) = a(:,i)
- else
-    a(:,i) = buf(ipos+1:ipos+nf)
- endif
- ipos = ipos + nf
-
-end subroutine copy_r8
-
-subroutine copy_r4(a)
- real(kind=4), intent(inout) :: a(:,:)
- integer :: nf
-
- if (size(a,2) /= nfull) return
- nf = size(a,1)
- if (pack) then
-    buf(ipos+1:ipos+nf) = real(a(:,i))
- else
-    a(:,i) = real(buf(ipos+1:ipos+nf),kind=4)
- endif
- ipos = ipos + nf
-
-end subroutine copy_r4
-
-subroutine copy_r8_1(a)
- real, intent(inout) :: a(:)
-
- if (size(a) /= nfull) return
- if (pack) then
-    buf(ipos+1) = a(i)
- else
-    a(i) = buf(ipos+1)
- endif
- ipos = ipos + 1
-
-end subroutine copy_r8_1
-
-subroutine copy_i1(a)
- integer(kind=1), intent(inout) :: a(:)
-
- if (size(a) /= nfull) return
- if (pack) then
-    buf(ipos+1) = real(a(i))
- else
-    a(i) = int(nint(buf(ipos+1)),kind=1)
- endif
- ipos = ipos + 1
-
-end subroutine copy_i1
-
-end subroutine copy_ghost
 
 !----------------------------------------------------------------
 !+
@@ -2787,7 +2677,6 @@ subroutine compute_cell(cell,listneigh,nneigh,Bevol,xyzh,vxyzu,fxyzu, &
 
  logical                         :: realviscosity
  logical                         :: useresistiveheat
- logical                         :: ignoreself
 
  integer                         :: i,ip
 

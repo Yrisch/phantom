@@ -70,6 +70,7 @@ module neighkdtree
  public :: sync_hmax_mpi
  public :: get_global_pairs,dualwalk_rounds,start_local_rounds,get_leaf_walk
  public :: get_remote_leaves,set_ghost_leaves
+ public :: rebuild_ghost_tree
 
  private
 
@@ -196,9 +197,10 @@ end subroutine get_distance_from_centre_of_mass
 !+
 !-----------------------------------------------------------------------
 subroutine build_tree(npart,nactive,xyzh,vxyzu,for_apr)
- use io,           only:nprocs
+ use io,           only:nprocs,fatal
  use kdtree,       only:maketree,maketreeglobal!,revtree
- use dim,          only:mpi,use_sinktree
+ use dim,          only:mpi,use_sinktree,gravity
+ use mpighosts,    only:clear_tree_ghosts,exchange_tree_ghosts,nghost_tree
  use part,         only:nptmass,xyzmh_ptmass,maxp
  use allocutils,   only:allocate_array
  integer, intent(inout) :: npart
@@ -220,7 +222,15 @@ subroutine build_tree(npart,nactive,xyzh,vxyzu,for_apr)
  if (.not. allocated(listneigh)) call allocate_array('listneigh',listneigh,maxp)
  !$omp end parallel
 
- if (mpi .and. nprocs > 1) then
+ if (mpi .and. nprocs > 1 .and. .not.gravity) then
+    ! domains, then the local tree with the ghost particles of the other domains
+    if (use_sinktree) call fatal('build_tree','sink particles in the tree need gravity with MPI')
+    call clear_tree_ghosts(npart)
+    call maketreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,npart,cellatid,leaf_is_active,ncells,&
+                        apr_tree,global_only=.true.)
+    call exchange_tree_ghosts(npart)
+    call maketree(node,xyzh,npart+nghost_tree,leaf_is_active,ncells,apr_tree,nghost=nghost_tree)
+ elseif (mpi .and. nprocs > 1) then
     if (use_sinktree) then
        call maketreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,npart,cellatid,leaf_is_active,ncells,&
                            apr_tree,nptmass,xyzmh_ptmass)
@@ -341,7 +351,8 @@ subroutine get_neighbour_list(inode,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesi
  endif
 
  if (present(remote_export)) then
-    if (nprocs > 1) global_search = .true.
+    ! without gravity the neighbours on the other tasks are ghost particles in the local tree
+    if (nprocs > 1 .and. gravity) global_search = .true.
     remote_export = .false.
  else
     global_search = .false.
@@ -362,7 +373,7 @@ subroutine get_neighbour_list(inode,mylistneigh,nneigh,xyzh,xyzcache,ixyzcachesi
 
  get_f = (gravity .and. present(f))
 
- if (mpi .and. nprocs > 1 .and. present(f)) then
+ if (mpi .and. nprocs > 1 .and. gravity .and. present(f)) then
     ! force with MPI: leaves walked in rounds from the global walk (local and ghost neighbours)
     call get_leaf_walk(inode,mylistneigh,nneigh,xyzcache,ixyzcachesize,f)
     return
@@ -766,25 +777,25 @@ subroutine dualwalk_rounds(kslab,nroots_in,roots_in,istart_in,icount_in,srclist_
 
     ! the remote pairs left to open and the remote leaf-leaf pairs must be mirrored
     if (check_dualtree_mpi) then
-    nchk = max(nnewr,nleafrem-nleafrem0,1)
-    allocate(pairs_chk(3,nchk))
-    do ir=1,nnew
-       do j=1,rcount_new(ir)
-          pairs_chk(:,rstart_new(ir)+j) = (/roots_new(ir),srcrem_new(2,rstart_new(ir)+j),srcrem_new(1,rstart_new(ir)+j)/)
+       nchk = max(nnewr,nleafrem-nleafrem0,1)
+       allocate(pairs_chk(3,nchk))
+       do ir=1,nnew
+          do j=1,rcount_new(ir)
+             pairs_chk(:,rstart_new(ir)+j) = (/roots_new(ir),srcrem_new(2,rstart_new(ir)+j),srcrem_new(1,rstart_new(ir)+j)/)
+          enddo
        enddo
-    enddo
-    call check_pair_mirror(nnewr,pairs_chk,nmismatch)
-    if (reduceall_mpi('+',nmismatch) > 0) call fatal('dualwalk_rounds','remote pairs left to open are not mirrored')
-    nchk = 0
-    do islot=nrec0+1,nleafslots
-       do j=1,leafrem_count(islot)
-          nchk = nchk + 1
-          pairs_chk(:,nchk) = (/leafrec_cell(islot),leafrem(2,leafrem_start(islot)+j),leafrem(1,leafrem_start(islot)+j)/)
+       call check_pair_mirror(nnewr,pairs_chk,nmismatch)
+       if (reduceall_mpi('+',nmismatch) > 0) call fatal('dualwalk_rounds','remote pairs left to open are not mirrored')
+       nchk = 0
+       do islot=nrec0+1,nleafslots
+          do j=1,leafrem_count(islot)
+             nchk = nchk + 1
+             pairs_chk(:,nchk) = (/leafrec_cell(islot),leafrem(2,leafrem_start(islot)+j),leafrem(1,leafrem_start(islot)+j)/)
+          enddo
        enddo
-    enddo
-    call check_pair_mirror(nchk,pairs_chk,nmismatch)
-    if (reduceall_mpi('+',nmismatch) > 0) call fatal('dualwalk_rounds','remote leaf-leaf pairs are not mirrored')
-    deallocate(pairs_chk)
+       call check_pair_mirror(nchk,pairs_chk,nmismatch)
+       if (reduceall_mpi('+',nmismatch) > 0) call fatal('dualwalk_rounds','remote leaf-leaf pairs are not mirrored')
+       deallocate(pairs_chk)
     endif
     ! the output of this round is the input of the next one
     nroots = nnew
@@ -1249,8 +1260,26 @@ subroutine cache_ghosts(inode,ighost,mylistneigh,nneigh,xyzcache,ixyzcachesize)
     endif
  enddo
 
-
 end subroutine cache_ghosts
+
+!-----------------------------------------------------------------------
+!+
+!  MPI without gravity: after density, the ghost particles are chosen and
+!  sent again with the new h, and the local tree is rebuilt with them
+!  (the domains are kept)
+!+
+!-----------------------------------------------------------------------
+subroutine rebuild_ghost_tree(npart,xyzh)
+ use kdtree,    only:maketree
+ use mpighosts, only:exchange_tree_ghosts,nghost_tree
+ integer, intent(in)    :: npart
+ real,    intent(inout) :: xyzh(:,:)
+
+ call exchange_tree_ghosts(npart)
+ call maketree(node,xyzh,npart+nghost_tree,leaf_is_active,ncells,.false.,nghost=nghost_tree)
+ call list_active_leaves()
+
+end subroutine rebuild_ghost_tree
 
 !-----------------------------------------------------------------------
 !+

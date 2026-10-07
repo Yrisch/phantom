@@ -98,7 +98,7 @@ module kdtree
 !+
 !-------------------------------------------------------------------------------
  interface
-  module subroutine maketree(node, xyzh, np, leaf_is_active, ncells, apr_tree, refinelevels,nptmass,xyzmh_ptmass)
+  module subroutine maketree(node, xyzh, np, leaf_is_active, ncells, apr_tree, refinelevels,nptmass,xyzmh_ptmass,nghost)
    use io,   only:fatal,warning,iprint,iverbose
 !$ use omp_lib
    type(kdnode),    intent(out)   :: node(:) !ncellsmax+1)
@@ -110,6 +110,7 @@ module kdtree
    integer,         intent(out),   optional :: refinelevels
    integer,         intent(in),    optional :: nptmass
    real,            intent(inout), optional :: xyzmh_ptmass(:,:)
+   integer,         intent(in),    optional :: nghost
 
   end subroutine maketree
  end interface
@@ -122,7 +123,7 @@ module kdtree
 !-------------------------------------------------------------------------------
  interface
   module subroutine maketreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,&
-                          np,cellatid,leaf_is_active,ncells,apr_tree,nptmass,xyzmh_ptmass)
+                          np,cellatid,leaf_is_active,ncells,apr_tree,nptmass,xyzmh_ptmass,global_only)
    use io,           only:fatal,warning,id,nprocs,master
    use mpiutils,     only:reduceall_mpi
    use mpibalance,   only:balancedomains
@@ -145,6 +146,7 @@ module kdtree
    logical,         intent(in)    :: apr_tree
    integer,         intent(in),    optional :: nptmass
    real,            intent(inout), optional :: xyzmh_ptmass(:,:)
+   logical,         intent(in),    optional :: global_only ! stop after the levels of the domains
   end subroutine maketreeglobal
  end interface
 !-----------------------------------------------

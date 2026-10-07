@@ -39,9 +39,10 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
                   dustevol,ddustevol,filfac,dustfrac,eos_vars,time,dt,dtnew,pxyzu,&
                   dens,metrics,apr_level)
  use dim,            only:mhd,fast_divcurlB,gr,periodic,do_radiation,driving,&
-                          sink_radiation,use_dustgrowth,ind_timesteps,isothermal,mpi
+                          sink_radiation,use_dustgrowth,ind_timesteps,isothermal,mpi,gravity
  use io,             only:iprint,fatal,error
- use neighkdtree,    only:build_tree
+ use neighkdtree,    only:build_tree,rebuild_ghost_tree
+ use mpighosts,      only:refresh_tree_ghosts
  use densityforce,   only:densityiterate
  use ptmass,         only:ipart_rhomax,ptmass_calc_enclosed_mass,ptmass_boundary_crossing,get_pressure_on_sinks
  use externalforces, only:externalforce
@@ -187,10 +188,21 @@ subroutine derivs(icall,npart,nactive,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,&
  !
  stressmax = 0.
  if (sinks_have_heating(nptmass,xyzmh_ptmass)) call ptmass_calc_enclosed_mass(nptmass,npart,xyzh)
- ! dual tree walk over MPI: remote nodes and ghost particles for force
- if (mpi .and. nprocs > 1) &
-    call dualwalk_global_force(npart,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dustprop,dustfrac,&
-                               eos_vars,dens,metrics,apr_level)
+ if (mpi .and. nprocs > 1) then
+    if (gravity) then
+       ! dual tree walk over MPI: remote nodes and ghost particles for force
+       call dualwalk_global_force(npart,xyzh,vxyzu,divcurlv,Bevol,rad,radprop,dustprop,dustfrac,&
+                                  eos_vars,dens,metrics,apr_level)
+    else
+       ! ghost particles with the new h and the local tree with them, or
+       ! only their new values if neither the tree nor density were computed
+       if (icall==0 .or. icall==1) then
+          call rebuild_ghost_tree(npart,xyzh)
+       else
+          call refresh_tree_ghosts(npart)
+       endif
+    endif
+ endif
  call force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
             rad,drad,radprop,dustprop,dustgasprop,Vrel_disp,dustfrac,ddustevol,fext,fxyz_drag,&
             ipart_rhomax,dt,stressmax,eos_vars,dens,metrics,apr_level)

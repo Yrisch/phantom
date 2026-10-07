@@ -120,7 +120,7 @@ contains
 subroutine densityiterate(icall,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol,stressmax,&
                           fxyzu,fext,alphaind,gradh,rad,radprop,dvdx,apr_level)
  use dim,         only:maxp,curlv,ndivcurlB,maxalpha,mhd_nonideal,nalpha,&
-                     use_dust,fast_divcurlB,mpi,gr,use_apr
+                     use_dust,fast_divcurlB,mpi,gr,use_apr,gravity
  use io,          only:iprint,fatal,iverbose,id,master,real4,warning,error,nprocs
  use neighkdtree, only:leaf_is_active,get_neighbour_list,get_hmaxcell,&
                      listneigh,get_cell_location,set_hmaxcell,sync_hmax_mpi,&
@@ -545,7 +545,8 @@ subroutine densityiterate(icall,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol
 
  !$omp end parallel
 
- if (mpi) call sync_hmax_mpi
+ ! the hmax of the global tree is only used by the walk over the tasks (with gravity)
+ if (mpi .and. gravity) call sync_hmax_mpi
 
  if (calculate_density) then
     !--reduce values

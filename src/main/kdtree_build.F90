@@ -230,6 +230,15 @@ module procedure maketreeglobal
 
  enddo levels
 
+ ! the local tree is built by the caller (with the ghost particles of the other domains)
+ if (present(global_only)) then
+    if (global_only) then
+       refinelevels = 0
+       cellatid     = 0
+       return
+    endif
+ endif
+
  ! local tree
  if (sinktree) then
     call maketree(node,xyzh,np,leaf_is_active,ncells,apr_tree,refinelevels,nptmass,xyzmh_ptmass)
@@ -327,9 +336,9 @@ module procedure maketree
  ! construct root node, i.e. find bounds of all particles
  if (sinktree) then
     call construct_root_node(np,npcounter,irootnode,xmini,xmaxi,leaf_is_active,.false.,&
-                             xyzh,xyzmh_ptmass,nptmass)
+                             xyzh,xyzmh_ptmass,nptmass,nghost=nghost)
  else
-    call construct_root_node(np,npcounter,irootnode,xmini,xmaxi,leaf_is_active,.false.,xyzh)
+    call construct_root_node(np,npcounter,irootnode,xmini,xmaxi,leaf_is_active,.false.,xyzh,nghost=nghost)
  endif
 
  if (inoderange(1,irootnode)==0 .or. inoderange(2,irootnode)==0 ) then
@@ -845,7 +854,7 @@ end subroutine build_top_parallel
 !+
 !---------------------------------
 subroutine construct_root_node(np,nproot,irootnode,xmini,xmaxi,leaf_is_active,global_build,xyzh,&
-                               xyzmh_ptmass,nptmass)
+                               xyzmh_ptmass,nptmass,nghost)
  use boundary, only:cross_boundary
  use mpidomain,only:isperiodic
  use mpitree,  only:reduce_group
@@ -863,8 +872,9 @@ subroutine construct_root_node(np,nproot,irootnode,xmini,xmaxi,leaf_is_active,gl
  logical, intent(in)              :: global_build
  real,    intent(inout), optional :: xyzmh_ptmass(:,:)
  integer, intent(in),    optional :: nptmass
+ integer, intent(in),    optional :: nghost ! the last nghost particles are ghosts, flagged as inactive
  integer, allocatable :: nlive(:)
- integer :: i,ncross,ic,nchunk,nl
+ integer :: i,ncross,ic,nchunk,nl,ifirstghost
  real    :: xminpart,yminpart,zminpart,xmaxpart,ymaxpart,zmaxpart
  real    :: xi, yi, zi
 
@@ -878,6 +888,8 @@ subroutine construct_root_node(np,nproot,irootnode,xmini,xmaxi,leaf_is_active,gl
  ncross = 0
  nproot = 0
  ! the live particles are also counted per chunk of the arrays in this pass, for the copy below
+ ifirstghost = np + 1
+ if (present(nghost)) ifirstghost = np - nghost + 1
  nchunk = 1
 !$ nchunk = omp_get_max_threads()
  allocate(nlive(0:nchunk))
@@ -950,7 +962,7 @@ subroutine construct_root_node(np,nproot,irootnode,xmini,xmaxi,leaf_is_active,gl
     nlive(ic) = nlive(ic) + nlive(ic-1)
  enddo
  !$omp parallel do schedule(static) default(none) &
- !$omp shared(np,nchunk,xyzh,nlive,inodeparts,treecache,iphase,massoftype,aprmassoftype,apr_level) &
+ !$omp shared(np,nchunk,xyzh,nlive,inodeparts,treecache,iphase,massoftype,aprmassoftype,apr_level,ifirstghost) &
  !$omp shared(maxp,maxphase) &
  !$omp private(ic,i,nproot)
  do ic=1,nchunk
@@ -969,6 +981,7 @@ subroutine construct_root_node(np,nproot,irootnode,xmini,xmaxi,leaf_is_active,gl
           else
              inodeparts(nproot) = i
           endif
+          if (i >= ifirstghost) inodeparts(nproot) = -i
           treecache(1:4,nproot) = xyzh(1:4,i)
           if (maxphase==maxp) then
              if (use_apr) then
@@ -1145,19 +1158,14 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
     nodeentry%rightchild = 0
     maxlevel = max(level,maxlevel)
     minlevel = min(level,minlevel)
-    ! individual timesteps where we mark leaf node as active/inactive
-    if (ind_timesteps) then
-       !
-       !--mark leaf node as active (contains some active particles)
-       !  or inactive by setting the firstincell to +ve (active) or -ve (inactive)
-       !
-       if (nodeisactive) then
-          leaf_is_active(nnode) = 1
-       else
-          leaf_is_active(nnode) = -1
-       endif
-    else
+    !
+    !--mark leaf node as active (contains some active particles) or inactive
+    !  (individual timesteps, or only ghost particles of other MPI domains)
+    !
+    if (nodeisactive) then
        leaf_is_active(nnode) = 1
+    else
+       leaf_is_active(nnode) = -1
     endif
  else ! split this node and add children to stack
     iaxis  = maxloc(xmaxi - xmini,1) ! split along longest axis
