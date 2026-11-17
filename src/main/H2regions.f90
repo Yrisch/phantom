@@ -299,14 +299,15 @@ subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_v
  real,    intent(out)   :: hmin  ! smallest smoothing length of the ionised gas
  integer, parameter   :: maxits = 50, maxc = 128
  real,    allocatable :: dnpart(:,:),dnall(:),rprev2(:,:),rprevmax2(:),dr2sec(:)
- real,    allocatable :: dn_lo(:),dn_hi(:),r_lo(:),r_hi(:),deltar(:),rs(:)
+ real,    allocatable :: dn_lo(:),dn_hi(:),r_lo(:),r_hi(:),deltar(:),rs(:),dnbuf(:)
  integer, allocatable :: id_shell(:),isort(:),nsecall(:),offsec(:)
  logical, allocatable :: converged(:),escaped(:)
- integer              :: nshell(nprocs),displs(nprocs)
- integer              :: i,k,j,m,n,nsec,nneigh,nneigh_shell,nneigh_inner,nshell_tot,its,ifirst,ilast,nk
+ integer              :: nshell(nprocs),displs(nprocs),counts4(nprocs)
+ integer              :: i,k,j,m,n,p,nsec,nneigh,nneigh_shell,nneigh_inner,nshell_tot,its,ifirst,ilast,nk
  integer              :: nhot,nhot_loc
  real                 :: xsrc(3),log_Qi,coef,rs0,vnorm,ddyn,rbound,dntot,dnj,phi
  real                 :: xyzcache(3,maxc)
+ real                 :: rootbox(4),rootall(4*nprocs)
  logical              :: query,warm
 
  !
@@ -328,6 +329,23 @@ subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_v
     allocate(seen_by(max(npart,1)),k_of(max(npart,1)),dn_of(max(npart,1)))
     seen_by = 0
     istamp  = 0
+ endif
+
+ !
+ !-- root node (centre, size) of every rank, gathered once: the distance beyond
+ !   which there is no gas is then known locally for every source
+ !
+ if (npart > 0) then
+    rootbox(1:3) = node(irootnode)%xcen
+    rootbox(4)   = node(irootnode)%size
+ else
+    rootbox = (/0.,0.,0.,-1./)  ! no gas on this rank
+ endif
+ if (mpi) then
+    counts4 = 4
+    call allgatherv_mpi(rootbox,rootall,counts=counts4,displs=get_displs_mpi(counts4))
+ else
+    rootall(1:4) = rootbox
  endif
 
  ! squared sector radii of the previous update (-1 if none)
@@ -374,6 +392,7 @@ subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_v
     if (allocated(escaped))  deallocate(escaped)
     if (allocated(nsecall))  deallocate(nsecall)
     if (allocated(offsec))   deallocate(offsec)
+    if (allocated(dnbuf))    deallocate(dnbuf)
 
     allocate(dn_lo(nsec))
     allocate(dn_hi(nsec))
@@ -385,17 +404,18 @@ subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_v
     allocate(escaped(nsec))
     allocate(nsecall(nsec))
     allocate(offsec(nsec+1))
+    allocate(dnbuf(2*nsec))
 
     !-- photons used by particle j as a fraction of its sector's budget Q/nsec (eq. 3, 13)
     coef = real(nsec)*10.**(DNcoeff - log_Qi)
 
     !-- distance beyond which there is no gas: a sector reaching it lets its photons escape
-    if (npart > 0) then
-       rbound = sqrt(sum((node(irootnode)%xcen - xsrc)**2)) + node(irootnode)%size
-    else
-       rbound = 0.
-    endif
-    if (mpi) rbound = reduceall_mpi('max',rbound)  ! same on every rank, also those without gas
+    !   (same on every rank, also those without gas)
+    rbound = 0.
+    do p=1,nprocs
+       if (rootall(4*p) < 0.) cycle
+       rbound = max(rbound,sqrt(sum((rootall(4*p-3:4*p-1) - xsrc)**2)) + rootall(4*p))
+    enddo
     !
     !-- starting range [r_lo,r_hi] of each sector (eq. 7 and 8), identical on every rank
     !
@@ -455,9 +475,12 @@ subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_v
        !-- photon demand inside r_lo and r_hi of each sector, from the stored dnpart
        call sum_dnspheres(nneigh,dnpart,r_lo,r_hi,dn_lo,dn_hi)
 
-       if (mpi) then
-          dn_lo = reduceall_mpi('+',dn_lo)
-          dn_hi = reduceall_mpi('+',dn_hi)
+       if (mpi) then  ! one reduction for both sums
+          dnbuf(1:nsec)        = dn_lo
+          dnbuf(nsec+1:2*nsec) = dn_hi
+          dnbuf = reduceall_mpi('+',dnbuf)
+          dn_lo = dnbuf(1:nsec)
+          dn_hi = dnbuf(nsec+1:2*nsec)
        endif
 
        query = .false.
@@ -617,7 +640,7 @@ subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_v
  enddo sources
 
  if (allocated(dnpart)) deallocate(dnpart)
- if (allocated(dn_lo)) deallocate(dn_lo,dn_hi,r_lo,r_hi,deltar,rs,converged,escaped,nsecall,offsec)
+ if (allocated(dn_lo)) deallocate(dn_lo,dn_hi,r_lo,r_hi,deltar,rs,converged,escaped,nsecall,offsec,dnbuf)
  deallocate(rprev2,rprevmax2)
  if (mpi) hmin = reduceall_mpi('min',hmin)
 
