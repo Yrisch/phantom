@@ -382,29 +382,15 @@ subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_v
        nsec = 1
     endif
 
-    if (allocated(dn_lo))    deallocate(dn_lo)
-    if (allocated(dn_hi))    deallocate(dn_hi)
-    if (allocated(r_lo))     deallocate(r_lo)
-    if (allocated(r_hi))     deallocate(r_hi)
-    if (allocated(deltar))   deallocate(deltar)
-    if (allocated(rs))       deallocate(rs)
-    if (allocated(converged)) deallocate(converged)
-    if (allocated(escaped))  deallocate(escaped)
-    if (allocated(nsecall))  deallocate(nsecall)
-    if (allocated(offsec))   deallocate(offsec)
-    if (allocated(dnbuf))    deallocate(dnbuf)
-
-    allocate(dn_lo(nsec))
-    allocate(dn_hi(nsec))
-    allocate(r_lo(nsec))
-    allocate(r_hi(nsec))
-    allocate(deltar(nsec))
-    allocate(rs(nsec))
-    allocate(converged(nsec))
-    allocate(escaped(nsec))
-    allocate(nsecall(nsec))
-    allocate(offsec(nsec+1))
-    allocate(dnbuf(2*nsec))
+    !-- per sector arrays: nsec is 1 or nsec_H2R, reallocate only when it changes
+    if (allocated(dn_lo)) then
+       if (size(dn_lo) /= nsec) deallocate(dn_lo,dn_hi,r_lo,r_hi,deltar,rs,converged,escaped,&
+                                           nsecall,offsec,dnbuf)
+    endif
+    if (.not.allocated(dn_lo)) then
+       allocate(dn_lo(nsec),dn_hi(nsec),r_lo(nsec),r_hi(nsec),deltar(nsec),rs(nsec))
+       allocate(converged(nsec),escaped(nsec),nsecall(nsec),offsec(nsec+1),dnbuf(2*nsec))
+    endif
 
     !-- photons used by particle j as a fraction of its sector's budget Q/nsec (eq. 3, 13)
     coef = real(nsec)*10.**(DNcoeff - log_Qi)
@@ -464,8 +450,10 @@ subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_v
              call getneigh_pos(xsrc,0.,r_hi(1),listneigh,nneigh,xyzcache,maxc,leaf_is_active)
           endif
 
-          if (allocated(dnpart)) deallocate(dnpart)
-          allocate(dnpart(3,nneigh))
+          if (allocated(dnpart)) then  ! grow only
+             if (size(dnpart,2) < nneigh) deallocate(dnpart)
+          endif
+          if (.not.allocated(dnpart)) allocate(dnpart(3,max(nneigh,1)))
 
           !-- (d^2, y_j, sector) of every neighbour: the costly part, only after a new walk
           call compute_dnpart(i,nptmass,xyzmh_ptmass,rprev2,rprevmax2,coef,r_hi,xyzh,rho,&
