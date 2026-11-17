@@ -610,7 +610,10 @@ end subroutine HII_bound
 !  r_S(s) taken in the sector of s that contains j.
 !  dnpart(1:3,n) = (d^2, y_j, sector) of listneigh(n); sector 0 marks a
 !  particle that is not gas, dead, or beyond r_hi of its sector.
-!  None of this depends on r_lo, so it is only needed after a new walk
+!  None of this depends on r_lo, so it is only needed after a new walk.
+!  Only the sources whose last region can reach the range of i enter the
+!  flux sharing: a particle closer than r_hi to i and than r_S(s) to s
+!  needs |x_s - x_i| < r_S(s) + max(r_hi)
 !+
 !-----------------------------------------------------------------------
 subroutine compute_dnpart(i,nptmass,xyzmh_ptmass,rprev2,rprevmax2,coef,r_hi,xyzh,rho,&
@@ -622,14 +625,32 @@ subroutine compute_dnpart(i,nptmass,xyzmh_ptmass,rprev2,rprevmax2,coef,r_hi,xyzh
  real,    intent(in)  :: xyzmh_ptmass(:,:),rprev2(:,:),rprevmax2(:),coef,r_hi(:)
  real,    intent(in)  :: xyzh(:,:),rho(:)
  real,    intent(out) :: dnpart(:,:)
- integer :: j,n,s,k,ks,ipix,itypej
- real    :: dx(3),dxs(3),dr2,d2s,fsum
+ integer, allocatable :: icand(:)
+ real,    allocatable :: qrat(:)
+ integer :: j,n,s,c,k,ks,ipix,itypej,ncand
+ real    :: dx(3),dxs(3),dr2,d2s,d2is,fsum,rcand
  logical :: isactive,isgas,isdust
 
+ !
+ !-- sources that may share the flux of i, with Q_s/Q_i = 10**(logQ_s - logQ_i)
+ !   (kept O(1)). The margin keeps round-off from dropping a source that touches
+ !
+ allocate(icand(nptmass),qrat(nptmass))
+ ncand = 0
+ do s=1,nptmass
+    if (s == i .or. rprevmax2(s) < 0.) cycle  ! < 0: not a source, or no radius yet
+    d2is  = dot_product(xyzmh_ptmass(1:3,s)-xyzmh_ptmass(1:3,i),xyzmh_ptmass(1:3,s)-xyzmh_ptmass(1:3,i))
+    rcand = 1.0001*(sqrt(rprevmax2(s)) + maxval(r_hi))
+    if (d2is >= rcand**2) cycle
+    ncand = ncand + 1
+    icand(ncand) = s
+    qrat(ncand)  = 10.**(xyzmh_ptmass(irateion,s)-xyzmh_ptmass(irateion,i))
+ enddo
+
  !$omp parallel do default(none) &
- !$omp shared(nneigh,listneigh,iphase,xyzh,xyzmh_ptmass,i,nptmass,rprev2,rprevmax2) &
- !$omp shared(coef,rho,r_hi,nside_H2R,dnpart) &
- !$omp private(n,j,isactive,isgas,isdust,itypej,dx,dr2,ipix,k,fsum,s,dxs,d2s,ks)
+ !$omp shared(nneigh,listneigh,iphase,xyzh,xyzmh_ptmass,i,rprev2,rprevmax2) &
+ !$omp shared(coef,rho,r_hi,nside_H2R,dnpart,ncand,icand,qrat) &
+ !$omp private(n,j,isactive,isgas,isdust,itypej,dx,dr2,ipix,k,fsum,c,s,dxs,d2s,ks)
  do n=1,nneigh
 
     dnpart(:,n) = 0.
@@ -649,10 +670,10 @@ subroutine compute_dnpart(i,nptmass,xyzmh_ptmass,rprev2,rprevmax2,coef,r_hi,xyzh
 
     if (dr2 >= r_hi(k)**2) cycle  ! the tree returns whole leaves, beyond r_hi too
 
-    !-- sum_s F_sj / F_ij, with Q_s/Q_i = 10**(logQ_s - logQ_i) to keep numbers O(1)
+    !-- sum_s F_sj / F_ij
     fsum = 1.
-    do s=1,nptmass
-       if (s == i .or. rprevmax2(s) < 0.) cycle  ! < 0: not a source, or no radius yet
+    do c=1,ncand
+       s   = icand(c)
        dxs = xyzh(1:3,j) - xyzmh_ptmass(1:3,s)
        d2s = dot_product(dxs,dxs)
        if (d2s >= rprevmax2(s)) cycle             ! beyond every sector of s
@@ -662,8 +683,7 @@ subroutine compute_dnpart(i,nptmass,xyzmh_ptmass,rprev2,rprevmax2,coef,r_hi,xyzh
        else
           ks = 1
        endif
-       if (d2s < rprev2(ks,s)) fsum = fsum + 10.**(xyzmh_ptmass(irateion,s)-xyzmh_ptmass(irateion,i)) &
-                                             *dr2/max(d2s,tiny(d2s))
+       if (d2s < rprev2(ks,s)) fsum = fsum + qrat(c)*dr2/max(d2s,tiny(d2s))
     enddo
 
     dnpart(1,n) = dr2
@@ -672,6 +692,8 @@ subroutine compute_dnpart(i,nptmass,xyzmh_ptmass,rprev2,rprevmax2,coef,r_hi,xyzh
 
  enddo
  !$omp end parallel do
+
+ deallocate(icand,qrat)
 
 end subroutine compute_dnpart
 
