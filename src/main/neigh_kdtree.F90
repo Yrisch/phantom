@@ -830,10 +830,21 @@ subroutine getneigh_sectors(xpos,nsec,secdir,secbeta,rhisec,listneigh,nneigh)
  integer, intent(out) :: nneigh
  integer :: n,k,istack,il,ir
  integer :: nstack(maxdepth+1)
- real    :: dx,dy,dz,r2,d,s,alpha,ang,cosang,rnode,rhimax
+ real    :: dx,dy,dz,r2,d,s,ang,cosang,rnode,rhimax,sina,cosa
  real    :: xoffset,yoffset,zoffset,dummycache(3,1)
+ real    :: cosb(nsec),sinb(nsec)
+ logical :: wide(nsec)
 
  rhimax = maxval(rhisec(1:nsec))
+ !
+ !--cos(alpha+beta) = cos(alpha)cos(beta) - sin(alpha)sin(beta): no trig per node.
+ !  alpha < pi/2 always, so alpha+beta < pi unless beta >= pi/2 (wide sectors)
+ !
+ do k=1,nsec
+    cosb(k) = cos(secbeta(k))
+    sinb(k) = sin(secbeta(k))
+    wide(k) = (secbeta(k) >= 0.5*pi)
+ enddo
  nneigh = 0
  istack = 1
  nstack(istack) = irootnode
@@ -851,17 +862,24 @@ subroutine getneigh_sectors(xpos,nsec,secdir,secbeta,rhisec,listneigh,nneigh)
        d     = 0.
     else
        d     = sqrt(r2)
-       alpha = asin(s/d)           ! angular radius of the node seen from xpos
+       if (d - s >= rhimax) cycle over_stack  ! beyond every sector: no need to test them
+       sina  = s/d                 ! angular radius alpha of the node seen from xpos
+       cosa  = sqrt(max(1. - sina*sina,0.))
        rnode = 0.
        do k=1,nsec
           if (rhisec(k) <= rnode) cycle
-          ang = alpha + secbeta(k)
-          if (ang >= pi) then
-             rnode = rhisec(k)
-          else
+          if (wide(k)) then
+             ang = asin(sina) + secbeta(k)
+             if (ang >= pi) then
+                rnode = rhisec(k)
+                cycle
+             endif
              cosang = cos(ang)
-             if (dx*secdir(1,k) + dy*secdir(2,k) + dz*secdir(3,k) > d*cosang) rnode = rhisec(k)
+          else
+             cosang = cosa*cosb(k) - sina*sinb(k)
           endif
+          !-- small margin: round-off must not close a node the cone touches
+          if (dx*secdir(1,k) + dy*secdir(2,k) + dz*secdir(3,k) > d*(cosang - 1.e-12)) rnode = rhisec(k)
        enddo
     endif
 
