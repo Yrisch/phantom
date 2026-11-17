@@ -19,8 +19,9 @@ module HIIRegion
 !
 ! :Runtime parameters: None
 !
-! :Dependencies: dim, eos, eos_HIIR, infile_utils, io, kernel, neighkdtree,
-!   part, physcon, sortutils, units
+! :Dependencies: cooling_HIIR, dim, eos, eos_HIIR, healpix, infile_utils,
+!   io, kdtree, kernel, mpiutils, neighkdtree, part, physcon, sortutils,
+!   units
 !
  use eos_HIIR,   only:csion,uIon,Tion,Tcold,muion
  use eos,        only:gmw
@@ -633,7 +634,6 @@ subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_v
  if (mpi) hmin = reduceall_mpi('min',hmin)
 
 end subroutine HII_bound
-
 
 !-----------------------------------------------------------------------
 !+
