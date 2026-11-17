@@ -48,6 +48,11 @@ module HIIRegion
  logical, allocatable, public  :: sectors_on(:)   ! sink solved in sectors (else isotropic) (maxptmass)
  real   , allocatable          :: secdir(:,:)     ! unit vector of the centre of each sector (3,nsec)
  real   , allocatable          :: secbeta(:)      ! angular radius of each sector: centre to farthest corner
+ !-- per particle cache of HII_bound, valid while seen_by(j) == istamp: sector k_of(j)
+ !   (0 = not gas) and photon demand dn_of(j) (< 0 = not computed yet)
+ integer, allocatable          :: seen_by(:),k_of(:)
+ real   , allocatable          :: dn_of(:)
+ integer                       :: istamp = 0
 
  integer, parameter :: maxcache  = 1024
 
@@ -311,6 +316,20 @@ subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_v
  if (maxvxyzu < 4) eos_vars(itemp,:) = Tcold  ! cooling in isothermal case
  hmin = huge(hmin)
 
+ !
+ !-- per particle cache: a particle pays its sector and flux sharing once per
+ !   source and update, however often the range grows. Kept between calls
+ !   (grown when npart grows) and stamped, so it is never cleared
+ !
+ if (allocated(seen_by)) then
+    if (size(seen_by) < npart) deallocate(seen_by,k_of,dn_of)
+ endif
+ if (.not.allocated(seen_by)) then
+    allocate(seen_by(max(npart,1)),k_of(max(npart,1)),dn_of(max(npart,1)))
+    seen_by = 0
+    istamp  = 0
+ endif
+
  ! squared sector radii of the previous update (-1 if none)
  ! used for the flux sharing of overlapping regions
  allocate(rprev2(nsec_H2R,nptmass),rprevmax2(nptmass))
@@ -330,6 +349,11 @@ subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_v
     log_Qi = xyzmh_ptmass(irateion,i)
     if (log_Qi < epsilon(log_Qi)) cycle sources !-- not bright enough...
     xsrc = xyzmh_ptmass(1:3,i)
+    if (istamp == huge(istamp)) then  ! stamps used up: start again
+       seen_by = 0
+       istamp  = 0
+    endif
+    istamp = istamp + 1
 
     warm = (xyzmh_ptmass(irstrom,i) > 0. .and. all(rstrom_sec(:,i) > 0.))
     if (.not.warm) sectors_on(i) = .true.
@@ -425,7 +449,7 @@ subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_v
 
           !-- (d^2, y_j, sector) of every neighbour: the costly part, only after a new walk
           call compute_dnpart(i,nptmass,xyzmh_ptmass,rprev2,rprevmax2,coef,r_hi,xyzh,rho,&
-                              listneigh,nneigh,dnpart)
+                              listneigh,nneigh,dnpart,istamp,seen_by,k_of,dn_of)
        endif
 
        !-- photon demand inside r_lo and r_hi of each sector, from the stored dnpart
@@ -611,20 +635,27 @@ end subroutine HII_bound
 !  dnpart(1:3,n) = (d^2, y_j, sector) of listneigh(n); sector 0 marks a
 !  particle that is not gas, dead, or beyond r_hi of its sector.
 !  None of this depends on r_lo, so it is only needed after a new walk.
+!  The sector and y_j of each particle are cached for this source and
+!  update in k_of, dn_of (seen_by(j) == istamp): a new walk after r_hi
+!  grew only evaluates the particles the previous walks did not return.
 !  Only the sources whose last region can reach the range of i enter the
 !  flux sharing: a particle closer than r_hi to i and than r_S(s) to s
-!  needs |x_s - x_i| < r_S(s) + max(r_hi)
+!  needs |x_s - x_i| < r_S(s) + max(r_hi). A source left out at an earlier
+!  walk cannot reach a particle cached then, closer than the earlier,
+!  smaller r_hi to i, so the cache stays valid when r_hi grows
 !+
 !-----------------------------------------------------------------------
 subroutine compute_dnpart(i,nptmass,xyzmh_ptmass,rprev2,rprevmax2,coef,r_hi,xyzh,rho,&
-                          listneigh,nneigh,dnpart)
+                          listneigh,nneigh,dnpart,istamp,seen_by,k_of,dn_of)
  use part,    only:get_pmass,iphase,get_partinfo,isdead_or_accreted,irateion
  use healpix, only:vec2pix_nest
- integer, intent(in)  :: i,nptmass,nneigh
+ integer, intent(in)  :: i,nptmass,nneigh,istamp
  integer, intent(in)  :: listneigh(:)
  real,    intent(in)  :: xyzmh_ptmass(:,:),rprev2(:,:),rprevmax2(:),coef,r_hi(:)
  real,    intent(in)  :: xyzh(:,:),rho(:)
  real,    intent(out) :: dnpart(:,:)
+ integer, intent(inout) :: seen_by(:),k_of(:)
+ real,    intent(inout) :: dn_of(:)
  integer, allocatable :: icand(:)
  real,    allocatable :: qrat(:)
  integer :: j,n,s,c,k,ks,ipix,itypej,ncand
@@ -649,45 +680,54 @@ subroutine compute_dnpart(i,nptmass,xyzmh_ptmass,rprev2,rprevmax2,coef,r_hi,xyzh
 
  !$omp parallel do default(none) &
  !$omp shared(nneigh,listneigh,iphase,xyzh,xyzmh_ptmass,i,rprev2,rprevmax2) &
- !$omp shared(coef,rho,r_hi,nside_H2R,dnpart,ncand,icand,qrat) &
+ !$omp shared(coef,rho,r_hi,nside_H2R,dnpart,ncand,icand,qrat,istamp,seen_by,k_of,dn_of) &
  !$omp private(n,j,isactive,isgas,isdust,itypej,dx,dr2,ipix,k,fsum,c,s,dxs,d2s,ks)
  do n=1,nneigh
 
     dnpart(:,n) = 0.
-    j = listneigh(n)
-    call get_partinfo(iphase(j),isactive,isgas,isdust,itypej)
-    if (.not.isgas .or. isdead_or_accreted(xyzh(4,j))) cycle
-
+    j   = listneigh(n)
     dx  = xyzh(1:3,j) - xyzmh_ptmass(1:3,i)
     dr2 = dot_product(dx,dx)
 
-    if (size(r_hi) > 1 .and. dr2 > 0.) then  ! size 1: isotropic, a single sector
-       call vec2pix_nest(nside_H2R,dx,ipix)
-       k = ipix + 1
-    else
-       k = 1
+    if (seen_by(j) /= istamp) then  ! first time this source meets j: its sector
+       seen_by(j) = istamp
+       dn_of(j)   = -1.
+       call get_partinfo(iphase(j),isactive,isgas,isdust,itypej)
+       if (.not.isgas .or. isdead_or_accreted(xyzh(4,j))) then
+          k_of(j) = 0
+       elseif (size(r_hi) > 1 .and. dr2 > 0.) then  ! size 1: isotropic, a single sector
+          call vec2pix_nest(nside_H2R,dx,ipix)
+          k_of(j) = ipix + 1
+       else
+          k_of(j) = 1
+       endif
     endif
 
+    k = k_of(j)
+    if (k == 0) cycle
     if (dr2 >= r_hi(k)**2) cycle  ! the tree returns whole leaves, beyond r_hi too
 
-    !-- sum_s F_sj / F_ij
-    fsum = 1.
-    do c=1,ncand
-       s   = icand(c)
-       dxs = xyzh(1:3,j) - xyzmh_ptmass(1:3,s)
-       d2s = dot_product(dxs,dxs)
-       if (d2s >= rprevmax2(s)) cycle             ! beyond every sector of s
-       if (d2s > 0.) then
-          call vec2pix_nest(nside_H2R,dxs,ipix)
-          ks = ipix + 1
-       else
-          ks = 1
-       endif
-       if (d2s < rprev2(ks,s)) fsum = fsum + qrat(c)*dr2/max(d2s,tiny(d2s))
-    enddo
+    if (dn_of(j) < 0.) then  ! demand not computed yet for source i
+       !-- sum_s F_sj / F_ij
+       fsum = 1.
+       do c=1,ncand
+          s   = icand(c)
+          dxs = xyzh(1:3,j) - xyzmh_ptmass(1:3,s)
+          d2s = dot_product(dxs,dxs)
+          if (d2s >= rprevmax2(s)) cycle             ! beyond every sector of s
+          if (d2s > 0.) then
+             call vec2pix_nest(nside_H2R,dxs,ipix)
+             ks = ipix + 1
+          else
+             ks = 1
+          endif
+          if (d2s < rprev2(ks,s)) fsum = fsum + qrat(c)*dr2/max(d2s,tiny(d2s))
+       enddo
+       dn_of(j) = coef*get_pmass(j,.true.)*rho(j)/fsum
+    endif
 
     dnpart(1,n) = dr2
-    dnpart(2,n) = coef*get_pmass(j,.true.)*rho(j)/fsum
+    dnpart(2,n) = dn_of(j)
     dnpart(3,n) = real(k)
 
  enddo
