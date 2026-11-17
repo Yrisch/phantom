@@ -152,6 +152,9 @@ subroutine setpart(id,npart,npartoftype,xyzh,massoftype,vxyzu,polyk,gamma,hfact,
  call set_velfield_from_cubes(xyzh,vxyzu,npartoftype(igas),filex,filey,filez,1.,rmax,.false.,ierr)
  if (ierr /= 0) call fatal('setup','error setting up velocity field')
 
+ !--Setting the centre of mass of the cloud to be zero
+ call reset_centreofmass(npart,xyzh,vxyzu)
+
  !--Normalise the energy
  call init_rho_from_h()
  call normalise_vfield(npart,vxyzu,ierr,ke=epotgrav)
@@ -169,8 +172,6 @@ subroutine setpart(id,npart,npartoftype,xyzh,massoftype,vxyzu,polyk,gamma,hfact,
     if (Mcloud_msun >= 1e4 .and. Rcloud_pc > 5.) gamma = 5./3.
  endif
 
- !--Setting the centre of mass of the cloud to be zero
- call reset_centreofmass(npart,xyzh,vxyzu)
 
  ! always set the accretion radius from the value in au given in the .setup file
  h_acc = Rsink_au*au/udist
