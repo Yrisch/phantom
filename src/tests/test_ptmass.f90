@@ -2135,13 +2135,16 @@ end subroutine bench_HIIregion
 !  Benchmark the bounded method (iH2R=4) on a cluster of sources whose
 !  HII regions overlap, so the flux sharing is exercised: a cold call
 !  from new sources, then warm calls as in a run (HIIdt = dt_HII).
-!  Cases: 12 sectors, 48 sectors, and 12 sectors among 1000 sinks, most
-!  of them not ionising (as in a cluster run).
+!  Cases: 27 sources with 12 sectors, 48 sectors, and 12 sectors among
+!  1000 sinks, most of them not ionising (as in a cluster run); then
+!  2 to 16 of the sources; 8 sources, one much brighter. Each case runs
+!  with OpenMP within each source, over the sources, and as the code
+!  chooses (iH2R_omp = 1, 2, 0): the results must agree.
 !  Prints the wall time of each call and checksums of the result
 !+
 !-----------------------------------------------------------------------
 subroutine bench_HII_cluster()
- use dim,            only:periodic,mpi
+ use dim,            only:periodic,mpi,maxvxyzu
  use io,             only:id,master,iprint,nprocs
  use part,           only:nptmass,xyzmh_ptmass,vxyz_ptmass,npart,xyzh,vxyzu,&
                           init_part,irstrom,irateion,rho,eos_vars,imu
@@ -2149,14 +2152,18 @@ subroutine bench_HII_cluster()
  use timing,         only:getused
  use mpiutils,       only:barrier_mpi,reduceall_mpi
  use omputils,       only:init_omp,omp_num_threads
- use HIIRegion,      only:HII_feedback,iH2R,nside_H2R,nHIIsources,HIIdt,dt_HII
+ use HIIRegion,      only:HII_feedback,iH2R,nside_H2R,nHIIsources,HIIdt,dt_HII,initialize_H2R,iH2R_omp
  use random,         only:ran2
- integer, parameter :: nlat = 3, nwarm = 5, ncase = 3, nsinks = 1000
- integer, parameter :: nside_case(ncase) = (/1,2,1/)
- logical, parameter :: dark_case(ncase)  = (/.false.,.false.,.true./)
+ integer, parameter :: nlat = 3, nwarm = 5, ncase = 8, nsinks = 1000, nmode = 3
+ integer, parameter :: mode_omp(nmode) = (/1,2,0/)
+ integer, parameter :: nside_case(ncase) = (/1,2,1,1,1,1,1,1/)
+ integer, parameter :: nsrc_case(ncase)  = (/27,27,27,2,4,8,16,8/)
+ logical, parameter :: dark_case(ncase)  = (/.false.,.false.,.true.,.false.,.false.,.false.,.false.,.false./)
+ real,    parameter :: logQ1_case(ncase) = (/49.5,49.5,49.5,49.5,49.5,49.5,49.5,51./) ! of the first source
  real,    parameter :: logQsrc = 49.5, spacing = 0.6, xdark = 1.6
- integer :: ix,iy,iz,ical,icase,nion,i,nsrc,iseed
- real    :: rho0,tcall(0:nwarm),rsum
+ integer :: ix,iy,iz,ical,icase,nion,i,nsrc,iseed,imode
+ real    :: rho0,tcall(0:nwarm),rsum,ttot(nmode)
+ real, allocatable :: u0(:)
  real(kind=4) :: t1,t2
 
  if (periodic) then
@@ -2167,70 +2174,84 @@ subroutine bench_HII_cluster()
  do icase=1,ncase
     nside_H2R = nside_case(icase)
     call setup_HII_sphere(logQsrc,rho0)   ! calls initialize_H2R with this nside
-    !
-    !-- nlat**3 sources on a lattice, spacing ~1.3 Stromgren radii: the regions overlap
-    !
-    nptmass = 0
-    do iz=1,nlat
-       do iy=1,nlat
-          do ix=1,nlat
-             nptmass = nptmass + 1
-             xyzmh_ptmass(1,nptmass) = spacing*(ix - 2) + 1.e-3
-             xyzmh_ptmass(2,nptmass) = spacing*(iy - 2) + 2.e-3
-             xyzmh_ptmass(3,nptmass) = spacing*(iz - 2) + 3.e-3
-             xyzmh_ptmass(4,nptmass) = -1.
-             xyzmh_ptmass(irateion,nptmass) = logQsrc
-             xyzmh_ptmass(irstrom,nptmass)  = -1.
+    if (maxvxyzu >= 4) u0 = vxyzu(4,1:npart)
+    do imode=1,nmode
+       iH2R_omp = mode_omp(imode)
+       !
+       !-- nsrc of the nlat**3 sources on a lattice, spacing ~1.3 Stromgren radii:
+       !   the regions overlap
+       !
+       nptmass = 0
+       do iz=1,nlat
+          do iy=1,nlat
+             do ix=1,nlat
+                if (nptmass >= nsrc_case(icase)) cycle
+                nptmass = nptmass + 1
+                xyzmh_ptmass(1,nptmass) = spacing*(ix - 2) + 1.e-3
+                xyzmh_ptmass(2,nptmass) = spacing*(iy - 2) + 2.e-3
+                xyzmh_ptmass(3,nptmass) = spacing*(iz - 2) + 3.e-3
+                xyzmh_ptmass(4,nptmass) = -1.
+                xyzmh_ptmass(irateion,nptmass) = logQsrc
+                xyzmh_ptmass(irstrom,nptmass)  = -1.
+             enddo
           enddo
        enddo
-    enddo
-    nsrc = nptmass
-    !
-    !-- sinks that do not ionise, spread through the cloud
-    !
-    if (dark_case(icase)) then
-       iseed = -2581
-       do i=1,nsinks-nsrc
-          nptmass = nptmass + 1
-          xyzmh_ptmass(1,nptmass) = xdark*(2.*ran2(iseed) - 1.)
-          xyzmh_ptmass(2,nptmass) = xdark*(2.*ran2(iseed) - 1.)
-          xyzmh_ptmass(3,nptmass) = xdark*(2.*ran2(iseed) - 1.)
-          xyzmh_ptmass(4,nptmass) = -1.
-          xyzmh_ptmass(irateion,nptmass) = 0.
-          xyzmh_ptmass(irstrom,nptmass)  = -1.
-       enddo
-    endif
-    vxyz_ptmass(:,1:nptmass) = 0.
-    nHIIsources = nsrc
-    call init_omp()
-    if (id==master) write(iprint,"(/,a,i0,a,i0,a,i0,a,i0,a,i0,a)") '--> benchmarking HII regions of ',nsrc,&
-       ' overlapping sources among ',nptmass,' sinks, ',12*nside_H2R**2,' sectors, ',nprocs,&
-       ' MPI task(s), ',omp_num_threads,' thread(s)'
+       nsrc = nptmass
+       xyzmh_ptmass(irateion,1) = logQ1_case(icase)
+       !
+       !-- sinks that do not ionise, spread through the cloud
+       !
+       if (dark_case(icase)) then
+          iseed = -2581
+          do i=1,nsinks-nsrc
+             nptmass = nptmass + 1
+             xyzmh_ptmass(1,nptmass) = xdark*(2.*ran2(iseed) - 1.)
+             xyzmh_ptmass(2,nptmass) = xdark*(2.*ran2(iseed) - 1.)
+             xyzmh_ptmass(3,nptmass) = xdark*(2.*ran2(iseed) - 1.)
+             xyzmh_ptmass(4,nptmass) = -1.
+             xyzmh_ptmass(irateion,nptmass) = 0.
+             xyzmh_ptmass(irstrom,nptmass)  = -1.
+          enddo
+       endif
+       vxyz_ptmass(:,1:nptmass) = 0.
+       nHIIsources = nsrc
+       call initialize_H2R   ! fresh radii and update interval for each mode
+       if (maxvxyzu >= 4) vxyzu(4,1:npart) = u0
+       call init_omp()
+       if (id==master) write(iprint,"(/,a,i0,a,i0,a,i0,a,i0,a,i0,a,i0)") '--> benchmarking HII regions of ',nsrc,&
+          ' overlapping sources among ',nptmass,' sinks, ',12*nside_H2R**2,' sectors, ',nprocs,&
+          ' MPI task(s), ',omp_num_threads,' thread(s), iH2R_omp = ',iH2R_omp
 
-    do ical=0,nwarm
-       if (mpi) call barrier_mpi()
-       call getused(t1)
-       call HII_feedback(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_vars)
-       call getused(t2)
-       tcall(ical) = real(t2 - t1)
-       if (mpi) tcall(ical) = reduceall_mpi('max',tcall(ical))
-       HIIdt = dt_HII   ! the next call is the next update
+       do ical=0,nwarm
+          if (mpi) call barrier_mpi()
+          call getused(t1)
+          call HII_feedback(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_vars)
+          call getused(t2)
+          tcall(ical) = real(t2 - t1)
+          if (mpi) tcall(ical) = reduceall_mpi('max',tcall(ical))
+          HIIdt = dt_HII   ! the next call is the next update
 
-       nion = 0
-       do i=1,npart
-          if (eos_vars(imu,i) < gmw) nion = nion + 1
+          nion = 0
+          do i=1,npart
+             if (eos_vars(imu,i) < gmw) nion = nion + 1
+          enddo
+          if (mpi) nion = int(reduceall_mpi('+',nion))
+          rsum = sum(xyzmh_ptmass(irstrom,1:nsrc))
+          if (id==master) write(iprint,"(a,i2,a,es10.3,a,i9,a,es22.14)") ' call ',ical,': time ',tcall(ical),&
+             ' s, N_ion ',nion,', sum R_S ',rsum
        enddo
-       if (mpi) nion = int(reduceall_mpi('+',nion))
-       rsum = sum(xyzmh_ptmass(irstrom,1:nsrc))
-       if (id==master) write(iprint,"(a,i2,a,es10.3,a,i9,a,es22.14)") ' call ',ical,': time ',tcall(ical),&
-          ' s, N_ion ',nion,', sum R_S ',rsum
+       ttot(imode) = sum(tcall(0:nwarm))
+       if (id==master) write(iprint,"(a,i0,a,i0,a,i0,a,i0,a,i0,a,es10.3,a,es10.3,a)") ' case ',icase,' (',nsrc,&
+          ' sources, nside ',nside_H2R,', ',nptmass,' sinks) iH2R_omp ',iH2R_omp,': cold call ',tcall(0),&
+          ' s, warm calls total ',sum(tcall(1:nwarm)),' s'
     enddo
-    if (id==master) write(iprint,"(a,i0,a,i0,a,i0,a,es10.3,a,es10.3,a)") ' case ',icase,' (nside ',nside_H2R,', ',&
-       nptmass,' sinks): cold call ',tcall(0),' s, warm calls total ',sum(tcall(1:nwarm)),' s'
+    if (id==master) write(iprint,"(a,i0,a,i0,a,f6.2,a,f6.2)") ' case ',icase,' (',nsrc,&
+       ' sources): all calls, within / over the sources = ',ttot(1)/ttot(2),', within / auto = ',ttot(1)/ttot(3)
  enddo
 
  call init_part()
  nside_H2R = 1
+ iH2R_omp  = 0
  iH2R = 0
  ieos = 2
 
