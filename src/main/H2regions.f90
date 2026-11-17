@@ -54,6 +54,19 @@ module HIIRegion
  integer, allocatable          :: seen_by(:),k_of(:)
  real   , allocatable          :: dn_of(:)
  integer                       :: istamp = 0
+ !$omp threadprivate(seen_by,k_of,dn_of,istamp)
+
+ !-- (iH2R=4) OpenMP over the sources (each source on one thread) or within each
+ !   source: 0 = by their cost, 1 = within, 2 = over the sources (not with MPI)
+ integer, public               :: iH2R_omp = 0
+ integer, allocatable          :: ncost_src(:)    ! particles of the last walk of each sink (-1 if none)
+
+ !-- particles a source ionises, and how much: applied in the order of the sources
+ type ionlist_t
+    integer :: n = 0
+    integer, allocatable :: j(:)
+    real,    allocatable :: phi(:)
+ end type ionlist_t
 
  integer, parameter :: maxcache  = 1024
 
@@ -119,11 +132,13 @@ subroutine initialize_H2R
     if (allocated(secbeta)) deallocate(secbeta)
     if (allocated(rstrom_sec)) deallocate(rstrom_sec)
     if (allocated(sectors_on)) deallocate(sectors_on)
+    if (allocated(ncost_src)) deallocate(ncost_src)
 
     allocate(secdir(3,nsec_H2R))
     allocate(secbeta(nsec_H2R))
     allocate(rstrom_sec(nsec_H2R,maxptmass))
     allocate(sectors_on(maxptmass))
+    allocate(ncost_src(maxptmass))
 
     !-- construct HEALPix grid
     do k=1,nsec_H2R
@@ -135,6 +150,7 @@ subroutine initialize_H2R
     enddo
     rstrom_sec = -1.
     sectors_on = .true.
+    ncost_src  = -1
     !-- vec2pix_nest fills its lookup table on the first call: do it here, outside OpenMP
     call vec2pix_nest(nside_H2R,secdir(:,1),ipix)
  endif
@@ -285,31 +301,27 @@ end subroutine HII_feedback
 !+
 !-----------------------------------------------------------------------
 subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_vars,hmin)
- use part,        only:ihacc,irateion,irstrom,itemp,imu
- use neighkdtree, only:listneigh=>listneigh_global,getneigh_sectors,getneigh_pos,&
-                       leaf_is_active,node
+ use part,        only:irateion,irstrom,itemp,imu
+ use neighkdtree, only:listneigh_global,listneigh_thread=>listneigh,node
  use kdtree,      only:irootnode
  use sortutils,   only:indexx
- use dim,         only:maxvxyzu,mpi
- use io,          only:iverbose,iprint,warning,id,nprocs
- use mpiutils,    only:reduceall_mpi,allgatherv_mpi,allgather_mpi,get_displs_mpi
+ use dim,         only:maxvxyzu,mpi,maxp
+ use io,          only:nprocs
+ use mpiutils,    only:reduceall_mpi,allgatherv_mpi,get_displs_mpi
+!$ use omp_lib,   only:omp_get_max_threads
  integer, intent(in)    :: nptmass,npart
  real,    intent(in)    :: xyzh(:,:),rho(:),vxyz_ptmass(:,:)
  real,    intent(inout) :: xyzmh_ptmass(:,:),vxyzu(:,:)
  real,    intent(inout) :: eos_vars(:,:)
  real,    intent(out)   :: hmin  ! smallest smoothing length of the ionised gas
- integer, parameter   :: maxits = 50, maxc = 128
- real,    allocatable :: dnpart(:,:),dnall(:),rprev2(:,:),rprevmax2(:),dr2sec(:)
- real,    allocatable :: dn_lo(:),dn_hi(:),r_lo(:),r_hi(:),deltar(:),rs(:),dnbuf(:)
- integer, allocatable :: id_shell(:),isort(:),nsecall(:),offsec(:)
- logical, allocatable :: converged(:),escaped(:)
- integer              :: nshell(nprocs),displs(nprocs),counts4(nprocs)
- integer              :: i,k,j,m,n,p,nsec,nneigh,nneigh_shell,nneigh_inner,nshell_tot,its,ifirst,ilast,nk
- integer              :: nhot,nhot_loc
- real                 :: xsrc(3),log_Qi,coef,rs0,vnorm,ddyn,rbound,dntot,dnj,phi
- real                 :: xyzcache(3,maxc)
+ type(ionlist_t), allocatable :: ion(:)
+ real,    allocatable :: rprev2(:,:),rprevmax2(:),rkey(:)
+ integer, allocatable :: isrc(:),iorder(:)
+ integer              :: counts4(nprocs)
+ integer              :: i,c,nsrc,nthreads
+ integer(kind=8)      :: ncostmax,ncostsum
  real                 :: rootbox(4),rootall(4*nprocs)
- logical              :: query,warm
+ logical              :: over_sources
 
  !
  !-- reset every local particle to neutral before the sources ionise them again
@@ -317,20 +329,6 @@ subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_v
  eos_vars(imu,:) = gmw
  if (maxvxyzu < 4) eos_vars(itemp,:) = Tcold  ! cooling in isothermal case
  hmin = huge(hmin)
-
- !
- !-- per particle cache: a particle pays its sector and flux sharing once per
- !   source and update, however often the range grows. Kept between calls
- !   (grown when npart grows) and stamped, so it is never cleared
- !
- if (allocated(seen_by)) then
-    if (size(seen_by) < npart) deallocate(seen_by,k_of,dn_of)
- endif
- if (.not.allocated(seen_by)) then
-    allocate(seen_by(max(npart,1)),k_of(max(npart,1)),dn_of(max(npart,1)))
-    seen_by = 0
-    istamp  = 0
- endif
 
  !
  !-- root node (centre, size) of every rank, gathered once: the distance beyond
@@ -363,277 +361,408 @@ subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_v
     endif
  enddo
 
- sources: do i=1,nptmass
+ !-- the sources bright enough
+ allocate(isrc(nptmass),ion(nptmass))
+ nsrc = 0
+ do i=1,nptmass
+    if (xyzmh_ptmass(irateion,i) < epsilon(0.)) cycle
+    nsrc = nsrc + 1
+    isrc(nsrc) = i
+ enddo
 
-    log_Qi = xyzmh_ptmass(irateion,i)
-    if (log_Qi < epsilon(log_Qi)) cycle sources !-- not bright enough...
-    xsrc = xyzmh_ptmass(1:3,i)
-    if (istamp == huge(istamp)) then  ! stamps used up: start again
-       seen_by = 0
-       istamp  = 0
-    endif
-    istamp = istamp + 1
-
-    warm = (xyzmh_ptmass(irstrom,i) > 0. .and. all(rstrom_sec(:,i) > 0.))
-    if (.not.warm) sectors_on(i) = .true.
-
-    if (sectors_on(i)) then
-       nsec = nsec_H2R
-    else
-       nsec = 1
-    endif
-
-    !-- per sector arrays: nsec is 1 or nsec_H2R, reallocate only when it changes
-    if (allocated(dn_lo)) then
-       if (size(dn_lo) /= nsec) deallocate(dn_lo,dn_hi,r_lo,r_hi,deltar,rs,converged,escaped,&
-                                           nsecall,offsec,dnbuf)
-    endif
-    if (.not.allocated(dn_lo)) then
-       allocate(dn_lo(nsec),dn_hi(nsec),r_lo(nsec),r_hi(nsec),deltar(nsec),rs(nsec))
-       allocate(converged(nsec),escaped(nsec),nsecall(nsec),offsec(nsec+1),dnbuf(2*nsec))
-    endif
-
-    !-- photons used by particle j as a fraction of its sector's budget Q/nsec (eq. 3, 13)
-    coef = real(nsec)*10.**(DNcoeff - log_Qi)
-
-    !-- distance beyond which there is no gas: a sector reaching it lets its photons escape
-    !   (same on every rank, also those without gas)
-    rbound = 0.
-    do p=1,nprocs
-       if (rootall(4*p) < 0.) cycle
-       rbound = max(rbound,sqrt(sum((rootall(4*p-3:4*p-1) - xsrc)**2)) + rootall(4*p))
+ !
+ !-- OpenMP over the sources when they keep every thread busy: at least one
+ !   source per thread, none costing more than a thread's share (cost: the
+ !   particles of its last walk; a new source has none, and is not shared out).
+ !   Within each source otherwise. Not with MPI: each source needs its own
+ !   collectives, in the same order on every rank
+ !
+ nthreads = 1
+!$ nthreads = omp_get_max_threads()
+ select case(iH2R_omp)
+ case(1)
+    over_sources = .false.
+ case(2)
+    over_sources = .true.
+ case default
+    ncostmax = 0
+    ncostsum = 0
+    over_sources = (nsrc >= nthreads)
+    do c=1,nsrc
+       if (ncost_src(isrc(c)) < 0 .or. xyzmh_ptmass(irstrom,isrc(c)) <= 0.) over_sources = .false.
+       ncostmax = max(ncostmax,int(ncost_src(isrc(c)),kind=8))
+       ncostsum = ncostsum + ncost_src(isrc(c))
     enddo
-    !
-    !-- starting range [r_lo,r_hi] of each sector (eq. 7 and 8), identical on every rank
-    !
-    if (warm) then
-       !-- D-type front: moves less than (2 c_ion + v_sink) dt; floor: the front is only
-       !   known to about one smoothing length (stand-in for 2 h_edge)
-       vnorm = sqrt(vxyz_ptmass(1,i)**2 + vxyz_ptmass(2,i)**2 + vxyz_ptmass(3,i)**2)
-       ddyn  = (2.*csion + vnorm)*HIIdt
-       if (nsec == 1) then  ! isotropic: the range encloses every sector of the last update
-          deltar(1) = max(ddyn, xyzmh_ptmass(ihacc,i), 0.01*maxval(rstrom_sec(:,i)))
-          r_lo(1)   = max(minval(rstrom_sec(:,i)) - deltar(1), 0.)
-          r_hi(1)   = min(maxval(rstrom_sec(:,i)) + deltar(1), rbound)
+    over_sources = over_sources .and. ncostmax*nthreads <= ncostsum
+ end select
+ over_sources = over_sources .and. .not.mpi .and. nthreads > 1 .and. nsrc > 1
+
+ if (over_sources) then
+    !-- costliest sources first (new sources first, their cost unknown): the
+    !   dynamic schedule then balances the threads
+    allocate(rkey(nsrc),iorder(nsrc))
+    do c=1,nsrc
+       i = isrc(c)
+       if (ncost_src(i) >= 0 .and. xyzmh_ptmass(irstrom,i) > 0.) then
+          rkey(c) = -real(ncost_src(i))
        else
-          do k=1,nsec
-             deltar(k) = max(ddyn, xyzmh_ptmass(ihacc,i), 0.01*rstrom_sec(k,i))
-             r_lo(k)   = max(rstrom_sec(k,i) - deltar(k), 0.)
-             r_hi(k)   = min(rstrom_sec(k,i) + deltar(k), rbound)
-          enddo
+          rkey(c) = -huge(0.)
        endif
-    else  ! new source: continuous Stromgren radius from the nearest gas, in every sector
-       rs0    = stromgren_guess(xsrc(1),xsrc(2),xsrc(3),xyzmh_ptmass(ihacc,i),log_Qi,xyzh,rho,rbound)
-       deltar = rs0
-       r_lo   = 0.
-       r_hi   = min(2.*rs0, rbound)
-    endif
-
-    !
-    !-- grow or shrink the range of each sector until W(r_lo) < 1 <= W(r_hi) (eq. 9);
-    !   the tree is walked again whenever one sector's r_hi grows
-    !
-    converged = .false.
-    escaped   = .false.
-    query     = .true.
-    its       = 0
-    deltafind: do while (.not.all(converged))
-       its = its + 1
-       if (its > maxits) then
-          call warning('HII_bound','range search did not converge',ival=i)
-          cycle sources
-       endif
-       if (query) then
-
-          if (nsec > 1) then ! solid angle sector around the star
-             call getneigh_sectors(xsrc,nsec,secdir,secbeta,r_hi,listneigh,nneigh)
-          else  ! isotropic: a sphere of radius r_hi
-             call getneigh_pos(xsrc,0.,r_hi(1),listneigh,nneigh,xyzcache,maxc,leaf_is_active)
-          endif
-
-          if (allocated(dnpart)) then  ! grow only
-             if (size(dnpart,2) < nneigh) deallocate(dnpart)
-          endif
-          if (.not.allocated(dnpart)) allocate(dnpart(3,max(nneigh,1)))
-
-          !-- (d^2, y_j, sector) of every neighbour: the costly part, only after a new walk
-          call compute_dnpart(i,nptmass,xyzmh_ptmass,rprev2,rprevmax2,coef,r_hi,xyzh,rho,&
-                              listneigh,nneigh,dnpart,istamp,seen_by,k_of,dn_of)
-       endif
-
-       !-- photon demand inside r_lo and r_hi of each sector, from the stored dnpart
-       call sum_dnspheres(nneigh,dnpart,r_lo,r_hi,dn_lo,dn_hi)
-
-       if (mpi) then  ! one reduction for both sums
-          dnbuf(1:nsec)        = dn_lo
-          dnbuf(nsec+1:2*nsec) = dn_hi
-          dnbuf = reduceall_mpi('+',dnbuf)
-          dn_lo = dnbuf(1:nsec)
-          dn_hi = dnbuf(nsec+1:2*nsec)
-       endif
-
-       query = .false.
-       do k=1,nsec
-          if (converged(k)) cycle
-          if (dn_hi(k) < 1.) then        ! photons left over at r_hi: the sector reaches further
-             if (r_hi(k) >= rbound) then  ! no gas left: a fraction 1 - dn_hi escapes
-                if (r_lo(k) < r_hi(k)) then
-                   r_lo(k) = r_hi(k)     ! one more pass: the whole sector moves to the inner block
-                else
-                   rs(k) = r_hi(k)
-                   escaped(k)   = .true.
-                   converged(k) = .true.
-                endif
-             else
-                r_lo(k)   = r_hi(k)
-                deltar(k) = 2.*deltar(k)
-                r_hi(k)   = min(r_hi(k) + deltar(k), rbound)
-                query     = .true.
-             endif
-          elseif (dn_lo(k) >= 1.) then   ! the sector shrank inside r_lo: no new walk needed
-             r_hi(k)   = r_lo(k)
-             deltar(k) = 2.*deltar(k)
-             r_lo(k)   = max(r_lo(k) - deltar(k), 0.)
-          else
-             converged(k) = .true.
-          endif
-       enddo
-    enddo deltafind
-
-    !-- split listneigh into shell / inner / rest for the final r_lo and r_hi
-    call partition_neigh(nneigh,dnpart,r_lo,r_hi,listneigh,nneigh_shell,nneigh_inner)
-
-    !
-    !-- ionise the local particles inside the r_lo of their sector;
-    !
-    nhot_loc = nneigh_inner
-    !$omp parallel do default(none) &
-    !$omp shared(nneigh_shell,nneigh_inner,listneigh,eos_vars,vxyzu,xyzh) &
-    !$omp private(n) &
-    !$omp reduction(min:hmin)
-    do n=nneigh_shell+1,nneigh_shell+nneigh_inner
-       call ionise_particle(eos_vars,vxyzu,listneigh(n),1.)
-       hmin = min(hmin,xyzh(4,listneigh(n)))
+    enddo
+    call indexx(nsrc,rkey,iorder)
+    !$omp parallel do default(none) schedule(dynamic,1) &
+    !$omp shared(nsrc,isrc,iorder,nptmass,npart,xyzh,rho,xyzmh_ptmass,vxyz_ptmass) &
+    !$omp shared(rprev2,rprevmax2,rootall,ion,maxp) &
+    !$omp private(c,i)
+    do c=1,nsrc
+       i = isrc(iorder(c))
+       if (.not.allocated(listneigh_thread)) allocate(listneigh_thread(maxp))
+       call bound_source(i,nptmass,npart,xyzh,rho,xyzmh_ptmass,vxyz_ptmass,rprev2,rprevmax2,&
+                         rootall,listneigh_thread,ion(i))
     enddo
     !$omp end parallel do
-
-    !
-    !-- gather the shell on every rank: (d^2, y_j, sector) of entry j of rank p sits at displs(p+1)+j
-    !
-    if (mpi) then
-       call allgather_mpi(nneigh_shell,nshell)
-       displs     = get_displs_mpi(nshell)
-       nshell_tot = sum(nshell)
-    else
-       nshell(1)  = nneigh_shell
-       displs(1)  = 0
-       nshell_tot = nneigh_shell
-    endif
-    allocate(dnall(3*nshell_tot),dr2sec(nshell_tot),id_shell(nshell_tot),isort(nshell_tot))
-    if (mpi) then
-       call allgatherv_mpi(reshape(dnpart(:,1:nneigh_shell),(/3*nneigh_shell/)),dnall,&
-                           counts=3*nshell,displs=3*displs)
-    else
-       dnall = reshape(dnpart(:,1:nneigh_shell),(/3*nneigh_shell/))
-    endif
-
-    !
-    !-- bucket the gathered entries by sector (the gathered data keep their order,
-    !   so displs still gives the owner of entry j)
-    !
-    nsecall = 0
-    do j=1,nshell_tot
-       k = nint(dnall(3*j))
-       nsecall(k) = nsecall(k) + 1
+    deallocate(rkey,iorder)
+    !-- ionise in the order of the sources, as within the sources
+    do c=1,nsrc
+       call apply_ionlist(ion(isrc(c)),eos_vars,vxyzu,xyzh,hmin)
     enddo
-    offsec(1) = 0
-    do k=1,nsec
-       offsec(k+1) = offsec(k) + nsecall(k)
+ else
+    do c=1,nsrc
+       i = isrc(c)
+       call bound_source(i,nptmass,npart,xyzh,rho,xyzmh_ptmass,vxyz_ptmass,rprev2,rprevmax2,&
+                         rootall,listneigh_global,ion(i))
+       call apply_ionlist(ion(i),eos_vars,vxyzu,xyzh,hmin)
     enddo
-    nsecall = 0
-    do j=1,nshell_tot
-       k = nint(dnall(3*j))
-       nsecall(k) = nsecall(k) + 1
-       isort(offsec(k) + nsecall(k)) = j
-    enddo
+ endif
 
-    !
-    !-- every rank marches each sector independently from its own W(r_lo)
-    !
-    ifirst = displs(id+1) + 1
-    ilast  = displs(id+1) + nshell(id+1)
-    nhot   = 0
-    !$omp parallel do default(none) schedule(dynamic) &
-    !$omp shared(nsec,escaped,nsecall,offsec,isort,dnall,dr2sec,id_shell,dn_lo,r_lo,rs) &
-    !$omp shared(ifirst,ilast,displs,id,listneigh,eos_vars,vxyzu,xyzh) &
-    !$omp private(k,nk,m,j,dnj,dntot,phi) &
-    !$omp reduction(+:nhot) &
-    !$omp reduction(min:hmin)
-    do k=1,nsec
-
-       if (escaped(k)) cycle
-       nk = nsecall(k)
-       do m=1,nk
-          dr2sec(offsec(k)+m) = dnall(3*isort(offsec(k)+m)-2)
-       enddo
-
-       call indexx(nk,dr2sec(offsec(k)+1:offsec(k)+nk),id_shell(offsec(k)+1:offsec(k)+nk))
-       dntot = dn_lo(k)
-       rs(k) = r_lo(k)
-
-       do m=1,nk
-          j   = isort(offsec(k) + id_shell(offsec(k)+m))
-          dnj = dnall(3*j-1)
-          if (dntot + dnj <= 1.) then
-             phi  = 1.
-             nhot = nhot + 1
-          else
-             phi = (1. - dntot)/dnj
-          endif
-          if (j >= ifirst .and. j <= ilast) then
-             call ionise_particle(eos_vars,vxyzu,listneigh(j-displs(id+1)),phi)
-             hmin = min(hmin,xyzh(4,listneigh(j-displs(id+1))))
-          endif
-          rs(k) = sqrt(dnall(3*j-2))
-          dntot = dntot + dnj
-          if (phi < 1.) exit
-       enddo
-
-    enddo
-    !$omp end parallel do
-
-    if (nsec == 1) then
-       rstrom_sec(:,i) = rs(1)
-    else
-       rstrom_sec(:,i) = rs
-    endif
-    !-- stored value is the mean over sectors
-    xyzmh_ptmass(irstrom,i) = sum(rs)/real(nsec)
-
-    !
-    !-- resolution of the bubble: sectors only once each holds a few hot particles
-    !
-    if (mpi) nhot_loc = int(reduceall_mpi('+',nhot_loc))
-    nhot = nhot + nhot_loc
-    if (sectors_on(i)) then
-       if (nhot < nsec_off*nsec_H2R) sectors_on(i) = .false.
-    else
-       if (nhot >= nsec_on*nsec_H2R) sectors_on(i) = .true.
-    endif
-
-    if (iverbose >= 2) write(iprint,*) 'HII_bound: sink ',i,' Rstrom mean/min/max = ',&
-                       sum(rs)/real(nsec),minval(rs),maxval(rs),' escaped sectors ',count(escaped),&
-                       ' shell size ',nshell_tot,' in ',its,' iterations, ',nhot,' hot particles, ',&
-                       nsec,' sectors'
-    deallocate(dnall,dr2sec,id_shell,isort)
- enddo sources
-
- if (allocated(dnpart)) deallocate(dnpart)
- if (allocated(dn_lo)) deallocate(dn_lo,dn_hi,r_lo,r_hi,deltar,rs,converged,escaped,nsecall,offsec,dnbuf)
- deallocate(rprev2,rprevmax2)
+ deallocate(rprev2,rprevmax2,isrc,ion)
  if (mpi) hmin = reduceall_mpi('min',hmin)
 
 end subroutine HII_bound
+
+!-----------------------------------------------------------------------
+!+
+!  Stromgren radius of each sector of source i (eq. 6-9, 13-14), and the
+!  particles it ionises, returned in ion. Writes only the radii of source
+!  i (rstrom_sec(:,i), xyzmh_ptmass(irstrom,i), sectors_on(i)) and the
+!  particle cache of the thread, so sources can run on different threads
+!+
+!-----------------------------------------------------------------------
+subroutine bound_source(i,nptmass,npart,xyzh,rho,xyzmh_ptmass,vxyz_ptmass,rprev2,rprevmax2,&
+                        rootall,listneigh,ion)
+ use part,        only:ihacc,irateion,irstrom
+ use neighkdtree, only:getneigh_sectors,getneigh_pos,leaf_is_active
+ use sortutils,   only:indexx
+ use dim,         only:mpi
+ use io,          only:iverbose,iprint,warning,id,nprocs
+ use mpiutils,    only:reduceall_mpi,allgatherv_mpi,allgather_mpi,get_displs_mpi
+ integer, intent(in)    :: i,nptmass,npart
+ real,    intent(in)    :: xyzh(:,:),rho(:),vxyz_ptmass(:,:),rprev2(:,:),rprevmax2(:),rootall(:)
+ real,    intent(inout) :: xyzmh_ptmass(:,:)
+ integer, intent(inout) :: listneigh(:)
+ type(ionlist_t), intent(out) :: ion
+ integer, parameter   :: maxits = 50, maxc = 128
+ real,    allocatable :: dnpart(:,:),dnall(:),dr2sec(:),phishell(:)
+ real,    allocatable :: dn_lo(:),dn_hi(:),r_lo(:),r_hi(:),deltar(:),rs(:),dnbuf(:)
+ integer, allocatable :: id_shell(:),isort(:),nsecall(:),offsec(:)
+ logical, allocatable :: converged(:),escaped(:)
+ integer              :: nshell(nprocs),displs(nprocs)
+ integer              :: k,j,m,n,p,nsec,nneigh,nneigh_shell,nneigh_inner,nshell_tot,its,ifirst,ilast,nk
+ integer              :: nhot,nhot_loc
+ real                 :: xsrc(3),log_Qi,coef,rs0,vnorm,ddyn,rbound,dntot,dnj,phi
+ real                 :: xyzcache(3,maxc)
+ logical              :: query,warm
+
+ log_Qi = xyzmh_ptmass(irateion,i)
+ xsrc   = xyzmh_ptmass(1:3,i)
+ ion%n  = 0
+
+ !
+ !-- per particle cache of this thread: a particle pays its sector and flux
+ !   sharing once per source and update, however often the range grows. Kept
+ !   between calls (grown when npart grows) and stamped, so it is never cleared
+ !
+ if (allocated(seen_by)) then
+    if (size(seen_by) < npart) deallocate(seen_by,k_of,dn_of)
+ endif
+ if (.not.allocated(seen_by)) then
+    allocate(seen_by(max(npart,1)),k_of(max(npart,1)),dn_of(max(npart,1)))
+    seen_by = 0
+    istamp  = 0
+ endif
+ if (istamp == huge(istamp)) then  ! stamps used up: start again
+    seen_by = 0
+    istamp  = 0
+ endif
+ istamp = istamp + 1
+
+ warm = (xyzmh_ptmass(irstrom,i) > 0. .and. all(rstrom_sec(:,i) > 0.))
+ if (.not.warm) sectors_on(i) = .true.
+
+ if (sectors_on(i)) then
+    nsec = nsec_H2R
+ else
+    nsec = 1
+ endif
+ allocate(dn_lo(nsec),dn_hi(nsec),r_lo(nsec),r_hi(nsec),deltar(nsec),rs(nsec))
+ allocate(converged(nsec),escaped(nsec),nsecall(nsec),offsec(nsec+1),dnbuf(2*nsec))
+ !-- photons used by particle j as a fraction of its sector's budget Q/nsec (eq. 3, 13)
+ coef = real(nsec)*10.**(DNcoeff - log_Qi)
+
+ !-- distance beyond which there is no gas: a sector reaching it lets its photons escape
+ !   (same on every rank, also those without gas)
+ rbound = 0.
+ do p=1,nprocs
+    if (rootall(4*p) < 0.) cycle
+    rbound = max(rbound,sqrt(sum((rootall(4*p-3:4*p-1) - xsrc)**2)) + rootall(4*p))
+ enddo
+ !
+ !-- starting range [r_lo,r_hi] of each sector (eq. 7 and 8), identical on every rank
+ !
+ if (warm) then
+    !-- D-type front: moves less than (2 c_ion + v_sink) dt; floor: the front is only
+    !   known to about one smoothing length (stand-in for 2 h_edge)
+    vnorm = sqrt(vxyz_ptmass(1,i)**2 + vxyz_ptmass(2,i)**2 + vxyz_ptmass(3,i)**2)
+    ddyn  = (2.*csion + vnorm)*HIIdt
+    if (nsec == 1) then  ! isotropic: the range encloses every sector of the last update
+       deltar(1) = max(ddyn, xyzmh_ptmass(ihacc,i), 0.01*maxval(rstrom_sec(:,i)))
+       r_lo(1)   = max(minval(rstrom_sec(:,i)) - deltar(1), 0.)
+       r_hi(1)   = min(maxval(rstrom_sec(:,i)) + deltar(1), rbound)
+    else
+       do k=1,nsec
+          deltar(k) = max(ddyn, xyzmh_ptmass(ihacc,i), 0.01*rstrom_sec(k,i))
+          r_lo(k)   = max(rstrom_sec(k,i) - deltar(k), 0.)
+          r_hi(k)   = min(rstrom_sec(k,i) + deltar(k), rbound)
+       enddo
+    endif
+ else  ! new source: continuous Stromgren radius from the nearest gas, in every sector
+    rs0    = stromgren_guess(xsrc(1),xsrc(2),xsrc(3),xyzmh_ptmass(ihacc,i),log_Qi,xyzh,rho,rbound)
+    deltar = rs0
+    r_lo   = 0.
+    r_hi   = min(2.*rs0, rbound)
+ endif
+
+ !
+ !-- grow or shrink the range of each sector until W(r_lo) < 1 <= W(r_hi) (eq. 9);
+ !   the tree is walked again whenever one sector's r_hi grows
+ !
+ converged = .false.
+ escaped   = .false.
+ query     = .true.
+ its       = 0
+ deltafind: do while (.not.all(converged))
+    its = its + 1
+    if (its > maxits) then
+       call warning('HII_bound','range search did not converge',ival=i)
+       return
+    endif
+    if (query) then
+
+       if (nsec > 1) then ! solid angle sector around the star
+          call getneigh_sectors(xsrc,nsec,secdir,secbeta,r_hi,listneigh,nneigh)
+       else  ! isotropic: a sphere of radius r_hi
+          call getneigh_pos(xsrc,0.,r_hi(1),listneigh,nneigh,xyzcache,maxc,leaf_is_active)
+       endif
+
+       if (allocated(dnpart)) deallocate(dnpart)
+       allocate(dnpart(3,max(nneigh,1)))
+
+       !-- (d^2, y_j, sector) of every neighbour: the costly part, only after a new walk
+       call compute_dnpart(i,nptmass,xyzmh_ptmass,rprev2,rprevmax2,coef,r_hi,xyzh,rho,&
+                           listneigh,nneigh,dnpart,istamp,seen_by,k_of,dn_of)
+    endif
+
+    !-- photon demand inside r_lo and r_hi of each sector, from the stored dnpart
+    call sum_dnspheres(nneigh,dnpart,r_lo,r_hi,dn_lo,dn_hi)
+
+    if (mpi) then  ! one reduction for both sums
+       dnbuf(1:nsec)        = dn_lo
+       dnbuf(nsec+1:2*nsec) = dn_hi
+       dnbuf = reduceall_mpi('+',dnbuf)
+       dn_lo = dnbuf(1:nsec)
+       dn_hi = dnbuf(nsec+1:2*nsec)
+    endif
+
+    query = .false.
+    do k=1,nsec
+       if (converged(k)) cycle
+       if (dn_hi(k) < 1.) then        ! photons left over at r_hi: the sector reaches further
+          if (r_hi(k) >= rbound) then  ! no gas left: a fraction 1 - dn_hi escapes
+             if (r_lo(k) < r_hi(k)) then
+                r_lo(k) = r_hi(k)     ! one more pass: the whole sector moves to the inner block
+             else
+                rs(k) = r_hi(k)
+                escaped(k)   = .true.
+                converged(k) = .true.
+             endif
+          else
+             r_lo(k)   = r_hi(k)
+             deltar(k) = 2.*deltar(k)
+             r_hi(k)   = min(r_hi(k) + deltar(k), rbound)
+             query     = .true.
+          endif
+       elseif (dn_lo(k) >= 1.) then   ! the sector shrank inside r_lo: no new walk needed
+          r_hi(k)   = r_lo(k)
+          deltar(k) = 2.*deltar(k)
+          r_lo(k)   = max(r_lo(k) - deltar(k), 0.)
+       else
+          converged(k) = .true.
+       endif
+    enddo
+ enddo deltafind
+
+ ncost_src(i) = nneigh  ! cost of this source at the next update
+
+ !-- split listneigh into shell / inner / rest for the final r_lo and r_hi
+ call partition_neigh(nneigh,dnpart,r_lo,r_hi,listneigh,nneigh_shell,nneigh_inner)
+
+ !
+ !-- the local particles inside the r_lo of their sector are ionised
+ !
+ nhot_loc = nneigh_inner
+ allocate(ion%j(nneigh_inner+nneigh_shell),ion%phi(nneigh_inner+nneigh_shell))
+ do n=1,nneigh_inner
+    ion%j(n)   = listneigh(nneigh_shell+n)
+    ion%phi(n) = 1.
+ enddo
+ ion%n = nneigh_inner
+
+ !
+ !-- gather the shell on every rank: (d^2, y_j, sector) of entry j of rank p sits at displs(p+1)+j
+ !
+ if (mpi) then
+    call allgather_mpi(nneigh_shell,nshell)
+    displs     = get_displs_mpi(nshell)
+    nshell_tot = sum(nshell)
+ else
+    nshell(1)  = nneigh_shell
+    displs(1)  = 0
+    nshell_tot = nneigh_shell
+ endif
+ allocate(dnall(3*nshell_tot),dr2sec(nshell_tot),id_shell(nshell_tot),isort(nshell_tot),phishell(nshell_tot))
+ if (mpi) then
+    call allgatherv_mpi(reshape(dnpart(:,1:nneigh_shell),(/3*nneigh_shell/)),dnall,&
+                        counts=3*nshell,displs=3*displs)
+ else
+    dnall = reshape(dnpart(:,1:nneigh_shell),(/3*nneigh_shell/))
+ endif
+
+ !
+ !-- bucket the gathered entries by sector (the gathered data keep their order,
+ !   so displs still gives the owner of entry j)
+ !
+ nsecall = 0
+ do j=1,nshell_tot
+    k = nint(dnall(3*j))
+    nsecall(k) = nsecall(k) + 1
+ enddo
+ offsec(1) = 0
+ do k=1,nsec
+    offsec(k+1) = offsec(k) + nsecall(k)
+ enddo
+ nsecall = 0
+ do j=1,nshell_tot
+    k = nint(dnall(3*j))
+    nsecall(k) = nsecall(k) + 1
+    isort(offsec(k) + nsecall(k)) = j
+ enddo
+
+ !
+ !-- every rank marches each sector independently from its own W(r_lo);
+ !   phishell of each entry reached (0 if not)
+ !
+ phishell = 0.
+ nhot     = 0
+ !$omp parallel do default(none) schedule(dynamic) &
+ !$omp shared(nsec,escaped,nsecall,offsec,isort,dnall,dr2sec,id_shell,dn_lo,r_lo,rs,phishell) &
+ !$omp private(k,nk,m,j,dnj,dntot,phi) &
+ !$omp reduction(+:nhot)
+ do k=1,nsec
+
+    if (escaped(k)) cycle
+    nk = nsecall(k)
+    do m=1,nk
+       dr2sec(offsec(k)+m) = dnall(3*isort(offsec(k)+m)-2)
+    enddo
+
+    call indexx(nk,dr2sec(offsec(k)+1:offsec(k)+nk),id_shell(offsec(k)+1:offsec(k)+nk))
+    dntot = dn_lo(k)
+    rs(k) = r_lo(k)
+
+    do m=1,nk
+       j   = isort(offsec(k) + id_shell(offsec(k)+m))
+       dnj = dnall(3*j-1)
+       if (dntot + dnj <= 1.) then
+          phi  = 1.
+          nhot = nhot + 1
+       else
+          phi = (1. - dntot)/dnj
+       endif
+       phishell(j) = phi
+       rs(k) = sqrt(dnall(3*j-2))
+       dntot = dntot + dnj
+       if (phi < 1.) exit
+    enddo
+
+ enddo
+ !$omp end parallel do
+
+ !-- the local entries of the shell that were reached
+ ifirst = displs(id+1) + 1
+ ilast  = displs(id+1) + nshell(id+1)
+ do j=ifirst,ilast
+    if (phishell(j) <= 0.) cycle
+    ion%n = ion%n + 1
+    ion%j(ion%n)   = listneigh(j-displs(id+1))
+    ion%phi(ion%n) = phishell(j)
+ enddo
+
+ if (nsec == 1) then
+    rstrom_sec(:,i) = rs(1)
+ else
+    rstrom_sec(:,i) = rs
+ endif
+ !-- stored value is the mean over sectors
+ xyzmh_ptmass(irstrom,i) = sum(rs)/real(nsec)
+
+ !
+ !-- resolution of the bubble: sectors only once each holds a few hot particles
+ !
+ if (mpi) nhot_loc = int(reduceall_mpi('+',nhot_loc))
+ nhot = nhot + nhot_loc
+ if (sectors_on(i)) then
+    if (nhot < nsec_off*nsec_H2R) sectors_on(i) = .false.
+ else
+    if (nhot >= nsec_on*nsec_H2R) sectors_on(i) = .true.
+ endif
+
+ if (iverbose >= 2) write(iprint,*) 'HII_bound: sink ',i,' Rstrom mean/min/max = ',&
+                    sum(rs)/real(nsec),minval(rs),maxval(rs),' escaped sectors ',count(escaped),&
+                    ' shell size ',nshell_tot,' in ',its,' iterations, ',nhot,' hot particles, ',&
+                    nsec,' sectors'
+
+end subroutine bound_source
+
+!-----------------------------------------------------------------------
+!+
+!  ionise the particles of one source
+!+
+!-----------------------------------------------------------------------
+subroutine apply_ionlist(ion,eos_vars,vxyzu,xyzh,hmin)
+ type(ionlist_t), intent(in)    :: ion
+ real,            intent(inout) :: eos_vars(:,:),vxyzu(:,:)
+ real,            intent(in)    :: xyzh(:,:)
+ real,            intent(inout) :: hmin
+ integer :: n
+
+ !$omp parallel do default(none) shared(ion,eos_vars,vxyzu,xyzh) private(n) reduction(min:hmin)
+ do n=1,ion%n
+    call ionise_particle(eos_vars,vxyzu,ion%j(n),ion%phi(n))
+    hmin = min(hmin,xyzh(4,ion%j(n)))
+ enddo
+ !$omp end parallel do
+
+end subroutine apply_ionlist
 
 !-----------------------------------------------------------------------
 !+
@@ -1362,8 +1491,12 @@ subroutine write_options_H2R(iunit)
     call write_inopt(Mmin, 'Mmin', "Minimum star mass to trigger HII region (MSun)", iunit)
     call write_inopt(Rmax, 'Rmax', "Maximum radius for HII region (pc)(only Knn)", iunit)
     call write_inopt(C_HII, 'C_HII', "safety factor on the update interval (front moves < C_HII*h)", iunit)
-    if (iH2R == 4) call write_inopt(nside_H2R, 'nsideH2R', &
-       "HEALPix Nside of the sectors, 12*Nside**2 sectors (power of 2, only bounded Knn)", iunit)
+    if (iH2R == 4) then
+       call write_inopt(nside_H2R, 'nsideH2R', &
+          "HEALPix Nside of the sectors, 12*Nside**2 sectors (power of 2, only bounded Knn)", iunit)
+       call write_inopt(iH2R_omp, 'iH2Romp', &
+          "OpenMP: 0=auto, 1=within each source, 2=over the sources (only bounded Knn, not MPI)", iunit)
+    endif
  endif
 
 end subroutine write_options_H2R
@@ -1386,6 +1519,7 @@ subroutine read_options_H2R(db,nerr)
     call read_inopt(C_HII,'C_HII',db,errcount=nerr,min=0.,default=0.3)
     if (iH2R == 4) then
        call read_inopt(nside_H2R,'nsideH2R',db,errcount=nerr,min=1,default=1)
+       call read_inopt(iH2R_omp,'iH2Romp',db,errcount=nerr,min=0,max=2,default=0)
        if (iand(nside_H2R,nside_H2R-1) /= 0) then
           call error('read_options_H2R','nsideH2R must be a power of 2')
           nerr = nerr + 1
