@@ -47,7 +47,7 @@ subroutine test_ptmass(ntests,npass,string)
  integer :: itmp,ierr,itest,istart,imax
  logical :: do_test_binary,do_test_accretion,do_test_createsink,do_test_softening
  logical :: do_test_chinese_coin,do_test_merger,do_test_potential,do_test_HII,do_test_SDAR
- logical :: do_test_binary_gr,do_test_orbit,do_test_sinkgas,do_bench_HII
+ logical :: do_test_binary_gr,do_test_orbit,do_test_sinkgas,do_bench_HII,do_bench_HII_cluster
  logical :: testall
 
  if (id==master) write(*,"(/,a,/)") '--> TESTING PTMASS MODULE'
@@ -65,6 +65,7 @@ subroutine test_ptmass(ntests,npass,string)
  do_test_orbit = .false.
  do_test_sinkgas = .false.
  do_bench_HII = .false.
+ do_bench_HII_cluster = .false.
  testall = .false.
  istart = 1
  select case(trim(string))
@@ -93,6 +94,8 @@ subroutine test_ptmass(ntests,npass,string)
     do_test_HII = .true.
  case('ptmassHIIbench')
     do_bench_HII = .true.
+ case('ptmassHIIcluster')
+    do_bench_HII_cluster = .true.
  case('ptmassSDAR')
     do_test_SDAR = .true.
  case('ptmassorbit','ptmassflyby')
@@ -185,6 +188,8 @@ subroutine test_ptmass(ntests,npass,string)
  if (do_test_HII .or. testall .and. .not.gr) call test_HIIregion(ntests,npass)
 
  if (do_bench_HII) call bench_HIIregion()
+
+ if (do_bench_HII_cluster) call bench_HII_cluster()
 
  !reset stuff and clean up temporary files
  itmp    = 201
@@ -2124,6 +2129,90 @@ subroutine bench_HIIregion()
  ieos = 2
 
 end subroutine bench_HIIregion
+
+!-----------------------------------------------------------------------
+!+
+!  Benchmark the bounded method (iH2R=4) on a cluster of sources whose
+!  HII regions overlap, so the flux sharing is exercised: a cold call
+!  from new sources, then warm calls as in a run (HIIdt = dt_HII).
+!  Prints the wall time of each call and checksums of the result
+!+
+!-----------------------------------------------------------------------
+subroutine bench_HII_cluster()
+ use dim,            only:periodic,mpi
+ use io,             only:id,master,iprint,nprocs
+ use part,           only:nptmass,xyzmh_ptmass,vxyz_ptmass,npart,xyzh,vxyzu,&
+                          init_part,irstrom,irateion,rho,eos_vars,imu
+ use eos,            only:ieos,gmw
+ use timing,         only:getused
+ use mpiutils,       only:barrier_mpi,reduceall_mpi
+ use omputils,       only:init_omp,omp_num_threads
+ use HIIRegion,      only:HII_feedback,iH2R,nside_H2R,nHIIsources,HIIdt,dt_HII
+ integer, parameter :: nlat = 3, nwarm = 5, nsides = 2
+ real,    parameter :: logQsrc = 49.5, spacing = 0.6
+ integer :: ix,iy,iz,ical,isd,nion,i
+ real    :: rho0,tcall(0:nwarm),rsum
+ real(kind=4) :: t1,t2
+
+ if (periodic) then
+    write(iprint,*) '--> Skip HII cluster benchmark when periodic is on...'
+    return
+ endif
+
+ do isd=1,nsides
+    nside_H2R = isd
+    call setup_HII_sphere(logQsrc,rho0)   ! calls initialize_H2R with this nside
+    !
+    !-- nlat**3 sources on a lattice, spacing ~1.3 Stromgren radii: the regions overlap
+    !
+    nptmass = 0
+    do iz=1,nlat
+       do iy=1,nlat
+          do ix=1,nlat
+             nptmass = nptmass + 1
+             xyzmh_ptmass(1,nptmass) = spacing*(ix - 2) + 1.e-3
+             xyzmh_ptmass(2,nptmass) = spacing*(iy - 2) + 2.e-3
+             xyzmh_ptmass(3,nptmass) = spacing*(iz - 2) + 3.e-3
+             xyzmh_ptmass(4,nptmass) = -1.
+             xyzmh_ptmass(irateion,nptmass) = logQsrc
+             xyzmh_ptmass(irstrom,nptmass)  = -1.
+          enddo
+       enddo
+    enddo
+    vxyz_ptmass(:,1:nptmass) = 0.
+    nHIIsources = nptmass
+    call init_omp()
+    if (id==master) write(iprint,"(/,a,i0,a,i0,a,i0,a,i0,a)") '--> benchmarking HII regions of ',nptmass,&
+       ' overlapping sources, ',12*nside_H2R**2,' sectors, ',nprocs,' MPI task(s), ',omp_num_threads,' thread(s)'
+
+    do ical=0,nwarm
+       if (mpi) call barrier_mpi()
+       call getused(t1)
+       call HII_feedback(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_vars)
+       call getused(t2)
+       tcall(ical) = real(t2 - t1)
+       if (mpi) tcall(ical) = reduceall_mpi('max',tcall(ical))
+       HIIdt = dt_HII   ! the next call is the next update
+
+       nion = 0
+       do i=1,npart
+          if (eos_vars(imu,i) < gmw) nion = nion + 1
+       enddo
+       if (mpi) nion = int(reduceall_mpi('+',nion))
+       rsum = sum(xyzmh_ptmass(irstrom,1:nptmass))
+       if (id==master) write(iprint,"(a,i2,a,es10.3,a,i9,a,es22.14)") ' call ',ical,': time ',tcall(ical),&
+          ' s, N_ion ',nion,', sum R_S ',rsum
+    enddo
+    if (id==master) write(iprint,"(a,i0,a,es10.3,a,es10.3,a)") ' nside ',nside_H2R,': cold call ',tcall(0),&
+       ' s, warm calls total ',sum(tcall(1:nwarm)),' s'
+ enddo
+
+ call init_part()
+ nside_H2R = 1
+ iH2R = 0
+ ieos = 2
+
+end subroutine bench_HII_cluster
 
 !-----------------------------------------------------------------------
 !+
