@@ -818,20 +818,26 @@ end subroutine getneigh
 !  from xpos, overlaps. Like getneigh, whole leaves are returned: the
 !  exact test, against the radius of each particle's own sector, is left
 !  to the caller.
+!  The tree is walked serially down to depth idepth_split; the open
+!  nodes there (and the leaves above) are then walked in parallel and
+!  their particles copied to listneigh in the order of the serial walk,
+!  so the list does not depend on the number of threads.
 !+
 !----------------------------------------------------------------
 subroutine getneigh_sectors(xpos,nsec,secdir,secbeta,rhisec,listneigh,nneigh)
  use io,      only:fatal
  use physcon, only:pi
+!$ use omp_lib, only:omp_get_thread_num
  real,    intent(in)  :: xpos(3)
  integer, intent(in)  :: nsec
  real,    intent(in)  :: secdir(:,:),secbeta(:),rhisec(:)
  integer, intent(out) :: listneigh(:)
  integer, intent(out) :: nneigh
- integer :: n,k,istack,il,ir
- integer :: nstack(maxdepth+1)
- real    :: dx,dy,dz,r2,d,s,ang,cosang,rnode,rhimax,sina,cosa
- real    :: xoffset,yoffset,zoffset,dummycache(3,1)
+ integer, parameter   :: idepth_split = 8
+ integer, allocatable :: item(:),itemcount(:),itemoff(:),itemowner(:),itemleaf1(:),itemnleaf(:),leaves(:)
+ integer :: n,k,istack,il,ir,nitem,it,ithread,nleaves,ip,l,ncopy
+ integer :: nstack(maxdepth+1),idepth(maxdepth+1)
+ real    :: rhimax
  real    :: cosb(nsec),sinb(nsec)
  logical :: wide(nsec)
 
@@ -845,64 +851,187 @@ subroutine getneigh_sectors(xpos,nsec,secdir,secbeta,rhisec,listneigh,nneigh)
     sinb(k) = sin(secbeta(k))
     wide(k) = (secbeta(k) >= 0.5*pi)
  enddo
- nneigh = 0
+ !
+ !--serial walk to depth idepth_split: the open nodes there and the leaves
+ !  above, in the order of a depth first walk (at most 2**idepth_split)
+ !
+ allocate(item(2**idepth_split))
+ nitem  = 0
  istack = 1
  nstack(istack) = irootnode
-
- over_stack: do while(istack /= 0)
+ idepth(istack) = 0
+ do while(istack /= 0)
     n = nstack(istack)
+    k = idepth(istack)
     istack = istack - 1
-    call get_sep(xpos,node(n)%xcen,dx,dy,dz,xoffset,yoffset,zoffset,r2)
-    s = node(n)%size
-    !
-    !--largest search radius among the sectors this node may contain
-    !
-    if (r2 <= s*s) then
-       rnode = rhimax              ! xpos is inside the node: every direction
-       d     = 0.
+    if (.not.node_in_sectors(xpos,n,nsec,secdir,secbeta,cosb,sinb,wide,rhisec,rhimax)) cycle
+    if (leaf_is_active(n) /= 0 .or. k >= idepth_split) then
+       nitem = nitem + 1
+       item(nitem) = n
     else
-       d     = sqrt(r2)
-       if (d - s >= rhimax) cycle over_stack  ! beyond every sector: no need to test them
-       sina  = s/d                 ! angular radius alpha of the node seen from xpos
-       cosa  = sqrt(max(1. - sina*sina,0.))
-       rnode = 0.
-       do k=1,nsec
-          if (rhisec(k) <= rnode) cycle
-          if (wide(k)) then
-             ang = asin(sina) + secbeta(k)
-             if (ang >= pi) then
-                rnode = rhisec(k)
-                cycle
-             endif
-             cosang = cos(ang)
-          else
-             cosang = cosa*cosb(k) - sina*sinb(k)
-          endif
-          !-- small margin: round-off must not close a node the cone touches
-          if (dx*secdir(1,k) + dy*secdir(2,k) + dz*secdir(3,k) > d*(cosang - 1.e-12)) rnode = rhisec(k)
-       enddo
-    endif
-
-    if (d - s < rnode) then
-       if (leaf_is_active(n) /= 0) then
-          call cache_neighbours(nneigh,n,0,0,listneigh,dummycache,xoffset,yoffset,zoffset)
-       else
-          il = node(n)%leftchild
-          ir = node(n)%rightchild
-          if (istack+2 > maxdepth+1) call fatal('getneigh_sectors','stack overflow')
-          if (il /= 0) then
-             istack = istack + 1
-             nstack(istack) = il
-          endif
-          if (ir /= 0) then
-             istack = istack + 1
-             nstack(istack) = ir
-          endif
+       il = node(n)%leftchild
+       ir = node(n)%rightchild
+       if (istack+2 > maxdepth+1) call fatal('getneigh_sectors','stack overflow')
+       if (il /= 0) then
+          istack = istack + 1
+          nstack(istack) = il
+          idepth(istack) = k + 1
+       endif
+       if (ir /= 0) then
+          istack = istack + 1
+          nstack(istack) = ir
+          idepth(istack) = k + 1
        endif
     endif
- enddo over_stack
+ enddo
+ !
+ !--each thread walks its subtrees into its own list of leaves, then copies
+ !  their particles to the place of the subtree in the serial order
+ !
+ allocate(itemcount(nitem),itemoff(nitem+1),itemowner(nitem),itemleaf1(nitem),itemnleaf(nitem))
+ !$omp parallel default(none) &
+ !$omp shared(nitem,item,itemcount,itemoff,itemowner,itemleaf1,itemnleaf,xpos,nsec,secdir,secbeta) &
+ !$omp shared(cosb,sinb,wide,rhisec,rhimax,listneigh,nneigh,inoderange,inodeparts) &
+ !$omp private(it,ithread,leaves,nleaves,l,n,ip,ncopy)
+ ithread = 0
+!$ ithread = omp_get_thread_num()
+ allocate(leaves(1024))
+ nleaves = 0
+ !$omp do schedule(dynamic)
+ do it=1,nitem
+    itemowner(it) = ithread
+    itemleaf1(it) = nleaves + 1
+    call getleaves_sectors(xpos,item(it),nsec,secdir,secbeta,cosb,sinb,wide,rhisec,rhimax,&
+                           leaves,nleaves,itemcount(it))
+    itemnleaf(it) = nleaves - itemleaf1(it) + 1
+ enddo
+ !$omp end do
+ !$omp single
+ itemoff(1) = 0
+ do it=1,nitem
+    itemoff(it+1) = itemoff(it) + itemcount(it)
+ enddo
+ nneigh = itemoff(nitem+1)
+ !$omp end single
+ do it=1,nitem
+    if (itemowner(it) /= ithread) cycle
+    ip = itemoff(it)
+    do l=itemleaf1(it),itemleaf1(it)+itemnleaf(it)-1
+       n = leaves(l)
+       ncopy = inoderange(2,n) - inoderange(1,n) + 1
+       listneigh(ip+1:ip+ncopy) = abs(inodeparts(inoderange(1,n):inoderange(2,n)))
+       ip = ip + ncopy
+    enddo
+ enddo
+ deallocate(leaves)
+ !$omp end parallel
+
+ deallocate(item,itemcount,itemoff,itemowner,itemleaf1,itemnleaf)
 
 end subroutine getneigh_sectors
+
+!----------------------------------------------------------------
+!+
+!  depth first walk of the subtree of node nroot for getneigh_sectors:
+!  appends its open leaves to leaves(nleaves+1:), grown if needed,
+!  and returns the number of particles they hold in npart
+!+
+!----------------------------------------------------------------
+subroutine getleaves_sectors(xpos,nroot,nsec,secdir,secbeta,cosb,sinb,wide,rhisec,rhimax,&
+                             leaves,nleaves,npart)
+ use io, only:fatal
+ real,    intent(in)    :: xpos(3),secdir(:,:),secbeta(:),cosb(:),sinb(:),rhisec(:),rhimax
+ logical, intent(in)    :: wide(:)
+ integer, intent(in)    :: nroot,nsec
+ integer, allocatable, intent(inout) :: leaves(:)
+ integer, intent(inout) :: nleaves
+ integer, intent(out)   :: npart
+ integer, allocatable :: tmp(:)
+ integer :: n,istack,il,ir
+ integer :: nstack(maxdepth+1)
+
+ npart  = 0
+ istack = 1
+ nstack(istack) = nroot
+ do while(istack /= 0)
+    n = nstack(istack)
+    istack = istack - 1
+    if (.not.node_in_sectors(xpos,n,nsec,secdir,secbeta,cosb,sinb,wide,rhisec,rhimax)) cycle
+    if (leaf_is_active(n) /= 0) then
+       if (nleaves >= size(leaves)) then
+          allocate(tmp(2*size(leaves)))
+          tmp(1:nleaves) = leaves(1:nleaves)
+          call move_alloc(tmp,leaves)
+       endif
+       nleaves = nleaves + 1
+       leaves(nleaves) = n
+       npart = npart + inoderange(2,n) - inoderange(1,n) + 1
+    else
+       il = node(n)%leftchild
+       ir = node(n)%rightchild
+       if (istack+2 > maxdepth+1) call fatal('getneigh_sectors','stack overflow')
+       if (il /= 0) then
+          istack = istack + 1
+          nstack(istack) = il
+       endif
+       if (ir /= 0) then
+          istack = istack + 1
+          nstack(istack) = ir
+       endif
+    endif
+ enddo
+
+end subroutine getleaves_sectors
+
+!----------------------------------------------------------------
+!+
+!  whether node n may hold particles of getneigh_sectors: closer to
+!  xpos than the largest rhisec of the sectors its angular disc,
+!  seen from xpos, overlaps
+!+
+!----------------------------------------------------------------
+logical function node_in_sectors(xpos,n,nsec,secdir,secbeta,cosb,sinb,wide,rhisec,rhimax)
+ use physcon, only:pi
+ real,    intent(in) :: xpos(3),secdir(:,:),secbeta(:),cosb(:),sinb(:),rhisec(:),rhimax
+ logical, intent(in) :: wide(:)
+ integer, intent(in) :: n,nsec
+ integer :: k
+ real    :: dx,dy,dz,r2,d,s,ang,cosang,rnode,sina,cosa
+ real    :: xoffset,yoffset,zoffset
+
+ call get_sep(xpos,node(n)%xcen,dx,dy,dz,xoffset,yoffset,zoffset,r2)
+ s = node(n)%size
+ if (r2 <= s*s) then
+    node_in_sectors = .true.   ! xpos is inside the node: every direction, d = 0
+    return
+ endif
+ d = sqrt(r2)
+ node_in_sectors = .false.
+ if (d - s >= rhimax) return   ! beyond every sector: no need to test them
+ !
+ !--largest search radius among the sectors this node may contain
+ !
+ sina  = s/d                 ! angular radius alpha of the node seen from xpos
+ cosa  = sqrt(max(1. - sina*sina,0.))
+ rnode = 0.
+ do k=1,nsec
+    if (rhisec(k) <= rnode) cycle
+    if (wide(k)) then
+       ang = asin(sina) + secbeta(k)
+       if (ang >= pi) then
+          rnode = rhisec(k)
+          cycle
+       endif
+       cosang = cos(ang)
+    else
+       cosang = cosa*cosb(k) - sina*sinb(k)
+    endif
+    !-- small margin: round-off must not close a node the cone touches
+    if (dx*secdir(1,k) + dy*secdir(2,k) + dz*secdir(3,k) > d*(cosang - 1.e-12)) rnode = rhisec(k)
+ enddo
+ node_in_sectors = (d - s < rnode)
+
+end function node_in_sectors
 
 !----------------------------------------------------------------
 !+
