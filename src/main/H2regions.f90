@@ -422,11 +422,14 @@ subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_v
 
           if (allocated(dnpart)) deallocate(dnpart)
           allocate(dnpart(3,nneigh))
+
+          !-- (d^2, y_j, sector) of every neighbour: the costly part, only after a new walk
+          call compute_dnpart(i,nptmass,xyzmh_ptmass,rprev2,rprevmax2,coef,r_hi,xyzh,rho,&
+                              listneigh,nneigh,dnpart)
        endif
 
-       !-- Loop over neighbours to find r_lo dn_lo and particles in the shell to cycle to
-       call compute_dnspheres(i,nptmass,xyzmh_ptmass,rprev2,rprevmax2,coef,r_lo,r_hi,xyzh,rho,&
-                              listneigh,nneigh,nneigh_shell,nneigh_inner,dn_lo,dn_hi,dnpart)
+       !-- photon demand inside r_lo and r_hi of each sector, from the stored dnpart
+       call sum_dnspheres(nneigh,dnpart,r_lo,r_hi,dn_lo,dn_hi)
 
        if (mpi) then
           dn_lo = reduceall_mpi('+',dn_lo)
@@ -460,6 +463,9 @@ subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_v
           endif
        enddo
     enddo deltafind
+
+    !-- split listneigh into shell / inner / rest for the final r_lo and r_hi
+    call partition_neigh(nneigh,dnpart,r_lo,r_hi,listneigh,nneigh_shell,nneigh_inner)
 
     !
     !-- ionise the local particles inside the r_lo of their sector;
@@ -596,49 +602,37 @@ end subroutine HII_bound
 
 !-----------------------------------------------------------------------
 !+
-!  photon demand of source i inside r_lo and inside r_hi of each sector,
-!  as a fraction of the sector's budget Q/nsec (eq. 6, 13). A particle that
-!  other sources also reached at the previous update costs source i only
-!  its flux share (eq. 14):
+!  photon demand y_j of every neighbour of source i, as a fraction of its
+!  sector's budget Q/nsec (eq. 6, 13). A particle that other sources also
+!  reached at the previous update costs source i only its flux share (eq. 14):
 !    f_ij = F_ij / sum_s F_sj,  F_sj = Q_s/(4 pi d_sj^2),
 !  the sum running over i and every source s with d_sj < r_S(s) last update,
 !  r_S(s) taken in the sector of s that contains j.
-!  listneigh is reordered into three blocks:
-!    1 : nneigh_shell                          shell [r_lo,r_hi) of the particle's sector,
-!                                              same order as dnpart(1:3,:) = (d^2, y_j, sector)
-!    nneigh_shell+1 : nneigh_shell+nneigh_inner inside r_lo of the particle's sector
-!    the rest                                   beyond r_hi, not gas, or dead
+!  dnpart(1:3,n) = (d^2, y_j, sector) of listneigh(n); sector 0 marks a
+!  particle that is not gas, dead, or beyond r_hi of its sector.
+!  None of this depends on r_lo, so it is only needed after a new walk
 !+
 !-----------------------------------------------------------------------
-subroutine compute_dnspheres(i,nptmass,xyzmh_ptmass,rprev2,rprevmax2,coef,r_lo,r_hi,xyzh,rho,&
-                             listneigh,nneigh,nneigh_shell,nneigh_inner,dn_lo,dn_hi,dnpart)
+subroutine compute_dnpart(i,nptmass,xyzmh_ptmass,rprev2,rprevmax2,coef,r_hi,xyzh,rho,&
+                          listneigh,nneigh,dnpart)
  use part,    only:get_pmass,iphase,get_partinfo,isdead_or_accreted,irateion
  use healpix, only:vec2pix_nest
- integer, intent(in)    :: i,nptmass,nneigh
- integer, intent(inout) :: listneigh(:)
- integer, intent(out)   :: nneigh_shell,nneigh_inner
- real,    intent(in)    :: xyzmh_ptmass(:,:),rprev2(:,:),rprevmax2(:),coef,r_lo(:),r_hi(:)
- real,    intent(in)    :: xyzh(:,:),rho(:)
- real,    intent(out)   :: dn_lo(:),dn_hi(:),dnpart(:,:)
- integer, allocatable :: iblock(:),listold(:)
- integer :: j,n,s,k,ks,ipix,itypej,ninner,nrej
- real    :: dx(3),dxs(3),dr2,dnj,d2s,fsum
+ integer, intent(in)  :: i,nptmass,nneigh
+ integer, intent(in)  :: listneigh(:)
+ real,    intent(in)  :: xyzmh_ptmass(:,:),rprev2(:,:),rprevmax2(:),coef,r_hi(:)
+ real,    intent(in)  :: xyzh(:,:),rho(:)
+ real,    intent(out) :: dnpart(:,:)
+ integer :: j,n,s,k,ks,ipix,itypej
+ real    :: dx(3),dxs(3),dr2,d2s,fsum
  logical :: isactive,isgas,isdust
 
- dn_lo = 0.
- dn_hi = 0.
- !
- !-- per particle: sector, distance and demand into dnpart(:,n), and its block
- !   (0 rejected, 1 shell, 2 inner). This is the costly part: run it in parallel
- !
- allocate(iblock(nneigh))
  !$omp parallel do default(none) &
  !$omp shared(nneigh,listneigh,iphase,xyzh,xyzmh_ptmass,i,nptmass,rprev2,rprevmax2) &
- !$omp shared(coef,rho,r_lo,r_hi,nside_H2R,dnpart,iblock) &
- !$omp private(n,j,isactive,isgas,isdust,itypej,dx,dr2,ipix,k,fsum,s,dxs,d2s,ks,dnj)
+ !$omp shared(coef,rho,r_hi,nside_H2R,dnpart) &
+ !$omp private(n,j,isactive,isgas,isdust,itypej,dx,dr2,ipix,k,fsum,s,dxs,d2s,ks)
  do n=1,nneigh
 
-    iblock(n) = 0
+    dnpart(:,n) = 0.
     j = listneigh(n)
     call get_partinfo(iphase(j),isactive,isgas,isdust,itypej)
     if (.not.isgas .or. isdead_or_accreted(xyzh(4,j))) cycle
@@ -672,43 +666,87 @@ subroutine compute_dnspheres(i,nptmass,xyzmh_ptmass,rprev2,rprevmax2,coef,r_lo,r
                                              *dr2/max(d2s,tiny(d2s))
     enddo
 
-    dnj = coef*get_pmass(j,.true.)*rho(j)/fsum
     dnpart(1,n) = dr2
-    dnpart(2,n) = dnj
+    dnpart(2,n) = coef*get_pmass(j,.true.)*rho(j)/fsum
     dnpart(3,n) = real(k)
 
-    if (dr2 < r_lo(k)**2) then
+ enddo
+ !$omp end parallel do
+
+end subroutine compute_dnpart
+
+!-----------------------------------------------------------------------
+!+
+!  photon demand of source i inside r_lo and inside r_hi of each sector,
+!  from dnpart. In serial and in list order: the sums do not depend on
+!  the number of threads
+!+
+!-----------------------------------------------------------------------
+subroutine sum_dnspheres(nneigh,dnpart,r_lo,r_hi,dn_lo,dn_hi)
+ integer, intent(in)  :: nneigh
+ real,    intent(in)  :: dnpart(:,:),r_lo(:),r_hi(:)
+ real,    intent(out) :: dn_lo(:),dn_hi(:)
+ integer :: n,k
+
+ dn_lo = 0.
+ dn_hi = 0.
+ do n=1,nneigh
+    k = nint(dnpart(3,n))
+    if (k == 0) cycle
+    if (dnpart(1,n) >= r_hi(k)**2) cycle   ! r_hi may have shrunk since the walk
+    dn_hi(k) = dn_hi(k) + dnpart(2,n)
+    if (dnpart(1,n) < r_lo(k)**2) dn_lo(k) = dn_lo(k) + dnpart(2,n)
+ enddo
+
+end subroutine sum_dnspheres
+
+!-----------------------------------------------------------------------
+!+
+!  listneigh is reordered into three blocks:
+!    1 : nneigh_shell                          shell [r_lo,r_hi) of the particle's sector,
+!                                              same order as dnpart(1:3,:) = (d^2, y_j, sector)
+!    nneigh_shell+1 : nneigh_shell+nneigh_inner inside r_lo of the particle's sector
+!    the rest                                   beyond r_hi, not gas, or dead
+!+
+!-----------------------------------------------------------------------
+subroutine partition_neigh(nneigh,dnpart,r_lo,r_hi,listneigh,nneigh_shell,nneigh_inner)
+ integer, intent(in)    :: nneigh
+ real,    intent(inout) :: dnpart(:,:)
+ real,    intent(in)    :: r_lo(:),r_hi(:)
+ integer, intent(inout) :: listneigh(:)
+ integer, intent(out)   :: nneigh_shell,nneigh_inner
+ integer, allocatable :: iblock(:),listold(:)
+ integer :: n,k,ninner,nrej
+
+ !-- block of each particle: 0 rejected, 1 shell, 2 inner
+ allocate(iblock(nneigh),listold(nneigh))
+ do n=1,nneigh
+    iblock(n) = 0
+    k = nint(dnpart(3,n))
+    if (k == 0) cycle
+    if (dnpart(1,n) >= r_hi(k)**2) cycle
+    if (dnpart(1,n) < r_lo(k)**2) then
        iblock(n) = 2
     else
        iblock(n) = 1
     endif
-
  enddo
- !$omp end parallel do
- !
- !-- sums and partition in serial, in list order: the sums do not depend on the
- !   number of threads. The shell keeps dnpart compacted in its own order (m <= n)
- !
+
  nneigh_shell = count(iblock == 1)
  nneigh_inner = count(iblock == 2)
- allocate(listold(nneigh))
  listold = listneigh(1:nneigh)
  ninner  = nneigh_shell
  nrej    = nneigh_shell + nneigh_inner
  nneigh_shell = 0
 
+ !-- the shell keeps dnpart compacted in its own order (m <= n)
  do n=1,nneigh
     select case(iblock(n))
     case(1) !-- shell
-       k = nint(dnpart(3,n))
-       dn_hi(k) = dn_hi(k) + dnpart(2,n)
        nneigh_shell = nneigh_shell + 1
        listneigh(nneigh_shell) = listold(n)
        dnpart(:,nneigh_shell)  = dnpart(:,n)
     case(2) !-- inner
-       k = nint(dnpart(3,n))
-       dn_hi(k) = dn_hi(k) + dnpart(2,n)
-       dn_lo(k) = dn_lo(k) + dnpart(2,n)
        ninner = ninner + 1
        listneigh(ninner) = listold(n)
     case default !--rejected
@@ -718,7 +756,7 @@ subroutine compute_dnspheres(i,nptmass,xyzmh_ptmass,rprev2,rprevmax2,coef,r_lo,r
  enddo
  deallocate(iblock,listold)
 
-end subroutine compute_dnspheres
+end subroutine partition_neigh
 
 !-----------------------------------------------------------------------
 !+
