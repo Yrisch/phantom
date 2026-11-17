@@ -751,7 +751,8 @@ end subroutine compute_dnpart
 !-----------------------------------------------------------------------
 !+
 !  photon demand of source i inside r_lo and inside r_hi of each sector,
-!  from dnpart. In serial and in list order: the sums do not depend on
+!  from dnpart. Summed over nchunk_dn(nneigh) contiguous chunks in
+!  parallel, then over the chunks in order: the sums do not depend on
 !  the number of threads
 !+
 !-----------------------------------------------------------------------
@@ -759,17 +760,35 @@ subroutine sum_dnspheres(nneigh,dnpart,r_lo,r_hi,dn_lo,dn_hi)
  integer, intent(in)  :: nneigh
  real,    intent(in)  :: dnpart(:,:),r_lo(:),r_hi(:)
  real,    intent(out) :: dn_lo(:),dn_hi(:)
- integer :: n,k
+ real,    allocatable :: dnc_lo(:,:),dnc_hi(:,:)
+ integer :: n,k,c,nchunk,nsec
+
+ nsec   = size(dn_lo)
+ nchunk = nchunk_dn(nneigh)
+ allocate(dnc_lo(nsec,nchunk),dnc_hi(nsec,nchunk))
+ !$omp parallel do default(none) schedule(static) &
+ !$omp shared(nchunk,nneigh,dnpart,r_lo,r_hi,dnc_lo,dnc_hi) &
+ !$omp private(c,n,k)
+ do c=1,nchunk
+    dnc_lo(:,c) = 0.
+    dnc_hi(:,c) = 0.
+    do n=chunk_start(c,nchunk,nneigh),chunk_start(c+1,nchunk,nneigh)-1
+       k = nint(dnpart(3,n))
+       if (k == 0) cycle
+       if (dnpart(1,n) >= r_hi(k)**2) cycle   ! r_hi may have shrunk since the walk
+       dnc_hi(k,c) = dnc_hi(k,c) + dnpart(2,n)
+       if (dnpart(1,n) < r_lo(k)**2) dnc_lo(k,c) = dnc_lo(k,c) + dnpart(2,n)
+    enddo
+ enddo
+ !$omp end parallel do
 
  dn_lo = 0.
  dn_hi = 0.
- do n=1,nneigh
-    k = nint(dnpart(3,n))
-    if (k == 0) cycle
-    if (dnpart(1,n) >= r_hi(k)**2) cycle   ! r_hi may have shrunk since the walk
-    dn_hi(k) = dn_hi(k) + dnpart(2,n)
-    if (dnpart(1,n) < r_lo(k)**2) dn_lo(k) = dn_lo(k) + dnpart(2,n)
+ do c=1,nchunk
+    dn_lo = dn_lo + dnc_lo(:,c)
+    dn_hi = dn_hi + dnc_hi(:,c)
  enddo
+ deallocate(dnc_lo,dnc_hi)
 
 end subroutine sum_dnspheres
 
@@ -780,6 +799,8 @@ end subroutine sum_dnspheres
 !                                              same order as dnpart(1:3,:) = (d^2, y_j, sector)
 !    nneigh_shell+1 : nneigh_shell+nneigh_inner inside r_lo of the particle's sector
 !    the rest                                   beyond r_hi, not gas, or dead
+!  Each block keeps the order of the list. Done in parallel over chunks:
+!  count per chunk, then each chunk copies its particles to its place
 !+
 !-----------------------------------------------------------------------
 subroutine partition_neigh(nneigh,dnpart,r_lo,r_hi,listneigh,nneigh_shell,nneigh_inner)
@@ -788,48 +809,87 @@ subroutine partition_neigh(nneigh,dnpart,r_lo,r_hi,listneigh,nneigh_shell,nneigh
  real,    intent(in)    :: r_lo(:),r_hi(:)
  integer, intent(inout) :: listneigh(:)
  integer, intent(out)   :: nneigh_shell,nneigh_inner
- integer, allocatable :: iblock(:),listold(:)
- integer :: n,k,ninner,nrej
+ integer, allocatable :: iblock(:),listold(:),ncount(:,:),ipos(:,:)
+ real,    allocatable :: dnold(:,:)
+ integer :: n,k,c,nchunk,ib
 
- !-- block of each particle: 0 rejected, 1 shell, 2 inner
- allocate(iblock(nneigh),listold(nneigh))
- do n=1,nneigh
-    iblock(n) = 0
-    k = nint(dnpart(3,n))
-    if (k == 0) cycle
-    if (dnpart(1,n) >= r_hi(k)**2) cycle
-    if (dnpart(1,n) < r_lo(k)**2) then
-       iblock(n) = 2
-    else
-       iblock(n) = 1
-    endif
+ nchunk = nchunk_dn(nneigh)
+ allocate(iblock(nneigh),listold(nneigh),dnold(3,nneigh),ncount(0:2,nchunk),ipos(0:2,nchunk))
+
+ !-- block of each particle (0 rejected, 1 shell, 2 inner), counted per chunk
+ !$omp parallel do default(none) schedule(static) &
+ !$omp shared(nchunk,nneigh,dnpart,r_lo,r_hi,iblock,ncount,listold,dnold,listneigh) &
+ !$omp private(c,n,k)
+ do c=1,nchunk
+    ncount(:,c) = 0
+    do n=chunk_start(c,nchunk,nneigh),chunk_start(c+1,nchunk,nneigh)-1
+       listold(n)  = listneigh(n)
+       dnold(:,n)  = dnpart(:,n)
+       iblock(n)   = 0
+       k = nint(dnpart(3,n))
+       if (k > 0) then
+          if (dnpart(1,n) < r_lo(k)**2) then
+             iblock(n) = 2
+          elseif (dnpart(1,n) < r_hi(k)**2) then
+             iblock(n) = 1
+          endif
+       endif
+       ncount(iblock(n),c) = ncount(iblock(n),c) + 1
+    enddo
+ enddo
+ !$omp end parallel do
+
+ !-- where each chunk writes in each block
+ nneigh_shell = sum(ncount(1,:))
+ nneigh_inner = sum(ncount(2,:))
+ ipos(1,1) = 0
+ ipos(2,1) = nneigh_shell
+ ipos(0,1) = nneigh_shell + nneigh_inner
+ do c=2,nchunk
+    ipos(:,c) = ipos(:,c-1) + ncount(:,c-1)
  enddo
 
- nneigh_shell = count(iblock == 1)
- nneigh_inner = count(iblock == 2)
- listold = listneigh(1:nneigh)
- ninner  = nneigh_shell
- nrej    = nneigh_shell + nneigh_inner
- nneigh_shell = 0
-
- !-- the shell keeps dnpart compacted in its own order (m <= n)
- do n=1,nneigh
-    select case(iblock(n))
-    case(1) !-- shell
-       nneigh_shell = nneigh_shell + 1
-       listneigh(nneigh_shell) = listold(n)
-       dnpart(:,nneigh_shell)  = dnpart(:,n)
-    case(2) !-- inner
-       ninner = ninner + 1
-       listneigh(ninner) = listold(n)
-    case default !--rejected
-       nrej = nrej + 1
-       listneigh(nrej) = listold(n)
-    end select
+ !$omp parallel do default(none) schedule(static) &
+ !$omp shared(nchunk,nneigh,iblock,ipos,listold,dnold,listneigh,dnpart) &
+ !$omp private(c,n,ib)
+ do c=1,nchunk
+    do n=chunk_start(c,nchunk,nneigh),chunk_start(c+1,nchunk,nneigh)-1
+       ib = iblock(n)
+       ipos(ib,c) = ipos(ib,c) + 1
+       listneigh(ipos(ib,c)) = listold(n)
+       if (ib == 1) dnpart(:,ipos(ib,c)) = dnold(:,n)  ! the shell keeps its dnpart
+    enddo
  enddo
- deallocate(iblock,listold)
+ !$omp end parallel do
+ deallocate(iblock,listold,dnold,ncount,ipos)
 
 end subroutine partition_neigh
+
+!-----------------------------------------------------------------------
+!+
+!  number of chunks a list of n neighbours is split in: depends on n
+!  only, so that sums over chunks do not depend on the number of threads
+!+
+!-----------------------------------------------------------------------
+pure integer function nchunk_dn(n)
+ integer, intent(in) :: n
+ integer, parameter :: minchunk = 4096, maxchunk = 256
+
+ nchunk_dn = max(1,min(maxchunk,n/minchunk))
+
+end function nchunk_dn
+
+!-----------------------------------------------------------------------
+!+
+!  first entry of chunk c of nchunk over n entries (c = nchunk+1 gives n+1)
+!+
+!-----------------------------------------------------------------------
+pure integer function chunk_start(c,nchunk,n)
+ integer, intent(in) :: c,nchunk,n
+
+ chunk_start = int((int(c-1,kind=8)*n)/nchunk) + 1
+
+end function chunk_start
 
 !-----------------------------------------------------------------------
 !+
