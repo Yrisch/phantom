@@ -905,7 +905,7 @@ subroutine getneigh_sectors(xpos,nsec,secdir,secbeta,rhisec,listneigh,nneigh)
                            leaves,nleaves,itemcount(it))
     itemnleaf(it) = nleaves - itemleaf1(it) + 1
  enddo
- !$omp end do
+ !$omp enddo
  !$omp single
  itemoff(1) = 0
  do it=1,nitem
