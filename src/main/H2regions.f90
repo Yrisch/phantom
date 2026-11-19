@@ -13,24 +13,32 @@ module HIIRegion
 ! Ionizing rate computed using observation fit made by Fujii et al. (2021)
 ! Adapted by Yann Bernard in Phantom
 !
+! Two phase thermal model (ieos=21): the fully ionised gas is held at uIon
+! and the neutral gas away from the front at Tcold (its hydro du/dt is
+! ignored in force). The gas of the front (partially ionised, or neutral
+! with an ionised neighbour) is heated at once to its target
+! T = phi*Tion + (1-phi)*Tcold and, above it, cools over Crelax*h/c_s(u)
+!
 ! :References: Fujii et al. (2021), Hopkins et al. (2012)
 !
 ! :Owner: Yann Bernard
 !
 ! :Runtime parameters: None
 !
-! :Dependencies: dim, eos, eos_HIIR, infile_utils, io, kernel, neighkdtree,
-!   part, physcon, sortutils, units
+! :Dependencies: dim, eos, eos_HIIR, healpix, infile_utils, io, kdtree,
+!   kernel, mpiutils, neighkdtree, part, physcon, sortutils, units
 !
- use eos_HIIR,   only:csion,uIon,Tion,Tcold,muion
+ use eos_HIIR,   only:csion,uIon,muion
  use eos,        only:gmw
  implicit none
 
  public :: update_ionrates,update_ionrate, HII_feedback,&
            initialize_H2R,read_options_H2R,write_options_H2R
+ public :: relax_u_HIIR,heated_u_HIIR,is_ionised,is_fully_ionised
 
  integer, public               :: iH2R = 0
  real   , public               :: C_HII = 0.3 ! safety factor on the update interval of the HII regions
+ real   , public               :: Crelax = 1. ! relaxation time of the gas of the front in units of h/c_s
  real   , public               :: Rmax = 15 ! Maximum HII region radius (pc) to avoid artificial expansion...
  real   , public               :: Mmin = 8  ! Minimum mass (Msun) to produce HII region
  integer, public               :: nHIIsources = 0
@@ -67,6 +75,7 @@ module HIIRegion
  real              :: hv_on_c
  real              :: Rst_max
  real              :: Minmass
+ real, parameter   :: tolphase = 1.e-3 ! relative excess of u below which the gas is back in its phase
 
  private
 
@@ -84,6 +93,7 @@ subroutine initialize_H2R
  use eos,     only:gmw
  use dim,     only:maxptmass
  use healpix, only:pix2vec_nest,vec2pix_nest
+ use part,    only:eos_vars,imu
  integer :: k,iv,ipix
  real    :: vertex(3,4)
 
@@ -101,6 +111,7 @@ subroutine initialize_H2R
  HIIdt = 0.
  dt_HII = huge(dt_HII)
  tlast_HII = 0.
+ eos_vars(imu,:) = gmw  ! neutral until the first update
 
  !
  !-- HEALPix sectors: centres and angular radii
@@ -279,12 +290,12 @@ end subroutine HII_feedback
 !+
 !-----------------------------------------------------------------------
 subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_vars,hmin)
- use part,        only:ihacc,irateion,irstrom,itemp,imu
+ use part,        only:ihacc,irateion,irstrom,imu
  use neighkdtree, only:listneigh=>listneigh_global,getneigh_sectors,getneigh_pos,&
                        leaf_is_active,node
  use kdtree,      only:irootnode
  use sortutils,   only:indexx
- use dim,         only:maxvxyzu,mpi
+ use dim,         only:mpi
  use io,          only:iverbose,iprint,warning,id,nprocs
  use mpiutils,    only:reduceall_mpi,allgatherv_mpi,allgather_mpi,get_displs_mpi
  integer, intent(in)    :: nptmass,npart
@@ -308,7 +319,6 @@ subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_v
  !-- reset every local particle to neutral before the sources ionise them again
  !
  eos_vars(imu,:) = gmw
- if (maxvxyzu < 4) eos_vars(itemp,:) = Tcold  ! cooling in isothermal case
  hmin = huge(hmin)
 
  ! squared sector radii of the previous update (-1 if none)
@@ -593,7 +603,6 @@ subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_v
 
 end subroutine HII_bound
 
-
 !-----------------------------------------------------------------------
 !+
 !  photon demand of source i inside r_lo and inside r_hi of each sector,
@@ -786,9 +795,7 @@ end function stromgren_guess
 !+
 !-----------------------------------------------------------------------
 subroutine ionise_particle(eos_vars,vxyzu,j,phi)
- use part,         only:itemp,imu
- use eos,          only:gamma,icooling
- use cooling_HIIR, only:heated_u_HIIR
+ use part,         only:imu
  integer, intent(in)    :: j
  real,    intent(in)    :: phi
  real,    intent(inout) :: eos_vars(:,:),vxyzu(:,:)
@@ -797,10 +804,9 @@ subroutine ionise_particle(eos_vars,vxyzu,j,phi)
  phi_old = (gmw - eos_vars(imu,j))/(gmw - muion)
  if (phi <= phi_old) return
 
- eos_vars(itemp,j) = phi*Tion  + (1. - phi)*Tcold
- eos_vars(imu,j)   = phi*muion + (1. - phi)*gmw
- !-- two phase model: heated at once (vpred in derivs), the step keeps it
- if (icooling == 10) vxyzu(4,j) = heated_u_HIIR(vxyzu(4,j),eos_vars(imu,j),gamma)
+ eos_vars(imu,j) = phi*muion + (1. - phi)*gmw
+ !-- heated at once for the forces (vpred in derivs); the step relaxes u to the same target
+ vxyzu(4,j) = heated_u_HIIR(vxyzu(4,j),eos_vars(imu,j))
 
 end subroutine ionise_particle
 
@@ -811,11 +817,10 @@ end subroutine ionise_particle
 !-----------------------------------------------------------------------
 subroutine HII_Knn(nptmass,npart,xyzh,xyzmh_ptmass,vxyzu,rho,eos_vars,hmin)
  use part,       only:massoftype,ihsoft,igas,irateion,isdead_or_accreted,&
-                      irstrom,get_partinfo,iphase,itemp,imu,get_pmass
+                      irstrom,get_partinfo,iphase,imu,get_pmass
  use neighkdtree,   only:listneigh=>listneigh_global,getneigh_pos,leaf_is_active
  use sortutils,  only:Knnfunc,set_r2func_origin,r2func_origin
  use physcon,    only:pc,pi
- use dim,        only:maxvxyzu
  use io,         only:iverbose,iprint,warning,id,master
  integer, intent(in)    :: nptmass,npart
  real,    intent(in)    :: xyzh(:,:),rho(:)
@@ -840,7 +845,6 @@ subroutine HII_Knn(nptmass,npart,xyzh,xyzmh_ptmass,vxyzu,rho,eos_vars,hmin)
  !
  if (nHIIsources > 0 .and. id==master) then
     eos_vars(imu,:) = gmw
-    if (maxvxyzu < 4) eos_vars(itemp,:) = Tcold  ! cooling in isothermal case
     do i=1,nptmass
        converged  = .false.
        max_search = .false.
@@ -956,8 +960,7 @@ end subroutine HII_Knn
 !-----------------------------------------------------------------------
 subroutine HII_ray(nptmass,npart,xyzh,xyzmh_ptmass,vxyzu,rho,eos_vars,hmin)
  use part,     only:massoftype,igas,irateion,irstrom,isdead_or_accreted,&
-                    iphase,get_partinfo,noverlap,itemp,imu
- use dim,      only:maxvxyzu
+                    iphase,get_partinfo,noverlap,imu
  use io,         only:iverbose,iprint,id,master
  integer, intent(in)    :: nptmass,npart
  real,    intent(in)    :: xyzh(:,:),rho(:)
@@ -980,7 +983,7 @@ subroutine HII_ray(nptmass,npart,xyzh,xyzmh_ptmass,vxyzu,rho,eos_vars,hmin)
     !
 !$omp parallel default(none)&
 !$omp shared(npart,nptmass,xyzh,vxyzu,xyzmh_ptmass,eos_vars,noverlap,rho)&
-!$omp shared(pmass,iphase,iH2R,Tcold,uIon,gmw)&
+!$omp shared(pmass,iphase,iH2R,uIon,gmw)&
 !$omp private(log_Qi,i,j,xj,yj,zj,fluxi,itypei,rsrci,isgas,isdust)&
 !$omp private(isactive,noverlapi)&
 !$omp reduction(+:k) &
@@ -991,7 +994,6 @@ subroutine HII_ray(nptmass,npart,xyzh,xyzmh_ptmass,vxyzu,rho,eos_vars,hmin)
           call get_partinfo(iphase(i),isactive,isgas,isdust,itypei)
           ! if (.not. isactive) cycle
           if (isgas) then
-             if (maxvxyzu < 4) eos_vars(itemp,i) = Tcold
              eos_vars(imu,i) = gmw
              noverlapi = 0
              do j=1,nptmass
@@ -1176,6 +1178,97 @@ end subroutine inversed_raytracing
 
 !-----------------------------------------------------------------------
 !+
+!  relaxation of the thermal energy to the target of its phase over dt,
+!  exact for any dt:
+!    u_new = u_target + (u - u_target)*exp(-dt/t_relax),  t_relax = Crelax*h/c_s(u)
+!  uIon for the fully ionised gas, u_target at once below the target.
+!  It does not commute with the kicks, so the step applies it once per
+!  interval of time of the particle, not in each kick
+!+
+!-----------------------------------------------------------------------
+real function relax_u_HIIR(ui,hi,mui,dt) result(unew)
+ use eos, only:gamma
+ real, intent(in) :: ui,hi,mui,dt
+ real :: utarget,trelax
+
+ unew = ui
+ if (dt <= 0.) return
+
+ if (is_fully_ionised(mui)) then
+    unew = uIon
+ else
+    utarget = get_utarget(mui)
+    if (unew <= utarget) then
+       unew = utarget  ! heated by the stars
+    else
+       trelax = Crelax*hi/sqrt(gamma*(gamma - 1.)*unew)
+       if (trelax > 0.) then
+          unew = utarget + (unew - utarget)*exp(-dt/trelax)
+          if (unew - utarget < tolphase*utarget) unew = utarget  ! back in its phase
+       else
+          unew = utarget  ! Crelax = 0: two isothermal phases
+       endif
+    endif
+ endif
+
+end function relax_u_HIIR
+
+!-----------------------------------------------------------------------
+!+
+!  thermal energy given to the forces when a particle is ionised:
+!  uIon for the fully ionised gas, at least its target otherwise
+!+
+!-----------------------------------------------------------------------
+real function heated_u_HIIR(ui,mui) result(uheated)
+ real, intent(in) :: ui,mui
+
+ if (is_fully_ionised(mui)) then
+    uheated = uIon
+ else
+    uheated = max(ui,get_utarget(mui))
+ endif
+
+end function heated_u_HIIR
+
+!-----------------------------------------------------------------------
+!+
+!  gas (partially) ionised by the HII routines
+!+
+!-----------------------------------------------------------------------
+logical function is_ionised(mui)
+ real, intent(in) :: mui
+
+ is_ionised = (mui > 0. .and. mui < gmw)
+
+end function is_ionised
+
+logical function is_fully_ionised(mui)
+ real, intent(in) :: mui
+
+ is_fully_ionised = (mui > 0. .and. mui <= muion)
+
+end function is_fully_ionised
+
+!-----------------------------------------------------------------------
+!+
+!  thermal energy of the phase, T_target = phi*Tion + (1-phi)*Tcold
+!+
+!-----------------------------------------------------------------------
+real function get_utarget(mui) result(utarget)
+ use eos,      only:gamma,temperature_coef
+ use eos_HIIR, only:Tion,Tcold
+ real, intent(in) :: mui
+ real :: mu,phi
+
+ mu = mui
+ if (mu <= 0.) mu = gmw
+ phi = min(max((gmw - mu)/(gmw - muion),0.),1.)
+ utarget = (phi*Tion + (1. - phi)*Tcold)/(temperature_coef*mu*(gamma - 1.))
+
+end function get_utarget
+
+!-----------------------------------------------------------------------
+!+
 !  write options to input file
 !+
 !-----------------------------------------------------------------------
@@ -1191,6 +1284,7 @@ subroutine write_options_H2R(iunit)
     call write_inopt(Mmin, 'Mmin', "Minimum star mass to trigger HII region (MSun)", iunit)
     call write_inopt(Rmax, 'Rmax', "Maximum radius for HII region (pc)(only Knn)", iunit)
     call write_inopt(C_HII, 'C_HII', "safety factor on the update interval (front moves < C_HII*h)", iunit)
+    call write_inopt(Crelax, 'Crelax', "relaxation time of the gas of the HII fronts in units of h/c_s", iunit)
     if (iH2R == 4) call write_inopt(nside_H2R, 'nsideH2R', &
        "HEALPix Nside of the sectors, 12*Nside**2 sectors (power of 2, only bounded Knn)", iunit)
  endif
@@ -1213,6 +1307,7 @@ subroutine read_options_H2R(db,nerr)
     call read_inopt(Mmin,'Mmin',db,errcount=nerr,min=8.)
     call read_inopt(Rmax,'Rmax',db,errcount=nerr,min=10.)
     call read_inopt(C_HII,'C_HII',db,errcount=nerr,min=0.,default=0.3)
+    call read_inopt(Crelax,'Crelax',db,errcount=nerr,min=0.,default=Crelax)
     if (iH2R == 4) then
        call read_inopt(nside_H2R,'nsideH2R',db,errcount=nerr,min=1,default=1)
        if (iand(nside_H2R,nside_H2R-1) /= 0) then
