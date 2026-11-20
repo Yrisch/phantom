@@ -187,7 +187,7 @@ subroutine evol_prestep(time,dtmax,dt,t1,tcpu1,nactive,inject_flag_present)
  logical,      intent(in)    :: inject_flag_present
  real(kind=4) :: twallperdump
  integer :: npart_old,nalive,istepHII,ibinHII
- logical :: doHII
+ logical :: doHII,newstars
  !
  ! injection of new particles into simulation
  !
@@ -239,7 +239,10 @@ subroutine evol_prestep(time,dtmax,dt,t1,tcpu1,nactive,inject_flag_present)
     nactive = npart
  endif
 
- if (gravity .and. icreate_sinks > 0) call ptmass_create_and_update_forces(time,dtextforce)
+ if (gravity .and. icreate_sinks > 0) then
+    newstars = (icreate_sinks == 2 .and. ipart_createstars /= 0)
+    call ptmass_create_and_update_forces(time,dtextforce)
+ endif
 
  if (iH2R > 0) then
     if (ind_timesteps) then
@@ -250,7 +253,7 @@ subroutine evol_prestep(time,dtmax,dt,t1,tcpu1,nactive,inject_flag_present)
     else
        doHII    = (time - tlast_HII >= min(dt_HII,dtmax))
     endif
-    if (doHII .or. (icreate_sinks == 2 .and. ipart_createstars /= 0)) then
+    if (doHII .or. newstars) then
        HIIupdateflag = .true.
        HIIdt     = time - tlast_HII
        tlast_HII = time
