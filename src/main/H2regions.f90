@@ -1306,11 +1306,8 @@ subroutine read_options_H2R(db,nerr)
  if (iH2R > 0) then
     call read_inopt(Mmin,'Mmin',db,errcount=nerr,min=8.)
     call read_inopt(Rmax,'Rmax',db,errcount=nerr,min=10.)
-    <<<<<<< HEAD
     call read_inopt(Crelax,'Crelax',db,errcount=nerr,min=0.,default=Crelax)
-    =======
     call read_inopt(C_HII,'C_HII',db,errcount=nerr,min=0.,default=0.3)
-    >>>>>>> newHIIupdate
     if (iH2R == 4) then
        call read_inopt(nside_H2R,'nsideH2R',db,errcount=nerr,min=1,default=1)
        if (iand(nside_H2R,nside_H2R-1) /= 0) then
