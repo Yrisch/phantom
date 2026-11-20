@@ -556,7 +556,7 @@ subroutine initialise_sink_particle_forces(time,dtextforce,dtsinkgas,logfile,ier
  use mpiutils,         only:reduce_in_place_mpi,reduceall_mpi
  use io,               only:iprint,id,master,nprocs
  use io_control,       only:set_rhofinal1
- use HIIRegion,        only:iH2R,initialize_H2R,update_ionrates
+ use HIIRegion,        only:iH2R,initialize_H2R,update_ionrates,tlast_HII
  use part,             only:ipert
  use subgroup,         only:subgroup_search,subgroup_init,update_kappa
  use utils_subgroup,   only:get_subgroup
@@ -599,6 +599,7 @@ subroutine initialise_sink_particle_forces(time,dtextforce,dtsinkgas,logfile,ier
  if (iH2R > 0) then
     call initialize_H2R
     call update_ionrates(nptmass,xyzmh_ptmass,h_acc)
+    tlast_HII = time
  endif
 
  if (nptmass > 0) then

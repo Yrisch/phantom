@@ -170,7 +170,7 @@ subroutine evol_prestep(time,dtmax,dt,t1,tcpu1,nactive,inject_flag_present)
  use dynamic_dtmax,only:check_dtmax_for_decrease
  use evolve_utils, only:ptmass_create_and_update_forces
  use inject,       only:inject_particles
- use HIIRegion,    only:iH2R,HIIuprate,HIIdt,HIIupdateflag
+ use HIIRegion,    only:iH2R,HIIdt,HIIupdateflag,dt_HII,tlast_HII
  use io_control,   only:nfulldump
  use mpiutils,     only:reduceall_mpi
  use part,         only:npart,npartoftype,xyzh,vxyzu,fxyzu,apr_level,&
@@ -186,13 +186,16 @@ subroutine evol_prestep(time,dtmax,dt,t1,tcpu1,nactive,inject_flag_present)
  integer,      intent(out)   :: nactive
  logical,      intent(in)    :: inject_flag_present
  real(kind=4) :: twallperdump
- integer :: npart_old,nalive,istepHII
+ integer :: npart_old,nalive,istepHII,ibinHII
+ logical :: doHII,newstars
 
  !
  ! Sink creation
  !
- if (gravity .and. icreate_sinks > 0) call ptmass_create_and_update_forces(time,dtextforce)
-
+ if (gravity .and. icreate_sinks > 0) then
+    newstars = (icreate_sinks == 2 .and. ipart_createstars /= 0)
+    call ptmass_create_and_update_forces(time,dtextforce)
+ endif
  !
  ! injection of new particles into simulation
  !
@@ -244,15 +247,20 @@ subroutine evol_prestep(time,dtmax,dt,t1,tcpu1,nactive,inject_flag_present)
     nactive = npart
  endif
 
+
  if (iH2R > 0) then
-    istepHII = 1
     if (ind_timesteps) then
-       istepHII = 2**nbinmax/HIIuprate
-       if (istepHII==0) istepHII = 1
+       !--update on the boundaries of the bin of timestep dtmax/2**ibinHII <= dt_HII, at least once per dtmax
+       ibinHII  = min(max(ceiling(log(dtmax/dt_HII)/log(2.)),0),int(nbinmax))
+       istepHII = 2**(nbinmax-ibinHII)
+       doHII    = (mod(istepfrac,istepHII) == 0)
+    else
+       doHII    = (time - tlast_HII >= min(dt_HII,dtmax))
     endif
-    if (mod(istepfrac,istepHII) == 0 .or. istepfrac == 1 .or. (icreate_sinks == 2 .and. ipart_createstars /= 0)) then
+    if (doHII .or. newstars) then
        HIIupdateflag = .true.
-       HIIdt = dtmax/real(HIIuprate)
+       HIIdt     = time - tlast_HII
+       tlast_HII = time
     endif
  endif
 

@@ -36,9 +36,9 @@ module HIIRegion
            initialize_H2R,read_options_H2R,write_options_H2R
  public :: relax_u_HIIR,heated_u_HIIR,is_ionised,is_fully_ionised
 
- integer, parameter, public    :: HIIuprate   = 8 ! update rate when IND_TIMESTEPS=yes (Hopkins like method)
  integer, public               :: iH2R = 0
  real   , public               :: Crelax = 1. ! relaxation time of the gas of the front in units of h/c_s
+ real   , public               :: C_HII = 0.3 ! safety factor on the update interval of the HII regions
  real   , public               :: Rmax = 15 ! Maximum HII region radius (pc) to avoid artificial expansion...
  real   , public               :: Mmin = 8  ! Minimum mass (Msun) to produce HII region
  integer, public               :: nHIIsources = 0
@@ -47,7 +47,9 @@ module HIIRegion
  real   , public               :: mH1
  real   , public               :: DNcoeff
  logical, public               :: HIIupdateflag
- real   , public               :: HIIdt
+ real   , public               :: HIIdt       ! time elapsed since the previous update
+ real   , public               :: dt_HII      ! interval until the next update
+ real   , public               :: tlast_HII   ! time of the previous update
  integer, public               :: nside_H2R = 1   ! HEALPix Nside of the sectors (iH2R=4): 12*Nside**2 sectors
  integer, public               :: nsec_H2R  = 12
  real   , allocatable, public  :: rstrom_sec(:,:) ! Stromgren radius of each sector of each sink (nsec,maxptmass)
@@ -108,6 +110,8 @@ subroutine initialize_H2R
  HIIupdateflag = .true.
  HIIdt = 0.
  eos_vars(imu,:) = gmw  ! neutral until the first update
+ dt_HII = huge(dt_HII)
+ tlast_HII = 0.
 
  !
  !-- HEALPix sectors: centres and angular radii
@@ -243,18 +247,40 @@ end subroutine update_ionrate
 !+
 !-----------------------------------------------------------------------
 subroutine HII_feedback(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_vars)
+ use part, only:irateion
  integer, intent(in)    :: nptmass,npart
  real,    intent(in)    :: xyzh(:,:),rho(:),vxyz_ptmass(:,:)
  real,    intent(inout) :: xyzmh_ptmass(:,:),vxyzu(:,:)
  real,    intent(inout) :: eos_vars(:,:)
+ integer :: i
+ real    :: hmin,vmax
+
  select case(iH2R)
  case(1)
-    call HII_Knn(nptmass,npart,xyzh,xyzmh_ptmass,vxyzu,rho,eos_vars)
+    call HII_Knn(nptmass,npart,xyzh,xyzmh_ptmass,vxyzu,rho,eos_vars,hmin)
  case(2,3)
-    call HII_ray(nptmass,npart,xyzh,xyzmh_ptmass,vxyzu,rho,eos_vars)
+    call HII_ray(nptmass,npart,xyzh,xyzmh_ptmass,vxyzu,rho,eos_vars,hmin)
  case(4)
-    call HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_vars)
+    call HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_vars,hmin)
+ case default
+    hmin = huge(hmin)
  end select
+
+ !
+ !-- interval until the next update: the D-type front, moving at (2 c_ion + v_sink)
+ !   as in the range search of HII_bound, travels less than C_HII times the
+ !   smallest smoothing length of the ionised gas
+ !
+ vmax = 0.
+ do i=1,nptmass
+    if (xyzmh_ptmass(irateion,i) < epsilon(0.)) cycle
+    vmax = max(vmax,sqrt(dot_product(vxyz_ptmass(1:3,i),vxyz_ptmass(1:3,i))))
+ enddo
+ if (hmin < huge(hmin)) then
+    dt_HII = C_HII*hmin/(2.*csion + vmax)
+ else
+    dt_HII = huge(dt_HII)  ! nothing ionised: new sources or the dtmax cap trigger the next update
+ endif
 
 end subroutine HII_feedback
 
@@ -263,7 +289,7 @@ end subroutine HII_feedback
 ! HII feedback routine using boundaries to spare the full knn
 !+
 !-----------------------------------------------------------------------
-subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_vars)
+subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_vars,hmin)
  use part,        only:ihacc,irateion,irstrom,imu
  use neighkdtree, only:listneigh=>listneigh_global,getneigh_sectors,getneigh_pos,&
                        leaf_is_active,node
@@ -276,6 +302,7 @@ subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_v
  real,    intent(in)    :: xyzh(:,:),rho(:),vxyz_ptmass(:,:)
  real,    intent(inout) :: xyzmh_ptmass(:,:),vxyzu(:,:)
  real,    intent(inout) :: eos_vars(:,:)
+ real,    intent(out)   :: hmin  ! smallest smoothing length of the ionised gas
  integer, parameter   :: maxits = 50, maxc = 128
  real,    allocatable :: dnpart(:,:),dnall(:),rprev2(:,:),rprevmax2(:),dr2sec(:)
  real,    allocatable :: dn_lo(:),dn_hi(:),r_lo(:),r_hi(:),deltar(:),rs(:)
@@ -292,6 +319,7 @@ subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_v
  !-- reset every local particle to neutral before the sources ionise them again
  !
  eos_vars(imu,:) = gmw
+ hmin = huge(hmin)
 
  ! squared sector radii of the previous update (-1 if none)
  ! used for the flux sharing of overlapping regions
@@ -448,10 +476,12 @@ subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_v
     !
     nhot_loc = nneigh_inner
     !$omp parallel do default(none) &
-    !$omp shared(nneigh_shell,nneigh_inner,listneigh,eos_vars,vxyzu) &
-    !$omp private(n)
+    !$omp shared(nneigh_shell,nneigh_inner,listneigh,eos_vars,vxyzu,xyzh) &
+    !$omp private(n) &
+    !$omp reduction(min:hmin)
     do n=nneigh_shell+1,nneigh_shell+nneigh_inner
        call ionise_particle(eos_vars,vxyzu,listneigh(n),1.)
+       hmin = min(hmin,xyzh(4,listneigh(n)))
     enddo
     !$omp end parallel do
 
@@ -503,9 +533,10 @@ subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_v
     nhot   = 0
     !$omp parallel do default(none) schedule(dynamic) &
     !$omp shared(nsec,escaped,nsecall,offsec,isort,dnall,dr2sec,id_shell,dn_lo,r_lo,rs) &
-    !$omp shared(ifirst,ilast,displs,id,listneigh,eos_vars,vxyzu) &
+    !$omp shared(ifirst,ilast,displs,id,listneigh,eos_vars,vxyzu,xyzh) &
     !$omp private(k,nk,m,j,dnj,dntot,phi) &
-    !$omp reduction(+:nhot)
+    !$omp reduction(+:nhot) &
+    !$omp reduction(min:hmin)
     do k=1,nsec
 
        if (escaped(k)) cycle
@@ -527,8 +558,10 @@ subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_v
           else
              phi = (1. - dntot)/dnj
           endif
-          if (j >= ifirst .and. j <= ilast) &
+          if (j >= ifirst .and. j <= ilast) then
              call ionise_particle(eos_vars,vxyzu,listneigh(j-displs(id+1)),phi)
+             hmin = min(hmin,xyzh(4,listneigh(j-displs(id+1))))
+          endif
           rs(k) = sqrt(dnall(3*j-2))
           dntot = dntot + dnj
           if (phi < 1.) exit
@@ -566,6 +599,7 @@ subroutine HII_bound(nptmass,npart,xyzh,xyzmh_ptmass,vxyz_ptmass,vxyzu,rho,eos_v
  if (allocated(dnpart)) deallocate(dnpart)
  if (allocated(dn_lo)) deallocate(dn_lo,dn_hi,r_lo,r_hi,deltar,rs,converged,escaped,nsecall,offsec)
  deallocate(rprev2,rprevmax2)
+ if (mpi) hmin = reduceall_mpi('min',hmin)
 
 end subroutine HII_bound
 
@@ -781,7 +815,7 @@ end subroutine ionise_particle
 ! HII feedback routine using K nearest neighbors prescription
 !+
 !-----------------------------------------------------------------------
-subroutine HII_Knn(nptmass,npart,xyzh,xyzmh_ptmass,vxyzu,rho,eos_vars)
+subroutine HII_Knn(nptmass,npart,xyzh,xyzmh_ptmass,vxyzu,rho,eos_vars,hmin)
  use part,       only:massoftype,ihsoft,igas,irateion,isdead_or_accreted,&
                       irstrom,get_partinfo,iphase,imu,get_pmass
  use neighkdtree,   only:listneigh=>listneigh_global,getneigh_pos,leaf_is_active
@@ -792,6 +826,7 @@ subroutine HII_Knn(nptmass,npart,xyzh,xyzmh_ptmass,vxyzu,rho,eos_vars)
  real,    intent(in)    :: xyzh(:,:),rho(:)
  real,    intent(inout) :: xyzmh_ptmass(:,:),vxyzu(:,:)
  real,    intent(inout) :: eos_vars(:,:)
+ real,    intent(out)   :: hmin  ! smallest smoothing length of the ionised gas
  integer, parameter :: maxc  = 128
  real, save :: xyzcache(3,maxc)
  integer            :: i,k,j,npartin,nneigh,itypej,its
@@ -800,6 +835,7 @@ subroutine HII_Knn(nptmass,npart,xyzh,xyzmh_ptmass,vxyzu,rho,eos_vars)
  logical            :: momflag,isactive,isgas,isdust,converged,max_search
 
  momflag = .false.
+ hmin = huge(hmin)
  r = 0.
  r_in = 0.
  pmass = massoftype(igas)
@@ -851,12 +887,14 @@ subroutine HII_Knn(nptmass,npart,xyzh,xyzmh_ptmass,vxyzu,rho,eos_vars)
                             logNdiff = DNdot - Ndot
                             Ndot = Ndot + log10(1.-10.**(logNdiff))
                             call ionise_particle(eos_vars,vxyzu,j,1.)
+                            hmin = min(hmin,xyzh(4,j))
                             npartin = npartin + 1
                          endif
                       else
                          if (k > 1) then ! end of the HII region
                             DNratio = 10**(Ndot)/10**(DNdot)
                             call ionise_particle(eos_vars,vxyzu,j,DNratio)
+                            hmin = min(hmin,xyzh(4,j))
                             Ndot = 0.
                             r = sqrt((xi-xyzh(1,j))**2 + (yi-xyzh(2,j))**2 + (zi-xyzh(3,j))**2)
                             j = listneigh(1)
@@ -920,7 +958,7 @@ end subroutine HII_Knn
 ! HII feedback routine using inversed ray tracing method
 !+
 !-----------------------------------------------------------------------
-subroutine HII_ray(nptmass,npart,xyzh,xyzmh_ptmass,vxyzu,rho,eos_vars)
+subroutine HII_ray(nptmass,npart,xyzh,xyzmh_ptmass,vxyzu,rho,eos_vars,hmin)
  use part,     only:massoftype,igas,irateion,irstrom,isdead_or_accreted,&
                     iphase,get_partinfo,noverlap,imu
  use io,         only:iverbose,iprint,id,master
@@ -928,12 +966,14 @@ subroutine HII_ray(nptmass,npart,xyzh,xyzmh_ptmass,vxyzu,rho,eos_vars)
  real,    intent(in)    :: xyzh(:,:),rho(:)
  real,    intent(inout) :: xyzmh_ptmass(:,:),vxyzu(:,:)
  real,    intent(inout) :: eos_vars(:,:)
+ real,    intent(out)   :: hmin  ! smallest smoothing length of the ionised gas
  real, save         :: xyzcache(4,maxcache)
  real               :: pmass,log_Qi,fluxi,xj,yj,zj,rsrci
  logical            :: isactive,isgas,isdust
  integer            :: i,j,itypei,noverlapi,k
  !$omp threadprivate(xyzcache)
 
+ hmin = huge(hmin)
  if (nHIIsources > 0 .and. id==master) then
     pmass = massoftype(igas)
     xyzmh_ptmass(irstrom,:) = -1.
@@ -946,7 +986,8 @@ subroutine HII_ray(nptmass,npart,xyzh,xyzmh_ptmass,vxyzu,rho,eos_vars)
 !$omp shared(pmass,iphase,iH2R,uIon,gmw)&
 !$omp private(log_Qi,i,j,xj,yj,zj,fluxi,itypei,rsrci,isgas,isdust)&
 !$omp private(isactive,noverlapi)&
-!$omp reduction(+:k)
+!$omp reduction(+:k) &
+!$omp reduction(min:hmin)
 !$omp do
     do i=1,npart
        if (.not. isdead_or_accreted(xyzh(4,i))) then
@@ -965,6 +1006,7 @@ subroutine HII_ray(nptmass,npart,xyzh,xyzmh_ptmass,vxyzu,rho,eos_vars)
                                             pmass,log_Qi,fluxi,rsrci)
                 if (fluxi > 0.) then
                    call ionise_particle(eos_vars,vxyzu,i,1.)
+                   hmin = min(hmin,xyzh(4,i))
                    noverlapi = noverlapi + 1
                    k = k + 1
                    !$omp atomic update
@@ -1242,6 +1284,7 @@ subroutine write_options_H2R(iunit)
     call write_inopt(Mmin, 'Mmin', "Minimum star mass to trigger HII region (MSun)", iunit)
     call write_inopt(Rmax, 'Rmax', "Maximum radius for HII region (pc)(only Knn)", iunit)
     call write_inopt(Crelax, 'Crelax', "relaxation time of the gas of the HII fronts in units of h/c_s", iunit)
+    call write_inopt(C_HII, 'C_HII', "safety factor on the update interval (front moves < C_HII*h)", iunit)
     if (iH2R == 4) call write_inopt(nside_H2R, 'nsideH2R', &
        "HEALPix Nside of the sectors, 12*Nside**2 sectors (power of 2, only bounded Knn)", iunit)
  endif
@@ -1263,7 +1306,11 @@ subroutine read_options_H2R(db,nerr)
  if (iH2R > 0) then
     call read_inopt(Mmin,'Mmin',db,errcount=nerr,min=8.)
     call read_inopt(Rmax,'Rmax',db,errcount=nerr,min=10.)
+    <<<<<<< HEAD
     call read_inopt(Crelax,'Crelax',db,errcount=nerr,min=0.,default=Crelax)
+    =======
+    call read_inopt(C_HII,'C_HII',db,errcount=nerr,min=0.,default=0.3)
+    >>>>>>> newHIIupdate
     if (iH2R == 4) then
        call read_inopt(nside_H2R,'nsideH2R',db,errcount=nerr,min=1,default=1)
        if (iand(nside_H2R,nside_H2R-1) /= 0) then
