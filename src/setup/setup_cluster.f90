@@ -66,7 +66,7 @@ subroutine setpart(id,npart,npartoftype,xyzh,massoftype,vxyzu,polyk,gamma,hfact,
  use timestep,     only:dtmax,tmax
  use centreofmass, only:reset_centreofmass
  use ptmass,       only:h_acc,r_crit,rho_crit_cgs,icreate_sinks,tmax_acc,h_soft_sinkgas, &
-                        r_merge_uncond,use_regnbody,f_crit_override,tseeds
+                        r_merge_uncond,use_regnbody,f_crit_override,tseeds,isf_sharing
  use datafiles,    only:find_phantom_datafile
  use eos,          only:ieos,gmw
  use kernel,       only:hfact_default
@@ -182,6 +182,7 @@ subroutine setpart(id,npart,npartoftype,xyzh,massoftype,vxyzu,polyk,gamma,hfact,
        ! these are default values for Yann Bernard's cluster (icluster==3)
        ! but the user is also free to tweak the parameters
        icreate_sinks   = 2
+       isf_sharing     = 1
        rho_crit_cgs    = 1.d-18
        h_soft_sinkgas  = h_acc
        r_crit          = h_acc

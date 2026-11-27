@@ -56,6 +56,7 @@ module ptmass
  public :: ptmass_kick,ptmass_drift,ptmass_vdependent_correction
  public :: ptmass_accrete, ptmass_create
  public :: ptmass_create_stars,ptmass_create_seeds,ptmass_check_stars
+ public :: frag_cascade,ptmass_merge_release_cascade
  public :: write_options_ptmass,read_options_ptmass
  public :: update_ptmass
  public :: calculate_mdot
@@ -85,6 +86,15 @@ module ptmass
  real,    public :: tmax_acc = huge(f_acc)
  real,    public :: tseeds   = huge(f_acc)
  integer, public :: n_max    = 5
+! mass sharing at the conversion of a sink and at mergers (see frag_cascade)
+ integer, public :: isf_sharing = 0     ! 0: uniform partition into the seeds, 1: hierarchical cascade
+ integer, public :: L_frag      = 3     ! levels of the cascade: at most 2**L_frag stars per sink
+ real,    public :: q_frag      = 2.    ! mass ratio of the dominant fragment to the satellite at a split
+ real,    public :: phi0_frag   = 1.4   ! fragmentation rate at mref_frag
+ real,    public :: dphi_frag   = -0.5  ! dependence of the fragmentation rate on log10 of the fragment mass
+ real,    public :: mref_frag   = 2.    ! pivot mass of the fragmentation rate (Msun)
+ real,    public :: r_frag      = 1.5   ! scale ratio between levels (fixed, not in the input file)
+ real,    public :: mmin_frag   = 0.08  ! smallest fragment (Msun, fixed, not in the input file)
 
  logical, public :: merge_release_sort = .true.
  logical, public :: use_regnbody       = .false. ! subsystems switch
@@ -1759,6 +1769,47 @@ end subroutine ptmass_create_seeds
 
 !-------------------------------------------------------------------------
 !+
+!  hierarchical fragmentation of a mass mtot (code units) into nfrag
+!  fragments (Thomasson et al. 2026): L_frag levels of scale ratio r_frag,
+!  a fragment of mass m splits in two with probability p = r**phi - 1,
+!  phi(m) = phi0 + dphi*log10(m/mref) clipped to [0, ln2/ln r], into q/(q+1)
+!  and 1/(q+1) of its mass, unless the satellite would be below mmin_frag.
+!  The mass is conserved
+!+
+!-------------------------------------------------------------------------
+subroutine frag_cascade(mtot,masses,nfrag)
+ use random,  only:ran2
+ use units,   only:umass
+ use physcon, only:solarm
+ real,    intent(in)  :: mtot
+ real,    intent(out) :: masses(:)   ! at least 2**L_frag
+ integer, intent(out) :: nfrag
+ integer :: l,k,n
+ real    :: mmin,mref,phimax,phi,m
+
+ mmin   = mmin_frag*solarm/umass
+ mref   = mref_frag*solarm/umass
+ phimax = log(2.)/log(r_frag)
+ nfrag     = 1
+ masses(1) = mtot
+ do l=1,L_frag
+    n = nfrag   ! the children of this level split only at the next one
+    do k=1,n
+       m = masses(k)
+       if (m/(q_frag + 1.) < mmin) cycle
+       phi = min(max(phi0_frag + dphi_frag*log10(m/mref),0.),phimax)
+       if (ran2(iseed_sf) < r_frag**phi - 1.) then
+          masses(k)     = m*q_frag/(q_frag + 1.)
+          nfrag         = nfrag + 1
+          masses(nfrag) = m/(q_frag + 1.)
+       endif
+    enddo
+ enddo
+
+end subroutine frag_cascade
+
+!-------------------------------------------------------------------------
+!+
 !  subroutine to create a bunch of stars inside a sink (core) particle
 !+
 !-------------------------------------------------------------------------
@@ -1766,7 +1817,7 @@ subroutine ptmass_create_stars(nptmass,itest,xyzmh_ptmass,vxyz_ptmass,fxyz_ptmas
                                fxyz_ptmass_sinksink,time)
  use dim,       only:maxptmass
  use physcon,   only:solarm,pi
- use io,        only:iprint,iverbose
+ use io,        only:iprint,iverbose,fatal
  use units,     only:umass
  use part,      only:itbirth,ihacc,ihsoft,ispinx,ispiny,ispinz,isftype,inseed
  use random ,   only:ran2,gauss_random,divide_unit_seg
@@ -1777,7 +1828,7 @@ subroutine ptmass_create_stars(nptmass,itest,xyzmh_ptmass,vxyz_ptmass,fxyz_ptmas
  real,    intent(inout) :: fxyz_ptmass(4,maxptmass),fxyz_ptmass_sinksink(4,maxptmass)
  real,    intent(in)    :: time
  integer, allocatable :: listid(:)
- real,    allocatable :: masses(:)
+ real,    allocatable :: masses(:),frag(:)
  real                 :: xi(3),vi(3),spini(3)
  integer              :: k,i,j,m,n
  real, parameter      :: mcutoff = 0.35355339059
@@ -1796,7 +1847,6 @@ subroutine ptmass_create_stars(nptmass,itest,xyzmh_ptmass,vxyz_ptmass,fxyz_ptmas
  spini(1) = xyzmh_ptmass(ispinx,itest)
  spini(2) = xyzmh_ptmass(ispiny,itest)
  spini(3) = xyzmh_ptmass(ispinz,itest)
- n        = nint(xyzmh_ptmass(inseed,itest))
  vi(1)    = vxyz_ptmass(1,itest)
  vi(2)    = vxyz_ptmass(2,itest)
  vi(3)    = vxyz_ptmass(3,itest)
@@ -1804,6 +1854,16 @@ subroutine ptmass_create_stars(nptmass,itest,xyzmh_ptmass,vxyz_ptmass,fxyz_ptmas
  xcom = 0.
 
  write(iprint,"(a,es10.3,a,es10.3,1x,3(es10.3,1x))") " ptmass_create_stars : new stars formed : ",time,"  (m,x,y,z) : ",mi,xi
+
+ !
+ !-- number of stars: from the cascade, or the seeds drawn at tseeds
+ !
+ if (isf_sharing == 1) then
+    allocate(frag(2**L_frag))
+    call frag_cascade(mi,frag,n)
+ else
+    n = nint(xyzmh_ptmass(inseed,itest))
+ endif
 
  !
  !-- masses sampling method
@@ -1815,13 +1875,18 @@ subroutine ptmass_create_stars(nptmass,itest,xyzmh_ptmass,vxyz_ptmass,fxyz_ptmas
     fxyz_ptmass(1:4,itest)          = 0.
     if (iH2R > 0) call update_ionrate(itest,xyzmh_ptmass,h_acc)
  else
+    if (nptmass + n - 1 > maxptmass) call fatal('ptmass_create_stars','nptmass > maxptmass')
     allocate(masses(n))
     allocate(listid(n))
-    minmass  = 0.08/(mi*(umass/solarm))
 
     if (iverbose > 1) write(iprint,*) "Mass sharing start ! "
 
-    call divide_unit_seg(masses,minmass,n,iseed_sf)
+    if (isf_sharing == 1) then
+       masses = frag(1:n)/mi   ! fractions of the sink mass, as divide_unit_seg
+    else
+       minmass  = 0.08/(mi*(umass/solarm))
+       call divide_unit_seg(masses,minmass,n,iseed_sf)
+    endif
 
     if (iverbose > 1) write(iprint,*) "Mass sharing  : ", masses*mi*(umass/solarm)
 
@@ -1970,6 +2035,7 @@ subroutine ptmass_create_stars(nptmass,itest,xyzmh_ptmass,vxyz_ptmass,fxyz_ptmas
     deallocate(listid)
     nptmass = nptmass + (n-1)
  endif
+ if (allocated(frag)) deallocate(frag)
 
  itest = 0 ! reset pointer to zero
 
@@ -2020,21 +2086,19 @@ end subroutine ptmass_create_all
 !+
 !-------------------------------------------------------------------------
 subroutine ptmass_merge_release(itest,ni,nj,mi,mj,nptmass,xyzmh_ptmass,pxyz_ptmass,fxyz_ptmass)
- use random ,   only:ran2,divide_unit_seg,ronsphere
+ use random ,   only:ran2,divide_unit_seg
  use dim,       only:maxptmass,nvel_ptmass
  use io,        only:iverbose,iprint
  use units,     only:umass
  use physcon,   only:solarm
- use part,      only:isftype,inseed
- use HIIRegion, only:update_ionrate,iH2R
+ use part,      only:inseed
  integer, intent(in)    :: itest,ni,nj
  real,    intent(in)    :: mi,mj
  integer, intent(inout) :: nptmass
  real,    intent(inout) :: xyzmh_ptmass(nsinkproperties,maxptmass), &
                            pxyz_ptmass(nvel_ptmass,maxptmass),fxyz_ptmass(4,maxptmass)
  real, allocatable :: masses(:)
- real              :: xi(3),vi(3),xk(3),vk(3),xcom(3),vcom(3)
- real              :: vl,mrel,mk,hacci,minmass,mtmp,mij
+ real              :: minmass,mtmp,mij
  integer           :: ntot,nrel,nsav,i,itmp
 
  if (iverbose >1) then
@@ -2074,7 +2138,82 @@ subroutine ptmass_merge_release(itest,ni,nj,mi,mj,nptmass,xyzmh_ptmass,pxyz_ptma
 
  write(iprint,*) 'Sink collision : ', nrel, 'escapers produced on ', ntot,'seeds'
 
- mrel    = sum(masses(nsav+1:ntot))
+ xyzmh_ptmass(inseed,itest) = real(nsav)
+ call release_escapers(itest,masses(nsav+1:ntot),nrel,mij,nptmass,xyzmh_ptmass,pxyz_ptmass,fxyz_ptmass)
+
+ deallocate(masses)
+
+end subroutine ptmass_merge_release
+
+!-------------------------------------------------------------------------
+!+
+! update of a merged sink with the cascade (isf_sharing = 1): the fragments
+! of both sinks (frag_cascade on mi and mj) above what the merged sink
+! holds (frag_cascade on mi + mj) are unstable, the lightest ones escape
+!+
+!-------------------------------------------------------------------------
+subroutine ptmass_merge_release_cascade(itest,mi,mj,nptmass,xyzmh_ptmass,pxyz_ptmass,fxyz_ptmass)
+ use dim,       only:maxptmass,nvel_ptmass
+ use io,        only:iverbose,iprint
+ use part,      only:inseed
+ use sortutils, only:indexx
+ integer, intent(in)    :: itest
+ real,    intent(in)    :: mi,mj
+ integer, intent(inout) :: nptmass
+ real,    intent(inout) :: xyzmh_ptmass(nsinkproperties,maxptmass), &
+                           pxyz_ptmass(nvel_ptmass,maxptmass),fxyz_ptmass(4,maxptmass)
+ real,    allocatable :: frag(:),fkeep(:)
+ integer, allocatable :: idx(:)
+ integer              :: nf,ni,nj,ntot,nkeep,nrel
+
+ if (iverbose >1) then
+    write(iprint,*) 'Update after merge (cascade) !! '
+ endif
+ nf = 2**L_frag
+ allocate(frag(2*nf),fkeep(nf),idx(2*nf))
+ call frag_cascade(mi,frag(1:nf),ni)
+ call frag_cascade(mj,frag(ni+1:ni+nf),nj)
+ call frag_cascade(mi+mj,fkeep,nkeep)
+ ntot = ni + nj
+ nrel = max(ntot - nkeep,0)
+
+ write(iprint,*) 'Sink collision : ', nrel, 'escapers produced on ', ntot,'fragments'
+
+ xyzmh_ptmass(inseed,itest) = real(nkeep)
+ if (nrel > 0) then
+    call indexx(ntot,frag(1:ntot),idx(1:ntot))   ! lightest first
+    call release_escapers(itest,frag(idx(1:nrel)),nrel,mi+mj,nptmass,xyzmh_ptmass,pxyz_ptmass,fxyz_ptmass)
+ endif
+
+ deallocate(frag,fkeep,idx)
+
+end subroutine ptmass_merge_release_cascade
+
+!-------------------------------------------------------------------------
+!+
+! release nrel stars of masses mesc from the merged sink itest of mass mij:
+! random positions at its accretion radius, random directions at the
+! liberation velocity; the sink keeps the centre of mass and momentum
+!+
+!-------------------------------------------------------------------------
+subroutine release_escapers(itest,mesc,nrel,mij,nptmass,xyzmh_ptmass,pxyz_ptmass,fxyz_ptmass)
+ use random ,   only:ronsphere
+ use dim,       only:maxptmass,nvel_ptmass
+ use io,        only:fatal
+ use part,      only:isftype,inseed
+ use HIIRegion, only:update_ionrate,iH2R
+ integer, intent(in)    :: itest,nrel
+ real,    intent(in)    :: mesc(nrel),mij
+ integer, intent(inout) :: nptmass
+ real,    intent(inout) :: xyzmh_ptmass(nsinkproperties,maxptmass), &
+                           pxyz_ptmass(nvel_ptmass,maxptmass),fxyz_ptmass(4,maxptmass)
+ real    :: xi(3),vi(3),xk(3),vk(3),xcom(3),vcom(3)
+ real    :: vl,mrel,mk,hacci
+ integer :: i
+
+ if (nptmass + nrel > maxptmass) call fatal('release_escapers','nptmass > maxptmass')
+
+ mrel    = sum(mesc)
  xi(1)   = xyzmh_ptmass(1,itest)
  xi(2)   = xyzmh_ptmass(2,itest)
  xi(3)   = xyzmh_ptmass(3,itest)
@@ -2082,7 +2221,6 @@ subroutine ptmass_merge_release(itest,ni,nj,mi,mj,nptmass,xyzmh_ptmass,pxyz_ptma
  vi(1)   = pxyz_ptmass(1,itest)
  vi(2)   = pxyz_ptmass(2,itest)
  vi(3)   = pxyz_ptmass(3,itest)
- xyzmh_ptmass(inseed,itest) = real(nsav)
 
  vcom = 0.
  xcom = 0.
@@ -2093,7 +2231,7 @@ subroutine ptmass_merge_release(itest,ni,nj,mi,mj,nptmass,xyzmh_ptmass,pxyz_ptma
     call ronsphere(xk,iseed_sf)
     call ronsphere(vk,iseed_sf)
     xk = xk * hacci
-    mk = masses(nsav+i)
+    mk = mesc(i)
     vk = vk * vl * sqrt(mij-mk)
     !
     !-- Star creation
@@ -2149,9 +2287,7 @@ subroutine ptmass_merge_release(itest,ni,nj,mi,mj,nptmass,xyzmh_ptmass,pxyz_ptma
 
  nptmass = nptmass + nrel
 
- deallocate(masses)
-
-end subroutine ptmass_merge_release
+end subroutine release_escapers
 
 !-------------------------------------------------------------------------
 !+
@@ -2306,7 +2442,13 @@ subroutine merge_sinks(time,nptmass,xyzmh_ptmass,pxyz_ptmass,fxyz_ptmass,fxyz_pt
                 if (nint(xyzmh_ptmass(isftype,j))==1) then ! Merge stars seeds and release escapers
                    ni = nint(xyzmh_ptmass(inseed,i))
                    nj = nint(xyzmh_ptmass(inseed,j))
-                   if ((ni+nj > 3) .and. (nj /= 0)) then ! release only if seeds in both sinks and > 3
+                   if (isf_sharing == 1) then
+                      if (ni > 0 .and. nj > 0) then ! both sinks fragmenting (older than tseeds)
+                         call ptmass_merge_release_cascade(i,mi,mj,nptmass,xyzmh_ptmass,pxyz_ptmass,fxyz_ptmass)
+                      else
+                         xyzmh_ptmass(inseed,i) = real(ni+nj)
+                      endif
+                   elseif ((ni+nj > 3) .and. (nj /= 0)) then ! release only if seeds in both sinks and > 3
                       call ptmass_merge_release(i,ni,nj,mi,mj,nptmass,xyzmh_ptmass,pxyz_ptmass,fxyz_ptmass)
                    else
                       xyzmh_ptmass(inseed,i) = real(ni+nj)
@@ -2622,6 +2764,14 @@ subroutine write_options_ptmass(iunit)
           call write_inopt(iseed_sf, "iseed_sf", "Initial radom seed for star formation scheme", iunit)
           call write_inopt(n_max, "n_max","Maximum number of seeds in one sink core",iunit)
           call write_inopt(merge_release_sort,"merge_release_sort","Sort masses during release of stars (Sink merge)",iunit)
+          call write_inopt(isf_sharing,'isf_sharing','mass sharing at conversion and mergers (0=uniform split, 1=cascade)',iunit)
+          if (isf_sharing == 1) then
+             call write_inopt(L_frag,'L_frag','levels of the cascade (at most 2**L_frag stars per sink)',iunit)
+             call write_inopt(q_frag,'q_frag','mass ratio of the dominant fragment to the satellite at a split',iunit)
+             call write_inopt(phi0_frag,'phi0_frag','fragmentation rate at mref_frag',iunit)
+             call write_inopt(dphi_frag,'dphi_frag','dependence of the fragmentation rate on log10 of the mass',iunit)
+             call write_inopt(mref_frag,'mref_frag','pivot mass of the fragmentation rate (Msun)',iunit)
+          endif
        endif
        if (f_crit_override > 0. .or. l_crit_override) then
           call write_inopt(f_crit_override,'f_crit_override' ,'unconditional sink formation if rho > f_crit_override*rho_crit',&
@@ -2676,6 +2826,16 @@ subroutine read_options_ptmass(db,nerr)
  call read_inopt(tseeds,'tseeds',db,errcount=nerr,min=0.,default=tseeds)
  call read_inopt(iseed_sf,'iseed_sf',db,errcount=nerr,default=iseed_sf)
  call read_inopt(n_max,'n_max',db,errcount=nerr,min=0,default=n_max)
+ call read_inopt(isf_sharing,'isf_sharing',db,errcount=nerr,min=0,max=1,default=isf_sharing)
+ call read_inopt(L_frag,'L_frag',db,errcount=nerr,min=0,max=10,default=L_frag)
+ call read_inopt(q_frag,'q_frag',db,errcount=nerr,min=1.,default=q_frag)
+ call read_inopt(phi0_frag,'phi0_frag',db,errcount=nerr,min=0.,default=phi0_frag)
+ call read_inopt(dphi_frag,'dphi_frag',db,errcount=nerr,default=dphi_frag)
+ call read_inopt(mref_frag,'mref_frag',db,errcount=nerr,min=0.,default=mref_frag)
+ if (isf_sharing == 1 .and. mref_frag <= 0.) then
+    call error(label,'mref_frag must be > 0')
+    nerr = nerr + 1
+ endif
  call read_inopt(use_regnbody,'use_regnbody',db,errcount=nerr,default=use_regnbody)
  call read_inopt(r_neigh,'r_neigh',db,errcount=nerr,default=r_neigh)
  call read_inopt(use_sinktree,'use_sinktree',db,errcount=nerr,default=use_sinktree)

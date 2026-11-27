@@ -47,7 +47,7 @@ subroutine test_ptmass(ntests,npass,string)
  integer :: itmp,ierr,itest,istart,imax
  logical :: do_test_binary,do_test_accretion,do_test_createsink,do_test_softening
  logical :: do_test_chinese_coin,do_test_merger,do_test_potential,do_test_HII,do_test_SDAR
- logical :: do_test_binary_gr,do_test_orbit,do_test_sinkgas,do_bench_HII
+ logical :: do_test_binary_gr,do_test_orbit,do_test_sinkgas,do_bench_HII,do_test_cascade
  logical :: testall
 
  if (id==master) write(*,"(/,a,/)") '--> TESTING PTMASS MODULE'
@@ -64,6 +64,7 @@ subroutine test_ptmass(ntests,npass,string)
  do_test_binary_gr = .false.
  do_test_orbit = .false.
  do_test_sinkgas = .false.
+ do_test_cascade = .false.
  do_bench_HII = .false.
  testall = .false.
  istart = 1
@@ -99,6 +100,8 @@ subroutine test_ptmass(ntests,npass,string)
     do_test_orbit = .true.
  case('ptmasssinkgas','sinkgas')
     do_test_sinkgas = .true.
+ case('ptmasscascade','cascade')
+    do_test_cascade = .true.
  case default
     testall = .true.
  end select
@@ -183,6 +186,10 @@ subroutine test_ptmass(ntests,npass,string)
  if (do_test_createsink .or. testall) call test_createsink(ntests,npass)
 
  if (do_test_SDAR .or. testall .and. .not.gr) call test_SDAR(ntests,npass)
+ !
+ !  Test of the hierarchical fragmentation of sinks into stars (icreate_sinks = 2)
+ !
+ if (do_test_cascade .or. testall) call test_frag_cascade(ntests,npass)
 
  if (do_test_HII .or. testall .and. .not.gr) call test_HIIregion(ntests,npass)
 
@@ -263,6 +270,88 @@ subroutine test_ptmass_options(ntests,npass)
  endif
 
 end subroutine test_ptmass_options
+
+!-----------------------------------------------------------------------
+!+
+!  hierarchical fragmentation of a sink into stars (frag_cascade) and the
+!  release of escapers at a merger (ptmass_merge_release_cascade)
+!+
+!-----------------------------------------------------------------------
+subroutine test_frag_cascade(ntests,npass)
+ use ptmass,    only:frag_cascade,ptmass_merge_release_cascade,L_frag,q_frag,phi0_frag,&
+                     dphi_frag,mmin_frag
+ use part,      only:nptmass,xyzmh_ptmass,vxyz_ptmass,fxyz_ptmass,ihacc,isftype,inseed
+ use units,     only:set_units
+ use physcon,   only:pc,solarm
+ use io,        only:id,master
+ use testutils, only:checkval,update_test_scores
+ integer, intent(inout) :: ntests,npass
+ integer :: nfailed(10),n,k,nmax,ntrial,nrel
+ real    :: frag(2**L_frag),m,errm,fmin,errp,errx,ptot(3),xtot(3)
+ real    :: q0,phi00,dphi0,mmin0
+
+ if (id==master) write(*,"(/,a)") '--> testing hierarchical fragmentation of sinks'
+ call set_units(dist=pc,mass=solarm,G=1.d0)   ! masses in Msun
+ nfailed(:) = 0
+ q0 = q_frag; phi00 = phi0_frag; dphi0 = dphi_frag; mmin0 = mmin_frag
+
+ !-- default rules on sinks of 0.3 to 50 Msun: mass conserved, at most 2**L stars,
+ !   no fragment below the floor once split
+ errm = 0.; nmax = 0; fmin = huge(fmin)
+ do k=1,200
+    m = 0.3*(50./0.3)**(real(k-1)/199.)
+    call frag_cascade(m,frag,n)
+    errm = max(errm,abs(sum(frag(1:n)) - m)/m)
+    nmax = max(nmax,n)
+    if (n > 1) fmin = min(fmin,minval(frag(1:n)))
+ enddo
+ call checkval(errm,0.,1.e-14,nfailed(1),'cascade conserves the mass')
+ call checkval(nmax <= 2**L_frag,.true.,nfailed(2),'at most 2**L stars per sink')
+ call checkval(fmin >= mmin_frag,.true.,nfailed(3),'no split below the floor')
+
+ !-- no fragmentation: one star
+ phi0_frag = 0.; dphi_frag = 0.
+ call frag_cascade(10.,frag,n)
+ call checkval(n,1,0,nfailed(4),'phi = 0 gives one star')
+
+ !-- always splitting (phi clipped to ln2/ln r) without floor: 2**L stars,
+ !   from q**L/(q+1)**L to 1/(q+1)**L of the mass
+ phi0_frag = 10.; mmin_frag = 0.
+ call frag_cascade(1.,frag,n)
+ call checkval(n,2**L_frag,0,nfailed(5),'p = 1 gives 2**L stars')
+ call checkval(maxval(frag(1:n)),(q_frag/(q_frag + 1.))**L_frag,1.e-14,nfailed(6),'p = 1: most massive star')
+ call checkval(minval(frag(1:n)),(1./(q_frag + 1.))**L_frag,1.e-14,nfailed(7),'p = 1: lightest star')
+ q_frag = q0; phi0_frag = phi00; dphi_frag = dphi0; mmin_frag = mmin0
+
+ !-- merger of a 12 and an 8 Msun sink: escapers, mass, momentum and centre of mass conserved
+ errm = 0.; errp = 0.; errx = 0.; nrel = 0
+ do ntrial=1,50
+    nptmass = 1
+    xyzmh_ptmass(:,1)      = 0.
+    xyzmh_ptmass(1:3,1)    = (/1.,2.,3./)
+    xyzmh_ptmass(4,1)      = 20.
+    xyzmh_ptmass(ihacc,1)  = 0.02
+    xyzmh_ptmass(isftype,1) = 1.
+    xyzmh_ptmass(inseed,1) = 1.
+    vxyz_ptmass(:,1)       = (/0.1,-0.2,0.3/)
+    call ptmass_merge_release_cascade(1,12.,8.,nptmass,xyzmh_ptmass,vxyz_ptmass,fxyz_ptmass)
+    nrel = nrel + nptmass - 1
+    do k=1,3
+       ptot(k) = sum(xyzmh_ptmass(4,1:nptmass)*vxyz_ptmass(k,1:nptmass))
+       xtot(k) = sum(xyzmh_ptmass(4,1:nptmass)*xyzmh_ptmass(k,1:nptmass))
+    enddo
+    errm = max(errm,abs(sum(xyzmh_ptmass(4,1:nptmass)) - 20.)/20.)
+    errp = max(errp,maxval(abs(ptot - 20.*(/0.1,-0.2,0.3/))))
+    errx = max(errx,maxval(abs(xtot - 20.*(/1.,2.,3./))))
+ enddo
+ call checkval(nrel > 0,.true.,nfailed(8),'mergers release escapers')
+ call checkval(errm,0.,1.e-14,nfailed(9),'merger release conserves the mass')
+ call checkval(max(errp,errx),0.,1.e-12,nfailed(10),'merger release conserves momentum and centre of mass')
+ nptmass = 0
+
+ call update_test_scores(ntests,nfailed,npass)
+
+end subroutine test_frag_cascade
 
 !-----------------------------------------------------------------------
 !+
