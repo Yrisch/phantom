@@ -66,7 +66,7 @@ subroutine setpart(id,npart,npartoftype,xyzh,massoftype,vxyzu,polyk,gamma,hfact,
  use timestep,     only:dtmax,tmax
  use centreofmass, only:reset_centreofmass
  use ptmass,       only:h_acc,r_crit,rho_crit_cgs,icreate_sinks,tmax_acc,h_soft_sinkgas, &
-                        r_merge_uncond,use_regnbody,f_crit_override,tseeds,isf_sharing
+                        r_merge_cond,use_regnbody,f_crit_override,tseeds,isf_sharing
  use datafiles,    only:find_phantom_datafile
  use eos,          only:ieos,gmw
  use kernel,       only:hfact_default
